@@ -91,6 +91,7 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("1 HP", "one_hp"),
                 _catalog.EnsurePreset("1 Hit Run", "one_hit_run"),
                 _catalog.EnsurePreset("Random Weapon", "random_weapon"),
+                _catalog.EnsurePreset("Random Armor", "random_armor"),
                 _catalog.EnsurePreset("Set health to 50%", "set_health_percent"),
                 _catalog.EnsurePreset("Set health to random %", "set_health_random_percent"),
                 _catalog.EnsurePreset("Watch item button", "watch_item_button")
@@ -202,6 +203,7 @@ public partial class MainViewModel : ObservableObject
         }
 
         CommitEditor();
+        CatalogStore.Save(_catalog);
         if (SelectedPreset.HandlerId == "use_selected_item"
             && FocusGameForItemTest
             && !FocusGameWindow())

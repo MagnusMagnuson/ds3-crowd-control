@@ -66,6 +66,9 @@ public class CatalogTests
         Assert.Equal(1, randomWeapon.Arguments["usableOnly"].GetInt32());
         Assert.Equal(1, randomWeapon.Arguments["removeOld"].GetInt32());
         Assert.Equal(0, randomWeapon.Arguments["includeMissingDlc"].GetInt32());
+        var randomArmor = loaded.Presets.Single(preset => preset.Name == "Random Armor" && preset.HandlerId == "random_armor");
+        Assert.Equal(1, randomArmor.Arguments["removeOld"].GetInt32());
+        Assert.Equal(0, randomArmor.Arguments["includeMissingDlc"].GetInt32());
         var halfHealth = loaded.Presets.Single(preset => preset.HandlerId == "set_health_percent");
         Assert.Equal(50, halfHealth.Arguments["percent"].GetInt32());
         Assert.Contains(loaded.Presets, preset => preset.HandlerId == "set_health_random_percent");

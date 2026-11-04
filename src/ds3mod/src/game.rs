@@ -3,7 +3,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use darksouls3::app_menu::NewMenuSystem;
-use darksouls3::param::{EQUIP_PARAM_WEAPON_ST, REINFORCE_PARAM_WEAPON_ST};
+use darksouls3::param::{
+    EQUIP_PARAM_PROTECTOR_ST, EQUIP_PARAM_WEAPON_ST, REINFORCE_PARAM_WEAPON_ST,
+};
 use darksouls3::sprj::{
     CSRegulationManager, GameDataMan, ItemCategory, ItemId, MenuMan, PlayerGameData, PlayerIns,
     WorldChrMan,
@@ -1068,6 +1070,11 @@ fn choose_weapon(options: &WeaponOptions, current: u32, stats: [u32; 4]) -> Resu
             candidates.push(variant);
         }
     }
+    // Choosing the weapon already held would change nothing.
+    let held = current / 10_000;
+    if candidates.iter().any(|variant| variant / 10_000 != held) {
+        candidates.retain(|variant| variant / 10_000 != held);
+    }
     if candidates.is_empty() {
         return Err("no weapon in the game data fits these options".to_string());
     }
@@ -1090,15 +1097,190 @@ fn choose_weapon(options: &WeaponOptions, current: u32, stats: [u32; 4]) -> Resu
     Ok((variant + level, candidates.len()))
 }
 
+/// Gives one of `item` and equips it through the menu routine. Returns its inventory
+/// index once the slot is confirmed to hold it.
+fn give_and_equip(player: &mut PlayerIns, item: ItemId, slot: u32) -> Result<i32, String> {
+    let located = cached()?;
+    let equip_item = *located.equip_item.as_ref().map_err(|error| error.clone())?;
+    let find_item = *located.find_item.as_ref().map_err(|error| error.clone())?;
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    game_data.give_item_directly(item, 1);
+
+    let raw_id = item.into_inner();
+    let player_addr = player as *mut PlayerIns as usize;
+    let equipment = unsafe { &mut player.player_game_data.as_mut().equipment };
+    let find: extern "C" fn(*mut std::ffi::c_void, *const u32) -> i32 =
+        unsafe { std::mem::transmute(find_item) };
+    let inventory = &mut equipment.equip_inventory_data as *mut _ as *mut std::ffi::c_void;
+    let index = find(inventory, &raw_id);
+    if index < 0 {
+        return Err(format!("item {raw_id:#X} was not found in the inventory after giving it"));
+    }
+
+    let mut buffer = [0u8; EQUIP_BUFFER_SIZE];
+    buffer[EQUIP_BUFFER_INVENTORY_INDEX..EQUIP_BUFFER_INVENTORY_INDEX + 4]
+        .copy_from_slice(&index.to_le_bytes());
+    let equip: extern "C" fn(u32, *const u8) = unsafe { std::mem::transmute(equip_item) };
+
+    let flags_address = module_pointer(player_addr, EQUIP_UNLOCK_MODULE_OFFSET)?
+        .wrapping_add(EQUIP_UNLOCK_FLAGS_OFFSET);
+    let flags = read_u32_checked(flags_address)?;
+    write_u32_checked(flags_address, flags | 1)?;
+    equip(slot, buffer.as_ptr());
+    write_u32_checked(flags_address, flags)?;
+
+    let equipped = equipment.equipment_indexes[slot as usize];
+    if equipped != index {
+        return Err(format!(
+            "item {raw_id:#X} was added, but the game did not equip it (slot {slot} holds {equipped}, wanted {index})"
+        ));
+    }
+    Ok(index)
+}
+
+/// Deletes an inventory entry unless it is empty or still equipped in any slot.
+/// Returns whether the entry is gone. The game's return value is not a success flag.
+fn remove_inventory_entry(player: &mut PlayerIns, index: i32) -> Result<bool, String> {
+    let equipment = unsafe { &mut player.player_game_data.as_mut().equipment };
+    if index < 0 || equipment.equipment_indexes.contains(&index) {
+        return Ok(false);
+    }
+    let address = *cached()?.remove_item.as_ref().map_err(|error| error.clone())?;
+    let remove: extern "C" fn(*mut std::ffi::c_void, i32, u8, u8) -> u8 =
+        unsafe { std::mem::transmute(address) };
+    let target = equipment as *mut _ as *mut std::ffi::c_void;
+    remove(target, index, 1, 1);
+    Ok(equipment.equip_inventory_data.items_data[index as u32].as_option().is_none())
+}
+
+pub struct ArmorOptions {
+    pub remove_old: bool,
+    pub include_missing_dlc: bool,
+}
+
+/// Head, body, hands, legs.
+const ARMOR_SLOTS: [u32; 4] = [0xC, 0xD, 0xE, 0xF];
+const ASHES_OF_ARIANDEL_ARMOR: [u32; 19] = [
+    20_000_000, 20_001_000, 20_002_000, 20_003_000, 55_500_000, 55_501_000, 55_502_000,
+    55_503_000, 56_500_000, 56_501_000, 56_503_000, 58_500_000, 58_501_000, 58_502_000,
+    58_503_000, 60_500_000, 60_501_000, 60_502_000, 60_503_000
+];
+const RINGED_CITY_ARMOR: [u32; 37] = [
+    28_501_000, 28_502_000, 28_503_000, 29_500_000, 29_501_000, 29_502_000, 29_503_000,
+    32_000_000, 32_001_000, 32_002_000, 32_003_000, 63_500_000, 63_501_000, 63_502_000,
+    63_503_000, 64_501_000, 64_502_000, 64_503_000, 67_500_000, 67_501_000, 67_502_000,
+    67_503_000, 68_500_000, 80_500_000, 80_501_000, 80_502_000, 80_503_000, 81_500_000,
+    81_501_000, 81_502_000, 81_503_000, 82_500_000, 82_501_000, 82_502_000, 82_503_000,
+    83_500_000, 84_500_000
+];
+
+pub fn is_listed_armor(id: u32) -> bool {
+    crate::armor_ids::REAL_ARMOR.binary_search(&id).is_ok()
+}
+
+/// Empty armor slots hold placeholder pieces with ids below this.
+pub fn is_real_armor(id: u32) -> bool {
+    id >= 1_000_000
+}
+
+pub fn armor_available(id: u32, ashes_installed: bool, ringed_city_installed: bool) -> bool {
+    (ashes_installed || !ASHES_OF_ARIANDEL_ARMOR.contains(&id))
+        && (ringed_city_installed || !RINGED_CITY_ARMOR.contains(&id))
+}
+
+/// Armor ids for each of [ARMOR_SLOTS], taken from the game's data.
+fn armor_pools(include_missing_dlc: bool) -> Result<[Vec<u32>; 4], String> {
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the armor list is unavailable: {error:?}"))?;
+    let (ashes, ringed_city) = unsafe { darksouls3::cs::CSDlc::instance() }
+        .map(|dlc| (dlc.dlc1_installed, dlc.dlc2_installed))
+        .unwrap_or((false, false));
+    let mut pools: [Vec<u32>; 4] = Default::default();
+    let mut dlc_rows = 0;
+    for (id, row) in regulation.get_param::<EQUIP_PARAM_PROTECTOR_ST>().iter() {
+        let id = id as u32;
+        if ASHES_OF_ARIANDEL_ARMOR.contains(&id) || RINGED_CITY_ARMOR.contains(&id) {
+            dlc_rows += 1;
+        }
+        if !is_listed_armor(id) {
+            continue;
+        }
+        if !include_missing_dlc && !armor_available(id, ashes, ringed_city) {
+            continue;
+        }
+        let slots = [row.head_equip(), row.body_equip(), row.arm_equip(), row.leg_equip()];
+        if let Some(slot) = slots.iter().position(|fits| *fits) {
+            pools[slot].push(id);
+        }
+    }
+    crate::log::log(format!(
+        "armor pools {:?}, {dlc_rows} of {} listed DLC ids found",
+        pools.iter().map(Vec::len).collect::<Vec<_>>(),
+        ASHES_OF_ARIANDEL_ARMOR.len() + RINGED_CITY_ARMOR.len(),
+    ));
+    Ok(pools)
+}
+
+pub fn random_armor(options: ArmorOptions) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let pools = armor_pools(options.include_missing_dlc)?;
+
+    let mut equipped = Vec::new();
+    let mut removed = 0;
+    let mut failure = None;
+    for (slot, pool) in ARMOR_SLOTS.into_iter().zip(&pools) {
+        if pool.is_empty() {
+            continue;
+        }
+        let player_data = unsafe { player.player_game_data.as_ref() };
+        let old_index = player_data.equipment.equipment_indexes[slot as usize];
+        let old_id = u32::try_from(old_index)
+            .ok()
+            .and_then(|index| {
+                player_data.equipment.equip_inventory_data.items_data[index]
+                    .as_option()
+                    .map(|entry| entry.item_id.param_id())
+            })
+            .unwrap_or(0);
+
+        // Choosing the piece already worn would change nothing.
+        let choices: Vec<u32> = pool.iter().copied().filter(|id| *id != old_id).collect();
+        let Some(&piece) = choices.get(random_index(choices.len())) else {
+            continue;
+        };
+        let item = ItemId::new(ItemCategory::Protector, piece)
+            .map_err(|error| format!("armor {piece} has an invalid id: {error:?}"))?;
+
+        match give_and_equip(player, item, slot) {
+            Ok(_) => {
+                equipped.push(piece);
+                if options.remove_old
+                    && is_real_armor(old_id)
+                    && remove_inventory_entry(player, old_index)?
+                {
+                    removed += 1;
+                }
+            }
+            Err(error) => failure = Some(error),
+        }
+    }
+    match failure {
+        Some(error) if equipped.is_empty() => Err(error),
+        Some(error) => Ok(format!("equipped armor {equipped:?}, but one piece failed: {error}")),
+        None if equipped.is_empty() => Err("no armor was found in the game data".to_string()),
+        None => Ok(format!("equipped armor {equipped:?}, removed {removed} old pieces")),
+    }
+}
+
 pub fn random_weapon(options: WeaponOptions) -> Result<String, String> {
     let player = unsafe { &mut *local_player()? };
     if player.super_chr_ins.modules.data.hp <= 0 {
         return Err("the local player is dead".to_string());
     }
-    let located = cached()?;
-    let equip_item = *located.equip_item.as_ref().map_err(|error| error.clone())?;
-    let find_item = *located.find_item.as_ref().map_err(|error| error.clone())?;
-
     let player_data = unsafe { player.player_game_data.as_ref() };
     let info = &player_data.player_info;
     let stats = [info.strength, info.dexterity, info.intelligence, info.faith];
@@ -1115,54 +1297,13 @@ pub fn random_weapon(options: WeaponOptions) -> Result<String, String> {
     let item = ItemId::new(ItemCategory::Weapon, weapon)
         .map_err(|error| format!("weapon {weapon} has an invalid id: {error:?}"))?;
 
-    let game_data = unsafe { GameDataMan::instance_mut() }
-        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
-    game_data.give_item_directly(item, 1);
-
-    let player_addr = player as *mut PlayerIns as usize;
-    let equipment = unsafe { &mut player.player_game_data.as_mut().equipment };
-    let find: extern "C" fn(*mut std::ffi::c_void, *const u32) -> i32 =
-        unsafe { std::mem::transmute(find_item) };
-    let inventory = &mut equipment.equip_inventory_data as *mut _ as *mut std::ffi::c_void;
-    let index = find(inventory, &weapon);
-    if index < 0 {
-        return Err(format!("weapon {weapon} was not found in the inventory after giving it"));
-    }
-
-    let mut buffer = [0u8; EQUIP_BUFFER_SIZE];
-    buffer[EQUIP_BUFFER_INVENTORY_INDEX..EQUIP_BUFFER_INVENTORY_INDEX + 4]
-        .copy_from_slice(&index.to_le_bytes());
-    let equip: extern "C" fn(u32, *const u8) = unsafe { std::mem::transmute(equip_item) };
-
-    let flags_address = module_pointer(player_addr, EQUIP_UNLOCK_MODULE_OFFSET)?
-        .wrapping_add(EQUIP_UNLOCK_FLAGS_OFFSET);
-    let flags = read_u32_checked(flags_address)?;
-    write_u32_checked(flags_address, flags | 1)?;
-    equip(RIGHT_HAND_SLOT, buffer.as_ptr());
-    write_u32_checked(flags_address, flags)?;
-
-    let equipped = equipment.equipment_indexes[RIGHT_HAND_SLOT as usize];
-    if equipped != index {
-        return Err(format!(
-            "weapon {weapon} was added, but the game did not equip it (slot holds {equipped}, wanted {index})"
-        ));
-    }
+    give_and_equip(player, item, RIGHT_HAND_SLOT)?;
     let mut removal = "";
     if options.remove_old
-        && slot_index >= 0
-        && slot_index != index
         && is_removable_weapon(current)
-        && !equipment.equipment_indexes.contains(&slot_index)
+        && remove_inventory_entry(player, slot_index)?
     {
-        let address = *located.remove_item.as_ref().map_err(|error| error.clone())?;
-        let remove: extern "C" fn(*mut std::ffi::c_void, i32, u8, u8) -> u8 =
-            unsafe { std::mem::transmute(address) };
-        let target = equipment as *mut _ as *mut std::ffi::c_void;
-        removal = if remove(target, slot_index, 1, 1) != 0 {
-            ", removed the old weapon"
-        } else {
-            ", but the game did not remove the old weapon"
-        };
+        removal = ", removed the old weapon";
     }
     Ok(format!(
         "equipped weapon {weapon} (+{}, infusion {}), picked from {pool} weapons{removal}",
@@ -1576,6 +1717,15 @@ pub fn schemas_json() -> Value {
             ]
         },
         {
+            "id": "random_armor",
+            "name": "Random Armor",
+            "description": "Gives you a random piece for each armor slot and equips all four.",
+            "arguments": [
+                { "name": "removeOld", "type": "bool", "label": "Remove previous armor", "hint": "Permanently deletes the armor you were wearing. Empty slots are skipped.", "default": 1, "min": 0, "max": 1 },
+                { "name": "includeMissingDlc", "type": "bool", "label": "Include armor from DLC you do not have (experimental)", "hint": "Weapons from a missing DLC worked in a short test, but armor has not been tried.", "default": 0, "min": 0, "max": 1 }
+            ]
+        },
+        {
             "id": "set_health_percent",
             "name": "Set health percent",
             "description": "Sets current HP to a percentage of the local player's maximum HP.",
@@ -1892,8 +2042,9 @@ fn format_values(track: &Track) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_soul_delta, classify_slot, combined_speed, health_at_percent, is_base_weapon_id,
-        is_empty_item, is_movement_animation, is_removable_weapon, pick_infusion, pick_level,
+        apply_soul_delta, armor_available, classify_slot, combined_speed, is_real_armor, health_at_percent, is_base_weapon_id,
+        is_empty_item, is_listed_armor, is_movement_animation, is_removable_weapon, pick_infusion,
+        pick_level,
         usable_two_handed, weapon_available,
         weapon_infusion, weapon_level, WeaponTrait,
     };
@@ -1906,6 +2057,28 @@ mod tests {
         assert!(weapon_available(crow_talons, true, false));
         assert!(!weapon_available(spear, true, false));
         assert!(weapon_available(spear, false, true));
+    }
+
+    #[test]
+    fn armor_rules_match_the_dlc_and_empty_slots() {
+        let (vilhelm_helm, ringed_knight_hood, plain) = (20_000_000, 63_500_000, 1_000_000);
+        assert!(!is_real_armor(900_000));
+        assert!(is_real_armor(plain));
+        assert!(armor_available(plain, false, false));
+        assert!(!armor_available(vilhelm_helm, false, true));
+        assert!(armor_available(vilhelm_helm, true, false));
+        assert!(!armor_available(ringed_knight_hood, true, false));
+        assert!(armor_available(ringed_knight_hood, false, true));
+    }
+
+    #[test]
+    fn unused_armor_rows_are_not_listed() {
+        for id in [1_000_000, 1_001_000, 83_501_000, 900_000] {
+            assert!(!is_listed_armor(id), "{id}");
+        }
+        for id in [20_000_000, 63_500_000, 26_502_000] {
+            assert!(is_listed_armor(id), "{id}");
+        }
     }
 
     #[test]

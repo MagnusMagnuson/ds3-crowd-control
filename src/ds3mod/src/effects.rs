@@ -71,6 +71,10 @@ fn execute(handler: &str, args: &Value) -> Outcome {
                 include_missing_dlc: number("includeMissingDlc", 0) != 0,
             })
         }
+        "random_armor" => game::random_armor(game::ArmorOptions {
+            remove_old: args.get("removeOld").and_then(Value::as_i64).unwrap_or(1) != 0,
+            include_missing_dlc: args.get("includeMissingDlc").and_then(Value::as_i64).unwrap_or(0) != 0,
+        }),
         "set_health_percent" => {
             let percent = args.get("percent").and_then(Value::as_i64).unwrap_or(50);
             game::set_health_percent(percent.clamp(1, 100) as i32)

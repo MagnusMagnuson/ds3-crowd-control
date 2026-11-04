@@ -1,3 +1,4 @@
+mod armor_ids;
 mod effects;
 mod game;
 mod input;

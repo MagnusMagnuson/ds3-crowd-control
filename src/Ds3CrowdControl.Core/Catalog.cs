@@ -165,6 +165,17 @@ public static class BuiltinHandlers
         },
         new HandlerSchema
         {
+            Id = "random_armor",
+            Name = "Random Armor",
+            Description = "Gives you a random piece for each armor slot and equips all four.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "removeOld", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Remove previous armor", Hint = "Permanently deletes the armor you were wearing. Empty slots are skipped." },
+                new EffectArgumentSchema { Name = "includeMissingDlc", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Include armor from DLC you do not have (experimental)", Hint = "Weapons from a missing DLC worked in a short test, but armor has not been tried." }
+            ]
+        },
+        new HandlerSchema
+        {
             Id = "set_health_percent",
             Name = "Set health percent",
             Description = "Sets current HP to a percentage of the local player's maximum HP.",
@@ -233,6 +244,7 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("1 HP", "one_hp", catalog));
         catalog.Presets.Add(Preset("1 Hit Run", "one_hit_run", catalog));
         catalog.Presets.Add(Preset("Random Weapon", "random_weapon", catalog));
+        catalog.Presets.Add(Preset("Random Armor", "random_armor", catalog));
         catalog.Presets.Add(Preset("Set health to 50%", "set_health_percent", catalog));
         catalog.Presets.Add(Preset("Set health to random %", "set_health_random_percent", catalog));
         catalog.Presets.Add(Preset("Spawn random NPC invader", "spawn_npc_invader", catalog));
