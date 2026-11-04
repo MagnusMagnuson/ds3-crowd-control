@@ -50,7 +50,8 @@
                         <ItemsControl.ItemTemplate>
                             <DataTemplate>
                                 <StackPanel Margin="0,0,0,8">
-                                    <TextBlock Text="{Binding Label}" Visibility="{Binding IsTextBox, Converter={StaticResource BoolToVisibility}}" />
+                                    <TextBlock Text="{Binding Label}" Visibility="{Binding ShowsLabel, Converter={StaticResource BoolToVisibility}}" />
+                                    <ComboBox ItemsSource="{Binding Options}" SelectedIndex="{Binding SelectedIndex}" Margin="0,4,0,0" Visibility="{Binding IsChoice, Converter={StaticResource BoolToVisibility}}" />
                                     <TextBox Text="{Binding Value, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,0" Visibility="{Binding IsTextBox, Converter={StaticResource BoolToVisibility}}" />
                                     <CheckBox Content="{Binding Label}" IsChecked="{Binding IsChecked}" Foreground="#F3F3F3" Visibility="{Binding IsCheckBox, Converter={StaticResource BoolToVisibility}}" />
                                     <TextBlock Text="{Binding Hint}" TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,0" Visibility="{Binding HasHint, Converter={StaticResource BoolToVisibility}}" />

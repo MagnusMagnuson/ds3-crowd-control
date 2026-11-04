@@ -23,6 +23,7 @@ public sealed class EffectArgumentSchema
     public int? Max { get; set; }
     public string? Label { get; set; }
     public string? Hint { get; set; }
+    public List<string>? Options { get; set; }
 }
 
 public sealed class HandlerSchema
@@ -150,6 +151,20 @@ public static class BuiltinHandlers
         },
         new HandlerSchema
         {
+            Id = "random_weapon",
+            Name = "Random Weapon",
+            Description = "Gives you a random weapon and equips it in right hand slot 1.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "weaponLevel", Type = "choice", Default = 0, Min = 0, Max = 2, Label = "Weapon level", Options = ["+0", "Random", "Same as right hand 1"] },
+                new EffectArgumentSchema { Name = "infusion", Type = "choice", Default = 0, Min = 0, Max = 2, Label = "Infusion", Options = ["None", "Random", "Same as right hand 1"] },
+                new EffectArgumentSchema { Name = "removeOld", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Remove previous weapon", Hint = "Permanently deletes the weapon that was in right hand 1, including its upgrades. Fists are never removed." },
+                new EffectArgumentSchema { Name = "includeMissingDlc", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Include weapons from DLC you do not have (experimental)", Hint = "Worked in a short test without the DLC installed, but not every weapon has been tried." },
+                new EffectArgumentSchema { Name = "usableOnly", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Usable two-handed only", Hint = "Skips weapons your stats cannot use, counting Strength at 1.5x for two-handing." }
+            ]
+        },
+        new HandlerSchema
+        {
             Id = "set_health_percent",
             Name = "Set health percent",
             Description = "Sets current HP to a percentage of the local player's maximum HP.",
@@ -217,6 +232,7 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Increase Speed", "increase_speed", catalog));
         catalog.Presets.Add(Preset("1 HP", "one_hp", catalog));
         catalog.Presets.Add(Preset("1 Hit Run", "one_hit_run", catalog));
+        catalog.Presets.Add(Preset("Random Weapon", "random_weapon", catalog));
         catalog.Presets.Add(Preset("Set health to 50%", "set_health_percent", catalog));
         catalog.Presets.Add(Preset("Set health to random %", "set_health_random_percent", catalog));
         catalog.Presets.Add(Preset("Spawn random NPC invader", "spawn_npc_invader", catalog));
@@ -286,7 +302,8 @@ public sealed class Catalog
             Min = argument.Min,
             Max = argument.Max,
             Label = argument.Label,
-            Hint = argument.Hint
+            Hint = argument.Hint,
+            Options = argument.Options?.ToList()
         }).ToList()
     };
 }

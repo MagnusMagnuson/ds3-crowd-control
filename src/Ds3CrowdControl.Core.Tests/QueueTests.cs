@@ -60,6 +60,12 @@ public class CatalogTests
         Assert.Contains(loaded.Presets, preset => preset.Name == "1 HP" && preset.HandlerId == "one_hp");
         var oneHitRun = loaded.Presets.Single(preset => preset.HandlerId == "one_hit_run");
         Assert.Equal(30, oneHitRun.Arguments["seconds"].GetInt32());
+        var randomWeapon = loaded.Presets.Single(preset => preset.Name == "Random Weapon" && preset.HandlerId == "random_weapon");
+        Assert.Equal(0, randomWeapon.Arguments["weaponLevel"].GetInt32());
+        Assert.Equal(0, randomWeapon.Arguments["infusion"].GetInt32());
+        Assert.Equal(1, randomWeapon.Arguments["usableOnly"].GetInt32());
+        Assert.Equal(1, randomWeapon.Arguments["removeOld"].GetInt32());
+        Assert.Equal(0, randomWeapon.Arguments["includeMissingDlc"].GetInt32());
         var halfHealth = loaded.Presets.Single(preset => preset.HandlerId == "set_health_percent");
         Assert.Equal(50, halfHealth.Arguments["percent"].GetInt32());
         Assert.Contains(loaded.Presets, preset => preset.HandlerId == "set_health_random_percent");

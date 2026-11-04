@@ -3,7 +3,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use darksouls3::app_menu::NewMenuSystem;
-use darksouls3::sprj::{GameDataMan, MenuMan, PlayerGameData, PlayerIns, WorldChrMan};
+use darksouls3::param::{EQUIP_PARAM_WEAPON_ST, REINFORCE_PARAM_WEAPON_ST};
+use darksouls3::sprj::{
+    CSRegulationManager, GameDataMan, ItemCategory, ItemId, MenuMan, PlayerGameData, PlayerIns,
+    WorldChrMan,
+};
 use pelite::pe64::Pe;
 use serde_json::{json, Value};
 use fromsoftware_shared::{FromStatic, Program};
@@ -33,12 +37,26 @@ const FADE_CALL_OFFSET: usize = 22;
 /// The function behind the event script's `SaveRequest` command.
 const SAVE_REQUEST_PATTERN: &str =
     "48 83 EC 28 E8 ?? ?? ?? ?? 84 C0 74 ?? 48 8D 4C 24 30 C6 44 24 30 2A E8 ?? ?? ?? ?? 84 C0 74";
+/// The equipment menu's "equip this" routine: `(slot, buffer)`. It reads the inventory
+/// index at buffer +0x38 and does the same refreshes as choosing a weapon in the menu.
+const EQUIP_ITEM_PATTERN: &str =
+    "48 8B C4 57 41 56 41 57 48 81 EC 90 00 00 00 48 C7 40 98 FE FF FF FF 48 89 58 08 48 89 68 10 48 89 70 20 48 8B DA 8B F9 E8";
+/// Looks up an item's inventory index: `(inventory, &item_id)`, -1 if it is missing.
+const FIND_ITEM_PATTERN: &str =
+    "40 56 48 83 EC 20 83 CE FF 83 3A FF 74 59 48 89 5C 24 30 48 89 7C 24 38 48 8D 79 10 48 8B CF E8";
+/// Removes one exact inventory entry: `(EquipGameData, index, 1, 1)`. It unequips the
+/// item first and is what the event script's remove-item command uses.
+const REMOVE_ITEM_PATTERN: &str =
+    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 41 0F B6 F1 41 0F B6 E8 8B FA 48 8B D9 E8";
 struct Located {
     game_man_slot: Result<usize, String>,
     add_soul: Result<usize, String>,
     set_text_effect: Result<usize, String>,
     fade: Result<FadeSystem, String>,
     save_request: Result<usize, String>,
+    equip_item: Result<usize, String>,
+    find_item: Result<usize, String>,
+    remove_item: Result<usize, String>,
 }
 
 #[derive(Clone, Copy)]
@@ -59,14 +77,18 @@ pub fn prepare() {
             set_text_effect: find_unique(SET_TEXT_EFFECT_PATTERN),
             fade: locate_fade_system(),
             save_request: find_unique(SAVE_REQUEST_PATTERN),
+            equip_item: find_unique(EQUIP_ITEM_PATTERN),
+            find_item: find_unique(FIND_ITEM_PATTERN),
+            remove_item: find_unique(REMOVE_ITEM_PATTERN),
         };
         crate::log::log(format!(
-            "patterns resolved: session={} souls={} text_effect={} fade={} save={}",
+            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={}",
             located.game_man_slot.is_ok(),
             located.add_soul.is_ok(),
             located.set_text_effect.is_ok(),
             located.fade.is_ok(),
             located.save_request.is_ok(),
+            located.equip_item.is_ok() && located.find_item.is_ok() && located.remove_item.is_ok(),
         ));
         located
     });
@@ -894,6 +916,261 @@ pub fn poll_one_hit_run() {
     }));
 }
 
+const RIGHT_HAND_SLOT: u32 = 1;
+const EQUIP_BUFFER_SIZE: usize = 0x100;
+const EQUIP_BUFFER_INVENTORY_INDEX: usize = 0x38;
+/// Bit 0 here allows equipment changes outside the menu.
+const EQUIP_UNLOCK_MODULE_OFFSET: usize = 0;
+const EQUIP_UNLOCK_FLAGS_OFFSET: usize = 0x10;
+
+/// Base weapons only: infusions add 100 to the id and upgrades add 1. Ids below 1000000
+/// are fists and ids from 20000000 are shields and ammo.
+pub fn is_base_weapon_id(id: u64) -> bool {
+    id % 10_000 == 0 && (1_000_000..20_000_000).contains(&id)
+}
+
+fn random_index(length: usize) -> usize {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0)
+        .wrapping_add(COUNTER.fetch_add(1, Ordering::Relaxed));
+    let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    ((mixed >> 32) as usize) % length.max(1)
+}
+
+/// How one property of the new weapon is chosen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeaponTrait {
+    Base,
+    Random,
+    SameAsRightHand,
+}
+
+impl WeaponTrait {
+    pub fn from_index(index: i64) -> Self {
+        match index {
+            1 => Self::Random,
+            2 => Self::SameAsRightHand,
+            _ => Self::Base,
+        }
+    }
+}
+
+pub struct WeaponOptions {
+    pub level: WeaponTrait,
+    pub infusion: WeaponTrait,
+    pub usable_only: bool,
+    pub remove_old: bool,
+    pub include_missing_dlc: bool,
+}
+
+/// The weapon data holds DLC weapons whether or not the DLC is installed, and its
+/// `simple_model_for_dlc` flag is unset for every weapon, so these are listed by hand.
+/// All ids were checked against the game's data.
+const ASHES_OF_ARIANDEL_WEAPONS: [u32; 13] = [
+    2_240_000, 4_120_000, 7_170_000, 7_180_000, 8_310_000, 9_230_000, 10_180_000, 11_050_000,
+    12_070_000, 13_410_000, 14_180_000, 16_140_000, 16_150_000,
+];
+const RINGED_CITY_WEAPONS: [u32; 19] = [
+    1_140_000, 1_150_000, 2_250_000, 2_260_000, 4_130_000, 5_060_000, 6_380_000, 8_320_000,
+    9_240_000, 9_250_000, 9_260_000, 10_170_000, 13_420_000, 13_430_000, 13_440_000, 14_120_000,
+    14_190_000, 16_120_000, 16_160_000,
+];
+
+pub fn weapon_available(base: u32, ashes_installed: bool, ringed_city_installed: bool) -> bool {
+    (ashes_installed || !ASHES_OF_ARIANDEL_WEAPONS.contains(&base))
+        && (ringed_city_installed || !RINGED_CITY_WEAPONS.contains(&base))
+}
+
+const INFUSION_COUNT: u32 = 16;
+const MAX_WEAPON_LEVEL: u32 = 15;
+
+/// Fists fill an empty hand and sit below the real weapon ids.
+pub fn is_removable_weapon(id: u32) -> bool {
+    id >= 1_000_000
+}
+
+/// A weapon id is the base id, plus 100 per infusion, plus 1 per level.
+pub fn weapon_level(id: u32) -> u32 {
+    id % 100
+}
+
+pub fn weapon_infusion(id: u32) -> u32 {
+    id % 10_000 / 100
+}
+
+pub fn pick_level(choice: WeaponTrait, max: u32, current: u32, roll: usize) -> u32 {
+    match choice {
+        WeaponTrait::Base => 0,
+        WeaponTrait::Random => roll as u32 % (max + 1),
+        WeaponTrait::SameAsRightHand => current.min(max),
+    }
+}
+
+pub fn pick_infusion(choice: WeaponTrait, available: &[u32], current: u32, roll: usize) -> u32 {
+    match choice {
+        WeaponTrait::Base => 0,
+        WeaponTrait::Random if available.is_empty() => 0,
+        WeaponTrait::Random => available[roll % available.len()],
+        WeaponTrait::SameAsRightHand if available.contains(&current) => current,
+        WeaponTrait::SameAsRightHand => 0,
+    }
+}
+
+/// Requirements and stats are strength, dexterity, intelligence, faith.
+pub fn usable_two_handed(stats: [u32; 4], requirements: [u8; 4]) -> bool {
+    stats[0] * 3 / 2 >= requirements[0] as u32
+        && stats[1] >= requirements[1] as u32
+        && stats[2] >= requirements[2] as u32
+        && stats[3] >= requirements[3] as u32
+}
+
+/// Returns the final weapon id and how many weapons it was picked from.
+fn choose_weapon(options: &WeaponOptions, current: u32, stats: [u32; 4]) -> Result<(u32, usize), String> {
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the weapon list is unavailable: {error:?}"))?;
+    let weapons = regulation.get_param::<EQUIP_PARAM_WEAPON_ST>();
+    let requirements = |row: &EQUIP_PARAM_WEAPON_ST| {
+        [row.proper_strength(), row.proper_agility(), row.proper_magic(), row.proper_faith()]
+    };
+
+    // Unknown DLC status counts as not installed, which only makes the pool smaller.
+    let (ashes, ringed_city) = unsafe { darksouls3::cs::CSDlc::instance() }
+        .map(|dlc| (dlc.dlc1_installed, dlc.dlc2_installed))
+        .unwrap_or((false, false));
+
+    let mut candidates = Vec::new();
+    for (id, row) in weapons.iter() {
+        if !is_base_weapon_id(id) || row.sort_id() <= 0 {
+            continue;
+        }
+        let base = id as u32;
+        if !options.include_missing_dlc && !weapon_available(base, ashes, ringed_city) {
+            continue;
+        }
+        let available: Vec<u32> = (0..INFUSION_COUNT)
+            .filter(|infusion| weapons.get(u64::from(base + infusion * 100)).is_some())
+            .collect();
+        let infusion = pick_infusion(
+            options.infusion,
+            &available,
+            weapon_infusion(current),
+            random_index(INFUSION_COUNT as usize),
+        );
+        let variant = base + infusion * 100;
+        let Some(variant_row) = weapons.get(u64::from(variant)) else {
+            continue;
+        };
+        if !options.usable_only || usable_two_handed(stats, requirements(variant_row)) {
+            candidates.push(variant);
+        }
+    }
+    if candidates.is_empty() {
+        return Err("no weapon in the game data fits these options".to_string());
+    }
+
+    let variant = candidates[random_index(candidates.len())];
+    let row = weapons
+        .get(u64::from(variant))
+        .ok_or_else(|| format!("weapon {variant} disappeared from the game data"))?;
+    let reinforce = regulation.get_param::<REINFORCE_PARAM_WEAPON_ST>();
+    let reinforce_type = u64::from(row.reinforce_type_id().max(0) as u16);
+    let max_level = (1..=MAX_WEAPON_LEVEL)
+        .take_while(|level| reinforce.get(reinforce_type + u64::from(*level)).is_some())
+        .count() as u32;
+    let level = pick_level(
+        options.level,
+        max_level,
+        weapon_level(current),
+        random_index(MAX_WEAPON_LEVEL as usize + 1),
+    );
+    Ok((variant + level, candidates.len()))
+}
+
+pub fn random_weapon(options: WeaponOptions) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let located = cached()?;
+    let equip_item = *located.equip_item.as_ref().map_err(|error| error.clone())?;
+    let find_item = *located.find_item.as_ref().map_err(|error| error.clone())?;
+
+    let player_data = unsafe { player.player_game_data.as_ref() };
+    let info = &player_data.player_info;
+    let stats = [info.strength, info.dexterity, info.intelligence, info.faith];
+    let slot_index = player_data.equipment.equipment_indexes[RIGHT_HAND_SLOT as usize];
+    let current = u32::try_from(slot_index)
+        .ok()
+        .and_then(|index| {
+            player_data.equipment.equip_inventory_data.items_data[index]
+                .as_option()
+                .map(|entry| entry.item_id.param_id())
+        })
+        .unwrap_or(0);
+    let (weapon, pool) = choose_weapon(&options, current, stats)?;
+    let item = ItemId::new(ItemCategory::Weapon, weapon)
+        .map_err(|error| format!("weapon {weapon} has an invalid id: {error:?}"))?;
+
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    game_data.give_item_directly(item, 1);
+
+    let player_addr = player as *mut PlayerIns as usize;
+    let equipment = unsafe { &mut player.player_game_data.as_mut().equipment };
+    let find: extern "C" fn(*mut std::ffi::c_void, *const u32) -> i32 =
+        unsafe { std::mem::transmute(find_item) };
+    let inventory = &mut equipment.equip_inventory_data as *mut _ as *mut std::ffi::c_void;
+    let index = find(inventory, &weapon);
+    if index < 0 {
+        return Err(format!("weapon {weapon} was not found in the inventory after giving it"));
+    }
+
+    let mut buffer = [0u8; EQUIP_BUFFER_SIZE];
+    buffer[EQUIP_BUFFER_INVENTORY_INDEX..EQUIP_BUFFER_INVENTORY_INDEX + 4]
+        .copy_from_slice(&index.to_le_bytes());
+    let equip: extern "C" fn(u32, *const u8) = unsafe { std::mem::transmute(equip_item) };
+
+    let flags_address = module_pointer(player_addr, EQUIP_UNLOCK_MODULE_OFFSET)?
+        .wrapping_add(EQUIP_UNLOCK_FLAGS_OFFSET);
+    let flags = read_u32_checked(flags_address)?;
+    write_u32_checked(flags_address, flags | 1)?;
+    equip(RIGHT_HAND_SLOT, buffer.as_ptr());
+    write_u32_checked(flags_address, flags)?;
+
+    let equipped = equipment.equipment_indexes[RIGHT_HAND_SLOT as usize];
+    if equipped != index {
+        return Err(format!(
+            "weapon {weapon} was added, but the game did not equip it (slot holds {equipped}, wanted {index})"
+        ));
+    }
+    let mut removal = "";
+    if options.remove_old
+        && slot_index >= 0
+        && slot_index != index
+        && is_removable_weapon(current)
+        && !equipment.equipment_indexes.contains(&slot_index)
+    {
+        let address = *located.remove_item.as_ref().map_err(|error| error.clone())?;
+        let remove: extern "C" fn(*mut std::ffi::c_void, i32, u8, u8) -> u8 =
+            unsafe { std::mem::transmute(address) };
+        let target = equipment as *mut _ as *mut std::ffi::c_void;
+        removal = if remove(target, slot_index, 1, 1) != 0 {
+            ", removed the old weapon"
+        } else {
+            ", but the game did not remove the old weapon"
+        };
+    }
+    Ok(format!(
+        "equipped weapon {weapon} (+{}, infusion {}), picked from {pool} weapons{removal}",
+        weapon_level(weapon),
+        weapon_infusion(weapon),
+    ))
+}
+
 pub fn set_health_percent(percent: i32) -> Result<String, String> {
     let player = unsafe { &mut *local_player()? };
     let data = &mut player.super_chr_ins.modules.data;
@@ -1287,6 +1564,18 @@ pub fn schemas_json() -> Value {
             "arguments": [{ "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 }]
         },
         {
+            "id": "random_weapon",
+            "name": "Random Weapon",
+            "description": "Gives you a random weapon and equips it in right hand slot 1.",
+            "arguments": [
+                { "name": "weaponLevel", "type": "choice", "label": "Weapon level", "options": ["+0", "Random", "Same as right hand 1"], "default": 0, "min": 0, "max": 2 },
+                { "name": "infusion", "type": "choice", "label": "Infusion", "options": ["None", "Random", "Same as right hand 1"], "default": 0, "min": 0, "max": 2 },
+                { "name": "removeOld", "type": "bool", "label": "Remove previous weapon", "hint": "Permanently deletes the weapon that was in right hand 1, including its upgrades. Fists are never removed.", "default": 1, "min": 0, "max": 1 },
+                { "name": "includeMissingDlc", "type": "bool", "label": "Include weapons from DLC you do not have (experimental)", "hint": "Worked in a short test without the DLC installed, but not every weapon has been tried.", "default": 0, "min": 0, "max": 1 },
+                { "name": "usableOnly", "type": "bool", "label": "Usable two-handed only", "hint": "Skips weapons your stats cannot use, counting Strength at 1.5x for two-handing.", "default": 1, "min": 0, "max": 1 }
+            ]
+        },
+        {
             "id": "set_health_percent",
             "name": "Set health percent",
             "description": "Sets current HP to a percentage of the local player's maximum HP.",
@@ -1603,9 +1892,74 @@ fn format_values(track: &Track) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_soul_delta, classify_slot, combined_speed, health_at_percent, is_empty_item,
-        is_movement_animation,
+        apply_soul_delta, classify_slot, combined_speed, health_at_percent, is_base_weapon_id,
+        is_empty_item, is_movement_animation, is_removable_weapon, pick_infusion, pick_level,
+        usable_two_handed, weapon_available,
+        weapon_infusion, weapon_level, WeaponTrait,
     };
+
+    #[test]
+    fn dlc_weapons_need_their_dlc() {
+        let (crow_talons, spear, longsword) = (11_050_000, 9_240_000, 2_000_000);
+        assert!(weapon_available(longsword, false, false));
+        assert!(!weapon_available(crow_talons, false, true));
+        assert!(weapon_available(crow_talons, true, false));
+        assert!(!weapon_available(spear, true, false));
+        assert!(weapon_available(spear, false, true));
+    }
+
+    #[test]
+    fn fists_are_never_removed() {
+        assert!(!is_removable_weapon(0));
+        assert!(!is_removable_weapon(110_000));
+        assert!(is_removable_weapon(1_000_000));
+        assert!(is_removable_weapon(16_000_805));
+    }
+
+    #[test]
+    fn weapon_ids_split_into_infusion_and_level() {
+        assert_eq!(weapon_infusion(16_000_805), 8);
+        assert_eq!(weapon_level(16_000_805), 5);
+        assert_eq!(weapon_infusion(3_000_000), 0);
+    }
+
+    #[test]
+    fn levels_follow_the_option_and_the_weapon_maximum() {
+        assert_eq!(pick_level(WeaponTrait::Base, 10, 7, 3), 0);
+        assert_eq!(pick_level(WeaponTrait::SameAsRightHand, 10, 7, 3), 7);
+        assert_eq!(pick_level(WeaponTrait::SameAsRightHand, 5, 10, 3), 5);
+        for roll in 0..50 {
+            assert!(pick_level(WeaponTrait::Random, 5, 0, roll) <= 5);
+        }
+    }
+
+    #[test]
+    fn infusions_only_use_what_the_weapon_allows() {
+        let available = [0, 1, 8];
+        assert_eq!(pick_infusion(WeaponTrait::Base, &available, 8, 1), 0);
+        assert_eq!(pick_infusion(WeaponTrait::SameAsRightHand, &available, 8, 1), 8);
+        assert_eq!(pick_infusion(WeaponTrait::SameAsRightHand, &available, 5, 1), 0);
+        assert_eq!(pick_infusion(WeaponTrait::Random, &[0], 8, 7), 0);
+        assert!(available.contains(&pick_infusion(WeaponTrait::Random, &available, 0, 7)));
+    }
+
+    #[test]
+    fn two_handing_counts_strength_at_one_and_a_half() {
+        assert!(usable_two_handed([20, 10, 10, 10], [30, 10, 10, 10]));
+        assert!(!usable_two_handed([19, 10, 10, 10], [30, 10, 10, 10]));
+        assert!(!usable_two_handed([40, 9, 10, 10], [10, 10, 10, 10]));
+    }
+
+    #[test]
+    fn only_base_weapons_are_picked() {
+        for id in [1_000_000, 3_000_000, 11_040_000, 16_000_000] {
+            assert!(is_base_weapon_id(id), "{id}");
+        }
+        // Fists, an upgrade, an infusion, a shield and an arrow.
+        for id in [110_000, 3_000_001, 16_000_800, 21_000_000, 50_000_000] {
+            assert!(!is_base_weapon_id(id), "{id}");
+        }
+    }
 
     #[test]
     fn only_idle_and_locomotion_count_as_movement() {

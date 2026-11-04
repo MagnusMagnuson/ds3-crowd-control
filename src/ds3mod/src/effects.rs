@@ -59,6 +59,18 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
             game::one_hit_run(seconds.clamp(1, 300) as i32)
         }
+        "random_weapon" => {
+            let number = |name: &str, default: i64| {
+                args.get(name).and_then(Value::as_i64).unwrap_or(default)
+            };
+            game::random_weapon(game::WeaponOptions {
+                level: game::WeaponTrait::from_index(number("weaponLevel", 0)),
+                infusion: game::WeaponTrait::from_index(number("infusion", 0)),
+                usable_only: number("usableOnly", 1) != 0,
+                remove_old: number("removeOld", 1) != 0,
+                include_missing_dlc: number("includeMissingDlc", 0) != 0,
+            })
+        }
         "set_health_percent" => {
             let percent = args.get("percent").and_then(Value::as_i64).unwrap_or(50);
             game::set_health_percent(percent.clamp(1, 100) as i32)

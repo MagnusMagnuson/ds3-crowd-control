@@ -11,12 +11,13 @@ namespace Ds3CrowdControl.Manager;
 
 public partial class ArgumentEditor : ObservableObject
 {
-    public ArgumentEditor(string name, string type, string value, string? label = null, string? hint = null)
+    public ArgumentEditor(string name, string type, string value, string? label = null, string? hint = null, IReadOnlyList<string>? options = null)
     {
         Name = name;
         Type = type;
         Label = label ?? name;
         Hint = hint ?? "";
+        Options = options ?? [];
         _value = value;
     }
 
@@ -25,7 +26,16 @@ public partial class ArgumentEditor : ObservableObject
     public string Label { get; }
     public string Hint { get; }
     public bool IsCheckBox => Type == "bool";
-    public bool IsTextBox => !IsCheckBox;
+    public bool IsChoice => Type == "choice";
+    public bool IsTextBox => !IsCheckBox && !IsChoice;
+    public bool ShowsLabel => !IsCheckBox;
+    public IReadOnlyList<string> Options { get; }
+
+    public int SelectedIndex
+    {
+        get => int.TryParse(Value, out var index) ? index : 0;
+        set => Value = value.ToString();
+    }
     public bool HasHint => Hint.Length > 0;
 
     public bool IsChecked
@@ -80,6 +90,7 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("Increase Speed", "increase_speed"),
                 _catalog.EnsurePreset("1 HP", "one_hp"),
                 _catalog.EnsurePreset("1 Hit Run", "one_hit_run"),
+                _catalog.EnsurePreset("Random Weapon", "random_weapon"),
                 _catalog.EnsurePreset("Set health to 50%", "set_health_percent"),
                 _catalog.EnsurePreset("Set health to random %", "set_health_random_percent"),
                 _catalog.EnsurePreset("Watch item button", "watch_item_button")
@@ -295,7 +306,8 @@ public partial class MainViewModel : ObservableObject
             {
                 var leftArgument = left.Arguments[argumentIndex];
                 var rightArgument = right.Arguments[argumentIndex];
-                if (leftArgument.Label != rightArgument.Label || leftArgument.Hint != rightArgument.Hint)
+                if (leftArgument.Label != rightArgument.Label || leftArgument.Hint != rightArgument.Hint ||
+                    !(leftArgument.Options ?? []).SequenceEqual(rightArgument.Options ?? []))
                 {
                     return false;
                 }
@@ -376,7 +388,7 @@ public partial class MainViewModel : ObservableObject
                 JsonValueKind.Undefined or JsonValueKind.Null => argument.Type == "string" ? argument.DefaultText ?? "" : (argument.Default ?? 0).ToString(),
                 _ => stored.ToString()
             };
-            Arguments.Add(new ArgumentEditor(argument.Name, argument.Type, text, argument.Label, argument.Hint));
+            Arguments.Add(new ArgumentEditor(argument.Name, argument.Type, text, argument.Label, argument.Hint, argument.Options));
         }
     }
 
