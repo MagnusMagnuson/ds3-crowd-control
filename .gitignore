@@ -1,0 +1,10 @@
+bin/
+obj/
+.vs/
+*.user
+TestResults/
+target/
+**/target/
+*.log
+.idea/
+DarkSoulsIII.exe
