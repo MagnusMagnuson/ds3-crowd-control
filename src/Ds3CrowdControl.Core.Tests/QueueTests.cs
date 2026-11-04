@@ -9,6 +9,31 @@ namespace Ds3CrowdControl.Core.Tests;
 public class CatalogTests
 {
     [Fact]
+    public void Loading_replaces_a_saved_schema_from_an_older_build()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "ds3-cc-tests", Guid.NewGuid().ToString("N"), "catalog.json");
+        var saved = Catalog.CreateDefault();
+        saved.FindHandler("decrease_speed")!.Arguments.RemoveAll(argument => argument.Name == "movementOnly");
+        CatalogStore.Save(saved, path);
+
+        var loaded = CatalogStore.LoadOrCreate(path);
+
+        Assert.Contains(loaded.FindHandler("decrease_speed")!.Arguments, argument => argument.Name == "movementOnly");
+    }
+
+    [Fact]
+    public void Presets_without_a_handler_are_removed()
+    {
+        var catalog = Catalog.CreateDefault();
+        catalog.Handlers.RemoveAll(handler => handler.Id == "kill_player");
+
+        var removed = catalog.RemoveOrphanPresets();
+
+        Assert.Equal("kill_player", Assert.Single(removed).HandlerId);
+        Assert.DoesNotContain(catalog.Presets, preset => preset.HandlerId == "kill_player");
+    }
+
+    [Fact]
     public void DefaultCatalogRoundTrips()
     {
         var path = Path.Combine(Path.GetTempPath(), "ds3-cc-tests", Guid.NewGuid().ToString("N"), "catalog.json");
@@ -18,9 +43,23 @@ public class CatalogTests
 
         Assert.Contains(loaded.Presets, preset => preset.Name == "Lose 100 souls" && preset.HandlerId == "adjust_souls");
         Assert.Contains(loaded.Presets, preset => preset.Name == "Kill player" && preset.HandlerId == "kill_player");
-        Assert.Contains(loaded.Presets, preset => preset.Name == "Fake death" && preset.HandlerId == "fake_death");
-        Assert.Contains(loaded.Presets, preset => preset.Name == "Fake death with YOU DIED" && preset.HandlerId == "fake_death_staged");
+        Assert.Contains(loaded.Presets, preset => preset.Name == "Fake Death" && preset.HandlerId == "fake_death");
+        Assert.DoesNotContain(loaded.Presets, preset => preset.HandlerId == "fake_death_staged");
         Assert.Contains(loaded.Presets, preset => preset.Name == "Show YOU DIED" && preset.HandlerId == "show_you_died");
+        Assert.Contains(loaded.Presets, preset => preset.Name == "Empty Stamina" && preset.HandlerId == "empty_stamina");
+        var noStamina = loaded.Presets.Single(preset => preset.HandlerId == "no_stamina");
+        Assert.Equal(5, noStamina.Arguments["seconds"].GetInt32());
+        foreach (var handlerId in new[] { "decrease_speed", "increase_speed" })
+        {
+            var speed = loaded.Presets.Single(preset => preset.HandlerId == handlerId);
+            Assert.Equal(30, speed.Arguments["percent"].GetInt32());
+            Assert.Equal(30, speed.Arguments["seconds"].GetInt32());
+            Assert.Equal(0, speed.Arguments["movementOnly"].GetInt32());
+        }
+
+        Assert.Contains(loaded.Presets, preset => preset.Name == "1 HP" && preset.HandlerId == "one_hp");
+        var oneHitRun = loaded.Presets.Single(preset => preset.HandlerId == "one_hit_run");
+        Assert.Equal(30, oneHitRun.Arguments["seconds"].GetInt32());
         var halfHealth = loaded.Presets.Single(preset => preset.HandlerId == "set_health_percent");
         Assert.Equal(50, halfHealth.Arguments["percent"].GetInt32());
         Assert.Contains(loaded.Presets, preset => preset.HandlerId == "set_health_random_percent");

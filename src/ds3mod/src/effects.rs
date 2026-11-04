@@ -40,8 +40,25 @@ fn execute(handler: &str, args: &Value) -> Outcome {
         "use_selected_item" => game::use_selected_item(),
         "kill_player" => game::kill_player(),
         "fake_death" => game::start_fake_death(),
-        "fake_death_staged" => game::start_staged_fake_death(),
         "show_you_died" => game::show_you_died(),
+        "empty_stamina" => game::empty_stamina(),
+        "no_stamina" => {
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(5);
+            game::no_stamina(seconds.clamp(1, 60) as i32)
+        }
+        "decrease_speed" => {
+            let (percent, seconds, movement_only) = speed_args(args);
+            game::change_speed(-percent.clamp(1, 90), seconds, movement_only)
+        }
+        "increase_speed" => {
+            let (percent, seconds, movement_only) = speed_args(args);
+            game::change_speed(percent.clamp(1, 300), seconds, movement_only)
+        }
+        "one_hp" => game::one_hp(),
+        "one_hit_run" => {
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
+            game::one_hit_run(seconds.clamp(1, 300) as i32)
+        }
         "set_health_percent" => {
             let percent = args.get("percent").and_then(Value::as_i64).unwrap_or(50);
             game::set_health_percent(percent.clamp(1, 100) as i32)
@@ -58,6 +75,13 @@ fn execute(handler: &str, args: &Value) -> Outcome {
         Ok(message) => Outcome::Success(message),
         Err(message) => Outcome::Failed(message),
     }
+}
+
+fn speed_args(args: &Value) -> (i32, i32, bool) {
+    let percent = args.get("percent").and_then(Value::as_i64).unwrap_or(30);
+    let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
+    let movement_only = args.get("movementOnly").and_then(Value::as_i64).unwrap_or(0) != 0;
+    (percent.clamp(1, 300) as i32, seconds.clamp(1, 300) as i32, movement_only)
 }
 
 pub fn spawn_unavailable() -> Outcome {

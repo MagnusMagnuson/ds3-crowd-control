@@ -109,8 +109,24 @@ fn run() {
             let handle = tasks.run_recurring(
                 |_data: &usize| {
                     input::sample_current(input::Phase::ChrInsPreBehavior);
+                    game::poll_stamina_lock();
+                    game::poll_speed_changes();
                 },
                 SprjTaskGroupIndex::ChrIns_PreBehavior,
+            );
+            std::mem::forget(handle);
+            let handle = tasks.run_recurring(
+                |_data: &usize| {
+                    game::poll_speed_changes();
+                },
+                SprjTaskGroupIndex::ChrIns_BehaviorSafe,
+            );
+            std::mem::forget(handle);
+            let handle = tasks.run_recurring(
+                |_data: &usize| {
+                    game::poll_speed_changes();
+                },
+                SprjTaskGroupIndex::ChrIns_PrePhysicsSafe,
             );
             std::mem::forget(handle);
         }
@@ -129,6 +145,9 @@ fn run() {
 fn on_frame() {
     input::frame_begin();
     game::poll_fake_death();
+    game::poll_one_hit_run();
+    game::poll_speed_changes();
+    game::poll_stamina_lock();
     game::poll_button_watch();
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

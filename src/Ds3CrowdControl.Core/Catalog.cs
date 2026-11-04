@@ -21,6 +21,8 @@ public sealed class EffectArgumentSchema
     public string? DefaultText { get; set; }
     public int? Min { get; set; }
     public int? Max { get; set; }
+    public string? Label { get; set; }
+    public string? Hint { get; set; }
 }
 
 public sealed class HandlerSchema
@@ -83,14 +85,7 @@ public static class BuiltinHandlers
         new HandlerSchema
         {
             Id = "fake_death",
-            Name = "Fake death",
-            Description = "Plays the death animation, then stands you back up at your previous HP and souls before the bonfire reload.",
-            Arguments = []
-        },
-        new HandlerSchema
-        {
-            Id = "fake_death_staged",
-            Name = "Fake death with YOU DIED",
+            Name = "Fake Death",
             Description = "Plays the death animation, grey screen and YOU DIED banner, fades to black, then stands you back up at your previous HP and souls.",
             Arguments = []
         },
@@ -100,6 +95,58 @@ public static class BuiltinHandlers
             Name = "Show YOU DIED",
             Description = "Shows the YOU DIED banner with its sound. The player stays alive and the area does not reload.",
             Arguments = []
+        },
+        new HandlerSchema
+        {
+            Id = "empty_stamina",
+            Name = "Empty Stamina",
+            Description = "Sets current stamina to 0. Being on a ladder with no stamina makes you fall off.",
+            Arguments = []
+        },
+        new HandlerSchema
+        {
+            Id = "no_stamina",
+            Name = "No Stamina",
+            Description = "Holds stamina empty for the chosen number of seconds, blocking sprinting, rolling and attacks.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 5, Min = 1, Max = 60 }]
+        },
+        new HandlerSchema
+        {
+            Id = "decrease_speed",
+            Name = "Decrease Speed",
+            Description = "Slows the player by a percentage for the chosen time. Adds together with Increase Speed.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "percent", Type = "int", Default = 30, Min = 1, Max = 90 },
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 1, Max = 300 },
+                new EffectArgumentSchema { Name = "movementOnly", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Movement only (experimental)", Hint = "Only walking, running and rolling change speed. Attacks can still start at the changed speed, because the game reports them a moment late." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "increase_speed",
+            Name = "Increase Speed",
+            Description = "Speeds up the player by a percentage for the chosen time. Adds together with Decrease Speed.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "percent", Type = "int", Default = 30, Min = 1, Max = 300 },
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 1, Max = 300 },
+                new EffectArgumentSchema { Name = "movementOnly", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Movement only (experimental)", Hint = "Only walking, running and rolling change speed. Attacks can still start at the changed speed, because the game reports them a moment late." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "one_hp",
+            Name = "1 HP",
+            Description = "Sets current HP to 1.",
+            Arguments = []
+        },
+        new HandlerSchema
+        {
+            Id = "one_hit_run",
+            Name = "1 Hit Run",
+            Description = "Holds HP at 1 for the chosen number of seconds, so healing does nothing and any hit kills.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 1, Max = 300 }]
         },
         new HandlerSchema
         {
@@ -162,9 +209,14 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Lose 100 souls", "adjust_souls", catalog));
         catalog.Presets.Add(Preset("Use selected item", "use_selected_item", catalog));
         catalog.Presets.Add(Preset("Kill player", "kill_player", catalog));
-        catalog.Presets.Add(Preset("Fake death", "fake_death", catalog));
-        catalog.Presets.Add(Preset("Fake death with YOU DIED", "fake_death_staged", catalog));
+        catalog.Presets.Add(Preset("Fake Death", "fake_death", catalog));
         catalog.Presets.Add(Preset("Show YOU DIED", "show_you_died", catalog));
+        catalog.Presets.Add(Preset("Empty Stamina", "empty_stamina", catalog));
+        catalog.Presets.Add(Preset("No Stamina", "no_stamina", catalog));
+        catalog.Presets.Add(Preset("Decrease Speed", "decrease_speed", catalog));
+        catalog.Presets.Add(Preset("Increase Speed", "increase_speed", catalog));
+        catalog.Presets.Add(Preset("1 HP", "one_hp", catalog));
+        catalog.Presets.Add(Preset("1 Hit Run", "one_hit_run", catalog));
         catalog.Presets.Add(Preset("Set health to 50%", "set_health_percent", catalog));
         catalog.Presets.Add(Preset("Set health to random %", "set_health_random_percent", catalog));
         catalog.Presets.Add(Preset("Spawn random NPC invader", "spawn_npc_invader", catalog));
@@ -189,6 +241,13 @@ public sealed class Catalog
         var preset = Preset(name, handlerId, this);
         Presets.Add(preset);
         return preset;
+    }
+
+    public List<EffectPreset> RemoveOrphanPresets()
+    {
+        var orphans = Presets.Where(preset => FindHandler(preset.HandlerId) is null).ToList();
+        Presets.RemoveAll(orphans.Contains);
+        return orphans;
     }
 
     public void ReplaceHandlers(IReadOnlyList<HandlerSchema> handlers)
@@ -225,7 +284,9 @@ public sealed class Catalog
             Default = argument.Default,
             DefaultText = argument.DefaultText,
             Min = argument.Min,
-            Max = argument.Max
+            Max = argument.Max,
+            Label = argument.Label,
+            Hint = argument.Hint
         }).ToList()
     };
 }
@@ -251,7 +312,10 @@ public static class CatalogStore
         }
 
         var json = File.ReadAllText(path);
-        return JsonSerializer.Deserialize<Catalog>(json, Json) ?? Catalog.CreateDefault();
+        var loaded = JsonSerializer.Deserialize<Catalog>(json, Json) ?? Catalog.CreateDefault();
+        // A saved schema can be older than this build, and the game may not be running yet.
+        loaded.ReplaceHandlers(BuiltinHandlers.All);
+        return loaded;
     }
 
     public static void Save(Catalog catalog) => Save(catalog, AppPaths.CatalogFile);

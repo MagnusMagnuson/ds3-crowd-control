@@ -11,15 +11,28 @@ namespace Ds3CrowdControl.Manager;
 
 public partial class ArgumentEditor : ObservableObject
 {
-    public ArgumentEditor(string name, string type, string value)
+    public ArgumentEditor(string name, string type, string value, string? label = null, string? hint = null)
     {
         Name = name;
         Type = type;
+        Label = label ?? name;
+        Hint = hint ?? "";
         _value = value;
     }
 
     public string Name { get; }
     public string Type { get; }
+    public string Label { get; }
+    public string Hint { get; }
+    public bool IsCheckBox => Type == "bool";
+    public bool IsTextBox => !IsCheckBox;
+    public bool HasHint => Hint.Length > 0;
+
+    public bool IsChecked
+    {
+        get => Value == "1";
+        set => Value = value ? "1" : "0";
+    }
 
     [ObservableProperty]
     private string _value;
@@ -55,22 +68,33 @@ public partial class MainViewModel : ObservableObject
                 _catalog.ReplaceHandlers(handlers);
             }
 
+            var removed = _catalog.RemoveOrphanPresets();
             var added = new[]
             {
                 _catalog.EnsurePreset("Kill player", "kill_player"),
-                _catalog.EnsurePreset("Fake death", "fake_death"),
-                _catalog.EnsurePreset("Fake death with YOU DIED", "fake_death_staged"),
+                _catalog.EnsurePreset("Fake Death", "fake_death"),
                 _catalog.EnsurePreset("Show YOU DIED", "show_you_died"),
+                _catalog.EnsurePreset("Empty Stamina", "empty_stamina"),
+                _catalog.EnsurePreset("No Stamina", "no_stamina"),
+                _catalog.EnsurePreset("Decrease Speed", "decrease_speed"),
+                _catalog.EnsurePreset("Increase Speed", "increase_speed"),
+                _catalog.EnsurePreset("1 HP", "one_hp"),
+                _catalog.EnsurePreset("1 Hit Run", "one_hit_run"),
                 _catalog.EnsurePreset("Set health to 50%", "set_health_percent"),
                 _catalog.EnsurePreset("Set health to random %", "set_health_random_percent"),
                 _catalog.EnsurePreset("Watch item button", "watch_item_button")
             }.Where(preset => preset is not null).Cast<EffectPreset>().ToList();
-            if (!handlersChanged && added.Count == 0)
+            if (!handlersChanged && added.Count == 0 && removed.Count == 0)
             {
                 return;
             }
 
             CatalogStore.Save(_catalog);
+            foreach (var preset in removed)
+            {
+                Presets.Remove(preset);
+            }
+
             foreach (var preset in added)
             {
                 Presets.Add(preset);
@@ -271,6 +295,11 @@ public partial class MainViewModel : ObservableObject
             {
                 var leftArgument = left.Arguments[argumentIndex];
                 var rightArgument = right.Arguments[argumentIndex];
+                if (leftArgument.Label != rightArgument.Label || leftArgument.Hint != rightArgument.Hint)
+                {
+                    return false;
+                }
+
                 if (leftArgument.Name != rightArgument.Name
                     || leftArgument.Type != rightArgument.Type
                     || leftArgument.Default != rightArgument.Default
@@ -347,7 +376,7 @@ public partial class MainViewModel : ObservableObject
                 JsonValueKind.Undefined or JsonValueKind.Null => argument.Type == "string" ? argument.DefaultText ?? "" : (argument.Default ?? 0).ToString(),
                 _ => stored.ToString()
             };
-            Arguments.Add(new ArgumentEditor(argument.Name, argument.Type, text));
+            Arguments.Add(new ArgumentEditor(argument.Name, argument.Type, text, argument.Label, argument.Hint));
         }
     }
 

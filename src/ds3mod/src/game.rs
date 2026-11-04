@@ -166,10 +166,6 @@ pub fn kill_player() -> Result<String, String> {
     Ok(format!("player HP {hp} -> 0; the game will handle the death normally"))
 }
 
-/// Stand back up before the death animation's respawn event.
-/// That event was measured at about 3.3s (frame 195–220) and it both shows
-/// YOU DIED and starts the bonfire load.
-const FAKE_DEATH_WAIT_FRAMES: u32 = 165;
 const FAKE_DEATH_HOLD_FRAMES: u32 = 90;
 const FAKE_DEATH_RETRY_FRAMES: u32 = 90;
 const TRUE_DEATH_OFFSET: usize = 0x90;
@@ -226,7 +222,7 @@ struct FakeDeath {
     remaining: u32,
     restoring: bool,
     restore_failures: u32,
-    staged: Option<StagedDeath>,
+    staged: StagedDeath,
 }
 
 /// Progress of the fake death that shows YOU DIED before standing up.
@@ -241,24 +237,14 @@ struct StagedDeath {
 static FAKE_DEATH: Mutex<Option<FakeDeath>> = Mutex::new(None);
 
 pub fn start_fake_death() -> Result<String, String> {
-    let saved_hp = begin_fake_death(None)?;
-    crate::log::log(format!(
-        "fake death started from HP {saved_hp}; stand up before the bonfire reload"
-    ));
-    Ok(format!(
-        "Fake death started from {saved_hp} HP. The death animation plays, then you stand back up at {saved_hp} before the bonfire reload."
-    ))
-}
-
-pub fn start_staged_fake_death() -> Result<String, String> {
-    let saved_hp = begin_fake_death(Some(StagedDeath::default()))?;
+    let saved_hp = begin_fake_death()?;
     crate::log::log(format!("staged fake death started from HP {saved_hp}"));
     Ok(format!(
-        "Staged fake death started from {saved_hp} HP. YOU DIED shows during the fall, then you stand back up at {saved_hp}."
+        "Fake death started from {saved_hp} HP. YOU DIED shows during the fall, then you stand back up at {saved_hp}."
     ))
 }
 
-fn begin_fake_death(staged: Option<StagedDeath>) -> Result<i32, String> {
+fn begin_fake_death() -> Result<i32, String> {
     let player = unsafe { &mut *local_player()? };
     let player_addr = player as *mut PlayerIns as usize;
     let saved_hp = player.super_chr_ins.modules.data.hp;
@@ -288,7 +274,7 @@ fn begin_fake_death(staged: Option<StagedDeath>) -> Result<i32, String> {
         remaining: 0,
         restoring: false,
         restore_failures: 0,
-        staged,
+        staged: StagedDeath::default(),
     });
     Ok(saved_hp)
 }
@@ -316,7 +302,7 @@ pub fn poll_fake_death() {
         if load_screen_open() {
             let _ = persist_fake_death_life(fake);
             release_black(fake);
-            crate::log::log("fake death 7 stopped because a load screen is open; load flags were not touched");
+            crate::log::log("fake death stopped because a load screen is open; load flags were not touched");
             slot.take();
             return;
         }
@@ -324,23 +310,16 @@ pub fn poll_fake_death() {
             fake.elapsed = fake.elapsed.saturating_add(1);
             let _ = write_souls_if_player(fake.saved_souls);
             let _ = write_persistent_hp(fake.saved_hp);
-            let ready = if fake.staged.is_some() {
-                advance_staged_death(fake)
-            } else {
-                fake.elapsed >= FAKE_DEATH_WAIT_FRAMES
-            };
-            if !ready {
+            if !advance_staged_death(fake) {
                 return;
             }
             fake.restoring = true;
             fake.remaining = FAKE_DEATH_HOLD_FRAMES;
-            if fake.staged.is_some() {
-                if let Err(error) = set_fade_plate(GREY_FADE_PLATE, &FADE_CLEAR, 0.0) {
-                    crate::log::log(format!("staged fake death grey reset failed: {error}"));
-                }
+            if let Err(error) = set_fade_plate(GREY_FADE_PLATE, &FADE_CLEAR, 0.0) {
+                crate::log::log(format!("staged fake death grey reset failed: {error}"));
             }
             crate::log::log(format!(
-                "fake death 7 restoring at frame {} before the respawn event",
+                "fake death restoring at frame {}",
                 fake.elapsed
             ));
         }
@@ -353,7 +332,7 @@ pub fn poll_fake_death() {
                 }
                 if fake.remaining == 0 {
                     crate::log::log(format!(
-                        "fake death 7 finished; HP restored to {}",
+                        "fake death finished; HP restored to {}",
                         fake.saved_hp
                     ));
                     save_living_player();
@@ -364,11 +343,11 @@ pub fn poll_fake_death() {
                 let _ = persist_fake_death_life(fake);
                 fake.restore_failures = fake.restore_failures.saturating_add(1);
                 if fake.restore_failures == 1 || fake.restore_failures % 60 == 0 {
-                    crate::log::log(format!("fake death 7 restore failed: {error}"));
+                    crate::log::log(format!("fake death restore failed: {error}"));
                 }
                 if fake.restore_failures >= FAKE_DEATH_RETRY_FRAMES {
                     crate::log::log(
-                        "fake death 7 gave up restoring the character; death counters and saved HP were written back",
+                        "fake death gave up restoring the character; death counters and saved HP were written back",
                     );
                     release_black(fake);
                     save_living_player();
@@ -382,9 +361,7 @@ pub fn poll_fake_death() {
 /// Runs one frame of the staged death. Returns true once it is time to stand up.
 fn advance_staged_death(fake: &mut FakeDeath) -> bool {
     let elapsed = fake.elapsed;
-    let Some(staged) = fake.staged.as_mut() else {
-        return true;
-    };
+    let staged = &mut fake.staged;
     let Ok(player) = local_player() else {
         return false;
     };
@@ -439,13 +416,10 @@ fn advance_staged_death(fake: &mut FakeDeath) -> bool {
 
 /// Every way out of a staged death must come through here, or the screen stays black.
 fn release_black(fake: &mut FakeDeath) {
-    let Some(staged) = fake.staged.as_mut() else {
-        return;
-    };
-    if !staged.black_on {
+    if !fake.staged.black_on {
         return;
     }
-    staged.black_on = false;
+    fake.staged.black_on = false;
     if let Err(error) = set_fade_plate(BLACK_FADE_PLATE, &FADE_CLEAR, BLACK_FADE_SECONDS) {
         crate::log::log(format!("staged fake death fade from black failed: {error}"));
     }
@@ -536,9 +510,7 @@ fn set_fade_plate(plate: u32, color: &[f32; 4], seconds: f32) -> Result<(), Stri
 
 fn restore_fake_death(fake: &FakeDeath) -> Result<(), String> {
     let player = unsafe { &mut *local_player()? };
-    if fake.staged.is_some() {
-        let _ = clear_dead_event_bit(player as *mut PlayerIns as usize);
-    }
+    let _ = clear_dead_event_bit(player as *mut PlayerIns as usize);
     write_player_hp(player, fake.saved_hp);
     write_souls(player.player_game_data.as_ptr(), fake.saved_souls)?;
     persist_fake_death_life(fake)?;
@@ -714,6 +686,212 @@ pub fn health_at_percent(max_hp: i32, percent: i32) -> i32 {
     }
     ((max_hp as i64 * percent.clamp(0, 100) as i64) / 100)
         .clamp(1, max_hp as i64) as i32
+}
+
+pub fn empty_stamina() -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    let data = &mut player.super_chr_ins.modules.data;
+    if data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let before = data.stamina;
+    data.stamina = 0;
+    Ok(format!("player stamina {before} -> 0"))
+}
+
+static STAMINA_LOCK: Mutex<Option<Instant>> = Mutex::new(None);
+/// Rolling and attacking still worked with stamina held at exactly 0. Below 0 is the
+/// overdrawn state the game itself refuses actions in, with room for a frame of regen.
+const NO_STAMINA_VALUE: i32 = -1000;
+
+pub fn no_stamina(seconds: i32) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    let data = &mut player.super_chr_ins.modules.data;
+    if data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    data.stamina = NO_STAMINA_VALUE;
+    let until = Instant::now() + Duration::from_secs(seconds.max(0) as u64);
+    let mut slot = STAMINA_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    *slot = Some(slot.map_or(until, |current| current.max(until)));
+    Ok(format!("stamina held empty for {seconds} seconds"))
+}
+
+/// Stamina regenerates during the character update and any amount above 0 allows an
+/// action, so this runs at frame start and again just before the player's behaviour.
+pub fn poll_stamina_lock() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = STAMINA_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(until) = *slot else {
+            return;
+        };
+        let finished = Instant::now() >= until || load_screen_open();
+        if let Ok(player) = local_player() {
+            let value = if finished { 0 } else { NO_STAMINA_VALUE };
+            unsafe { &mut *player }.super_chr_ins.modules.data.stamina = value;
+        }
+        if finished {
+            slot.take();
+            crate::log::log("stamina lock ended");
+        }
+    }));
+}
+
+const BEHAVIOR_MODULE_OFFSET: usize = 0x28;
+/// Playback multiplier: the module's update multiplies frame time by this float.
+const PLAYBACK_SPEED_OFFSET: usize = 0xA58;
+const NORMAL_SPEED: f32 = 1.0;
+const MIN_SPEED: f32 = 0.1;
+const MAX_SPEED: f32 = 4.0;
+
+struct SpeedChange {
+    percent: i32,
+    until: Instant,
+    movement_only: bool,
+}
+
+static SPEED_CHANGES: Mutex<Vec<SpeedChange>> = Mutex::new(Vec::new());
+/// The animation id drops back to movement during an attack's recovery, so wait this
+/// long after any action before slowing down again.
+const SPEED_ACTION_GRACE: Duration = Duration::from_millis(250);
+static SPEED_LAST_ACTION: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// Active changes add together, so -30% and +30% give normal speed.
+pub fn combined_speed(percents: impl Iterator<Item = i32>) -> f32 {
+    let total: i32 = percents.sum();
+    (NORMAL_SPEED + total as f32 / 100.0).clamp(MIN_SPEED, MAX_SPEED)
+}
+
+/// Measured in-game: 0 is idle, 20010-22100 are walking, running, turning and stopping,
+/// and 27115 is a roll. Attacks (230xxxxx) and items (150032100) sit outside this.
+pub fn is_movement_animation(anim: i32) -> bool {
+    anim <= 0 || (20_000..23_000).contains(&anim) || (27_000..28_000).contains(&anim)
+}
+
+fn write_player_speed(player: usize, speed: f32) -> Result<(), String> {
+    let module = module_pointer(player, BEHAVIOR_MODULE_OFFSET)?;
+    write_u32_checked(module.wrapping_add(PLAYBACK_SPEED_OFFSET), speed.to_bits())
+}
+
+pub fn change_speed(percent: i32, seconds: i32, movement_only: bool) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let player = player as *mut PlayerIns as usize;
+    let mut changes = SPEED_CHANGES.lock().unwrap_or_else(|poison| poison.into_inner());
+    changes.push(SpeedChange {
+        percent,
+        until: Instant::now() + Duration::from_secs(seconds.max(0) as u64),
+        movement_only,
+    });
+    let speed = combined_speed(changes.iter().map(|change| change.percent));
+    write_player_speed(player, speed)?;
+    Ok(format!("speed {percent:+}% for {seconds} seconds, now {speed:.2}x"))
+}
+
+/// Runs several times a frame, so it reads the live player directly instead of going
+/// through the checked helpers, which query the memory map on every access.
+fn apply_speed_for_animation(player: usize, moving: f32, acting: f32, now: Instant) {
+    let module = |offset: usize| unsafe {
+        let modules = ((player + MODULES_OFFSET) as *const usize).read();
+        if modules < 0x10_000 {
+            return None;
+        }
+        let pointer = ((modules + offset) as *const usize).read();
+        (pointer >= 0x10_000).then_some(pointer)
+    };
+    let (Some(action), Some(behavior)) = (module(ACTION_REQUEST_OFFSET), module(BEHAVIOR_MODULE_OFFSET))
+    else {
+        return;
+    };
+    let anim = unsafe { ((action + CURRENT_ANIM_OFFSET) as *const i32).read() };
+
+    // The multiplier covers every animation, so movement-only changes drop out for actions.
+    let mut last_action = SPEED_LAST_ACTION.lock().unwrap_or_else(|poison| poison.into_inner());
+    if !is_movement_animation(anim) {
+        *last_action = Some(now);
+    }
+    let recently_acted =
+        last_action.is_some_and(|at| now.saturating_duration_since(at) < SPEED_ACTION_GRACE);
+    let applied = if recently_acted { acting } else { moving };
+    unsafe { ((behavior + PLAYBACK_SPEED_OFFSET) as *mut f32).write(applied) };
+}
+
+pub fn poll_speed_changes() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut changes = SPEED_CHANGES.lock().unwrap_or_else(|poison| poison.into_inner());
+        if changes.is_empty() {
+            return;
+        }
+        if load_screen_open() {
+            changes.clear();
+            crate::log::log("speed changes ended by a load screen");
+            return;
+        }
+        let now = Instant::now();
+        changes.retain(|change| change.until > now);
+        let moving = combined_speed(changes.iter().map(|change| change.percent));
+        let acting = combined_speed(
+            changes
+                .iter()
+                .filter(|change| !change.movement_only)
+                .map(|change| change.percent),
+        );
+        if let Ok(player) = local_player() {
+            apply_speed_for_animation(player as usize, moving, acting, now);
+        }
+        if changes.is_empty() {
+            crate::log::log("speed back to normal");
+        }
+    }));
+}
+
+pub fn one_hp() -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    let data = &mut player.super_chr_ins.modules.data;
+    if data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let before = data.hp;
+    data.hp = 1;
+    Ok(format!("player HP {before} -> 1"))
+}
+
+static ONE_HIT_RUN: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn one_hit_run(seconds: i32) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    let data = &mut player.super_chr_ins.modules.data;
+    if data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    data.hp = 1;
+    let until = Instant::now() + Duration::from_secs(seconds.max(0) as u64);
+    let mut slot = ONE_HIT_RUN.lock().unwrap_or_else(|poison| poison.into_inner());
+    *slot = Some(slot.map_or(until, |current| current.max(until)));
+    Ok(format!("HP held at 1 for {seconds} seconds"))
+}
+
+/// Only ever lowers HP, so a killing hit at 1 HP stays a real death.
+pub fn poll_one_hit_run() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = ONE_HIT_RUN.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(until) = *slot else {
+            return;
+        };
+        if Instant::now() >= until || load_screen_open() {
+            slot.take();
+            crate::log::log("1 hit run ended");
+            return;
+        }
+        if let Ok(player) = local_player() {
+            let data = &mut unsafe { &mut *player }.super_chr_ins.modules.data;
+            if data.hp > 1 {
+                data.hp = 1;
+            }
+        }
+    }));
 }
 
 pub fn set_health_percent(percent: i32) -> Result<String, String> {
@@ -1054,13 +1232,7 @@ pub fn schemas_json() -> Value {
         },
         {
             "id": "fake_death",
-            "name": "Fake death",
-            "description": "Plays the death animation, then stands you back up at your previous HP and souls before the bonfire reload.",
-            "arguments": []
-        },
-        {
-            "id": "fake_death_staged",
-            "name": "Fake death with YOU DIED",
+            "name": "Fake Death",
             "description": "Plays the death animation, grey screen and YOU DIED banner, fades to black, then stands you back up at your previous HP and souls.",
             "arguments": []
         },
@@ -1069,6 +1241,50 @@ pub fn schemas_json() -> Value {
             "name": "Show YOU DIED",
             "description": "Shows the YOU DIED banner with its sound. The player stays alive and the area does not reload.",
             "arguments": []
+        },
+        {
+            "id": "empty_stamina",
+            "name": "Empty Stamina",
+            "description": "Sets current stamina to 0. Being on a ladder with no stamina makes you fall off.",
+            "arguments": []
+        },
+        {
+            "id": "no_stamina",
+            "name": "No Stamina",
+            "description": "Holds stamina empty for the chosen number of seconds, blocking sprinting, rolling and attacks.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 5, "min": 1, "max": 60 }]
+        },
+        {
+            "id": "decrease_speed",
+            "name": "Decrease Speed",
+            "description": "Slows the player by a percentage for the chosen time. Adds together with Increase Speed.",
+            "arguments": [
+                { "name": "percent", "type": "int", "default": 30, "min": 1, "max": 90 },
+                { "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 },
+                { "name": "movementOnly", "type": "bool", "label": "Movement only (experimental)", "hint": "Only walking, running and rolling change speed. Attacks can still start at the changed speed, because the game reports them a moment late.", "default": 0, "min": 0, "max": 1 }
+            ]
+        },
+        {
+            "id": "increase_speed",
+            "name": "Increase Speed",
+            "description": "Speeds up the player by a percentage for the chosen time. Adds together with Decrease Speed.",
+            "arguments": [
+                { "name": "percent", "type": "int", "default": 30, "min": 1, "max": 300 },
+                { "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 },
+                { "name": "movementOnly", "type": "bool", "label": "Movement only (experimental)", "hint": "Only walking, running and rolling change speed. Attacks can still start at the changed speed, because the game reports them a moment late.", "default": 0, "min": 0, "max": 1 }
+            ]
+        },
+        {
+            "id": "one_hp",
+            "name": "1 HP",
+            "description": "Sets current HP to 1.",
+            "arguments": []
+        },
+        {
+            "id": "one_hit_run",
+            "name": "1 Hit Run",
+            "description": "Holds HP at 1 for the chosen number of seconds, so healing does nothing and any hit kills.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 }]
         },
         {
             "id": "set_health_percent",
@@ -1386,7 +1602,29 @@ fn format_values(track: &Track) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_soul_delta, classify_slot, health_at_percent, is_empty_item};
+    use super::{
+        apply_soul_delta, classify_slot, combined_speed, health_at_percent, is_empty_item,
+        is_movement_animation,
+    };
+
+    #[test]
+    fn only_idle_and_locomotion_count_as_movement() {
+        for anim in [-1, 0, 20010, 20110, 20112, 20210, 22100, 27115] {
+            assert!(is_movement_animation(anim), "{anim}");
+        }
+        for anim in [17002, 18002, 23030000, 23030320, 150032100] {
+            assert!(!is_movement_animation(anim), "{anim}");
+        }
+    }
+
+    #[test]
+    fn speed_changes_add_together_and_stay_in_range() {
+        assert_eq!(combined_speed([].into_iter()), 1.0);
+        assert_eq!(combined_speed([-30, 30].into_iter()), 1.0);
+        assert_eq!(combined_speed([50].into_iter()), 1.5);
+        assert_eq!(combined_speed([-90, -90].into_iter()), 0.1);
+        assert_eq!(combined_speed([300, 300].into_iter()), 4.0);
+    }
 
     #[test]
     fn soul_delta_clamps_at_zero() {
