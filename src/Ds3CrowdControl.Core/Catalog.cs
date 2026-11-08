@@ -39,8 +39,14 @@ public sealed class EffectPreset
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string Name { get; set; } = "";
     public string HandlerId { get; set; } = "";
-    public bool Enabled { get; set; } = true;
     public int CooldownSeconds { get; set; }
+    public bool RedeemEnabled { get; set; }
+    public int RedeemCost { get; set; } = 500;
+    public string? TwitchRewardId { get; set; }
+    public bool BitsEnabled { get; set; }
+    public int BitsAmount { get; set; } = 100;
+    public bool GiftEnabled { get; set; }
+    public int GiftAmount { get; set; } = 1;
     public Dictionary<string, JsonElement> Arguments { get; set; } = [];
 }
 
@@ -55,7 +61,10 @@ public sealed class GameState
 
     public static GameState Disconnected { get; } = new();
 
-    public bool IsSafe => Connected && ExeMatch && SessionKnown && Offline && InGame;
+    /// <summary>Everything is fine except the moment, so an effect can wait.</summary>
+    public bool CanWait => Connected && ExeMatch && SessionKnown && Offline;
+
+    public bool IsSafe => CanWait && InGame;
 }
 
 public static class BuiltinHandlers
@@ -67,7 +76,11 @@ public static class BuiltinHandlers
             Id = "adjust_souls",
             Name = "Adjust souls",
             Description = "Adds a signed amount to held souls. Negative values remove souls and the result is clamped at 0.",
-            Arguments = [new EffectArgumentSchema { Name = "delta", Type = "int", Default = -100, Min = -999_999_999, Max = 999_999_999 }]
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "delta", Type = "int", Default = -100, Min = -999_999_999, Max = 999_999_999 },
+                new EffectArgumentSchema { Name = "scaleWithLevel", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Scale with level", Hint = "Grows with the cost of your next level. The amount is what you lose at level 10, so -100 takes about 1800 souls at level 50 and 7400 at level 100." }
+            ]
         },
         new HandlerSchema
         {
@@ -151,6 +164,13 @@ public static class BuiltinHandlers
         },
         new HandlerSchema
         {
+            Id = "invincible",
+            Name = "Invincible",
+            Description = "The player takes no hit damage for the chosen number of seconds. A second use keeps the longer remaining time.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 1, Max = 300 }]
+        },
+        new HandlerSchema
+        {
             Id = "random_weapon",
             Name = "Random Weapon",
             Description = "Gives you a random weapon and equips it in right hand slot 1.",
@@ -170,8 +190,74 @@ public static class BuiltinHandlers
             Description = "Gives you a random piece for each armor slot and equips all four.",
             Arguments =
             [
+                new EffectArgumentSchema { Name = "armorStyle", Type = "choice", Default = 0, Min = 0, Max = 2, Label = "Armor style", Hint = "Matching set picks one armor set. If it has no piece for a slot, that slot stays as it is.", Options = ["Random pieces", "Matching set", "Either at random"] },
                 new EffectArgumentSchema { Name = "removeOld", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Remove previous armor", Hint = "Permanently deletes the armor you were wearing. Empty slots are skipped." },
                 new EffectArgumentSchema { Name = "includeMissingDlc", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Include armor from DLC you do not have (experimental)", Hint = "Weapons from a missing DLC worked in a short test, but armor has not been tried." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "temporary_armor",
+            Name = "Temporary Armor",
+            Description = "Swaps all armor slots for a random outfit, then puts your own armor back when the time is up.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 60, Min = 1, Max = 600 },
+                new EffectArgumentSchema { Name = "armorStyle", Type = "choice", Default = 0, Min = 0, Max = 2, Label = "Armor style", Hint = "Matching set picks one armor set. If it has no piece for a slot, that slot stays as it is.", Options = ["Random pieces", "Matching set", "Either at random"] },
+                new EffectArgumentSchema { Name = "includeMissingDlc", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Include armor from DLC you do not have (experimental)", Hint = "Weapons from a missing DLC worked in a short test, but armor has not been tried." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "bombardier",
+            Name = "Bombardier",
+            Description = "Takes away all your weapons, dresses you in the Mirrah Chain Set and gives you endless Black Firebombs in a free quick slot, then puts everything back when the time is up.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 60, Min = 5, Max = 600 }]
+        },
+        new HandlerSchema
+        {
+            Id = "shuffle_stats",
+            Name = "Shuffle Stats",
+            Description = "Randomly swaps your nine stats with each other, so your level stays the same.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 0, Min = 0, Max = 600, Label = "Seconds", Hint = "How long until your real stats come back. 0 keeps the shuffle, and it saves to your character." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "oversaturate",
+            Name = "Oversaturate",
+            Description = "Pushes the colours far past normal for the chosen number of seconds, for a badly over-edited look.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 15, Min = 1, Max = 300 },
+                new EffectArgumentSchema { Name = "percent", Type = "int", Default = 2000, Min = 100, Max = 2000 }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "blind",
+            Name = "Blind",
+            Description = "Fades the screen to black, holds it for the chosen number of seconds, then fades back in.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 5, Min = 1, Max = 60 }]
+        },
+        new HandlerSchema
+        {
+            Id = "freeze",
+            Name = "Freeze",
+            Description = "Freezes the player in place for the chosen number of seconds. The camera still moves.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 5, Min = 1, Max = 60 }]
+        },
+        new HandlerSchema
+        {
+            Id = "invert_controls",
+            Name = "Invert Controls",
+            Description = "Inverts the controller sticks for the chosen number of seconds. Controller only.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 15, Min = 1, Max = 300 },
+                new EffectArgumentSchema { Name = "camera", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Invert camera too", Hint = "Also flips the right stick. Off means only movement is inverted." }
             ]
         },
         new HandlerSchema
@@ -190,10 +276,18 @@ public static class BuiltinHandlers
         },
         new HandlerSchema
         {
-            Id = "spawn_npc_invader",
-            Name = "Spawn NPC invader",
-            Description = "Reserved. A working invader spawn needs the game's character spawn routine, which is not called in this version.",
-            Arguments = [new EffectArgumentSchema { Name = "npcParamIds", Type = "string", DefaultText = "" }]
+            Id = "spawn_random_enemy",
+            Name = "Spawn Random Enemy",
+            Description = "Spawns random enemies near you, from the current map unless Whole game is on.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "amount", Type = "int", Default = 1, Min = 1, Max = 10 },
+                new EffectArgumentSchema { Name = "limit", Type = "int", Default = 5, Min = 1, Max = 16, Label = "Enemy limit", Hint = "How many spawned enemies can be active at once. The game itself stops at 16." },
+                new EffectArgumentSchema { Name = "wholeGame", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Whole game (experimental)", Hint = "Picks from every area and gives enemies from elsewhere a random local AI. They may act oddly." },
+                new EffectArgumentSchema { Name = "bosses", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Include bosses", Hint = "Bosses can spawn too. Many rely on map events, so some may act oddly." },
+                new EffectArgumentSchema { Name = "onlyBosses", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Only bosses", Hint = "Spawns nothing but bosses. Without Whole game, only bosses from the current map can appear." },
+                new EffectArgumentSchema { Name = "replaceOldest", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Replace oldest at limit", Hint = "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot." }
+            ]
         },
         new HandlerSchema
         {
@@ -243,11 +337,19 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Increase Speed", "increase_speed", catalog));
         catalog.Presets.Add(Preset("1 HP", "one_hp", catalog));
         catalog.Presets.Add(Preset("1 Hit Run", "one_hit_run", catalog));
+        catalog.Presets.Add(Preset("Invincible", "invincible", catalog));
         catalog.Presets.Add(Preset("Random Weapon", "random_weapon", catalog));
         catalog.Presets.Add(Preset("Random Armor", "random_armor", catalog));
+        catalog.Presets.Add(Preset("Temporary Armor", "temporary_armor", catalog));
+        catalog.Presets.Add(Preset("Bombardier", "bombardier", catalog));
+        catalog.Presets.Add(Preset("Shuffle Stats", "shuffle_stats", catalog));
+        catalog.Presets.Add(Preset("Oversaturate", "oversaturate", catalog));
+        catalog.Presets.Add(Preset("Blind", "blind", catalog));
+        catalog.Presets.Add(Preset("Freeze", "freeze", catalog));
+        catalog.Presets.Add(Preset("Invert Controls", "invert_controls", catalog));
         catalog.Presets.Add(Preset("Set health to 50%", "set_health_percent", catalog));
         catalog.Presets.Add(Preset("Set health to random %", "set_health_random_percent", catalog));
-        catalog.Presets.Add(Preset("Spawn random NPC invader", "spawn_npc_invader", catalog));
+        catalog.Presets.Add(Preset("Spawn Random Enemy", "spawn_random_enemy", catalog));
         catalog.Presets.Add(Preset("Dump player data", "dump_player_data", catalog));
         catalog.Presets.Add(Preset("Watch item button", "watch_item_button", catalog));
         return catalog;
@@ -294,7 +396,6 @@ public sealed class Catalog
         {
             Name = name,
             HandlerId = handlerId,
-            Enabled = true,
             CooldownSeconds = 0,
             Arguments = BuiltinHandlers.DefaultArguments(handler)
         };

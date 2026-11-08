@@ -5,6 +5,12 @@ namespace Ds3CrowdControl.Core;
 public sealed class ManagerSettings
 {
     public bool FocusGameForItemTest { get; set; }
+    public bool EffectsPaused { get; set; }
+    public int GapSeconds { get; set; }
+    public int WaitingLimit { get; set; }
+    public bool ShowQueue { get; set; } = true;
+    public bool ShowDevTools { get; set; }
+    public bool SyncTriggers { get; set; }
 }
 
 public static class ManagerSettingsStore

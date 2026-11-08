@@ -109,7 +109,8 @@ public sealed class GameBridgeServer : IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            return new EffectResult(requestId, EffectStatus.Retry, "the game did not answer in time");
+            // Not Retry: the mod may still run this late, and a retry could run it twice.
+            return new EffectResult(requestId, EffectStatus.Failed, "the game did not answer in time, but the effect may still run");
         }
         finally
         {

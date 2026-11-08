@@ -1,5 +1,6 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use windows::Win32::System::Memory::{VirtualProtect, PAGE_PROTECTION_FLAGS, PAGE_READWRITE};
 
@@ -13,6 +14,7 @@ const DEVICES_OFFSET: usize = 0x90;
 const INPUT_DATA_OFFSET: usize = 0x140;
 const BITSET_OFFSET: usize = INPUT_DATA_OFFSET + 0x30;
 const XINPUT_GAMEPAD_X: u16 = 0x4000;
+const XINPUT_GAMEPAD_DPAD_DOWN: u16 = 0x0002;
 const LEARNED_BUTTON_FILE: &str = "use-item-button.txt";
 const WATCH_FRAMES: u32 = 600;
 
@@ -82,24 +84,20 @@ static SYNTHETIC_POLLS: AtomicU32 = AtomicU32::new(0);
 static SYNTHETIC_CONTROLLER: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_CONTROLLER: AtomicU32 = AtomicU32::new(u32::MAX);
 static LAST_BUTTONS: AtomicU32 = AtomicU32::new(0);
-static LEARNED_BUTTON: AtomicU32 = AtomicU32::new(0);
+/// X on the game's default controls, so Use selected item works without any setup.
+static LEARNED_BUTTON: AtomicU32 = AtomicU32::new(0x4000);
 static FRAME: AtomicU32 = AtomicU32::new(0);
 static TRACE: Mutex<Option<Trace>> = Mutex::new(None);
 
 pub fn prepare() {
     if let Ok(button) = load_learned_button() {
         LEARNED_BUTTON.store(button as u32, Ordering::Release);
-        crate::log::log(format!("learned use-item XInput mask loaded: {button:#06X}"));
     }
-    match install_xinput_hook() {
-        Ok(()) => crate::log::log("XInputGetState hook installed"),
-        Err(error) => crate::log::log(format!("XInputGetState hook unavailable: {error}")),
+    if let Err(error) = install_xinput_hook() {
+        crate::log::log(format!("XInputGetState hook unavailable: {error}"));
     }
-    match locate_pad_bitset() {
-        Ok((address, size)) => {
-            crate::log::log(format!("pad bitset resolved at {address:#X}, size={size}"))
-        }
-        Err(error) => crate::log::log(format!("pad bitset unavailable: {error}")),
+    if let Err(error) = locate_pad_bitset() {
+        crate::log::log(format!("pad bitset unavailable: {error}"));
     }
 }
 
@@ -107,15 +105,13 @@ pub fn frame_begin() {
     let frame = FRAME.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if SYNTHETIC_X.load(Ordering::Acquire) && SYNTHETIC_POLLS.load(Ordering::Acquire) > 0 {
         SYNTHETIC_X.store(false, Ordering::Release);
-        let polls = SYNTHETIC_POLLS.swap(0, Ordering::AcqRel);
-        crate::log::log(format!("synthetic XInput use-item pulse completed after {polls} poll(s)"));
+        SYNTHETIC_POLLS.store(0, Ordering::Release);
     }
     if PENDING_USE_ITEM.load(Ordering::Acquire)
         && !SYNTHETIC_X.load(Ordering::Acquire)
         && matches!(crate::game::menus_open(), Ok(false))
         && activate_pending()
     {
-        crate::log::log("menu closed; queued use-item command released to XInput");
     }
     sample(Phase::FrameBegin, frame);
     let finished = {
@@ -169,7 +165,6 @@ pub fn queue_use_item(menu_open: bool) -> Result<String, String> {
         return Err("a synthetic use-item press is already pending".to_string());
     }
     if menu_open {
-        crate::log::log("use-item command is waiting for the menu to close");
         return Ok("Queued use-item command; waiting for the open menu to close.".to_string());
     }
     if activate_pending() {
@@ -556,6 +551,61 @@ fn read_image_c_string(image: &[u8], offset: usize) -> Result<&str, String> {
     std::str::from_utf8(&tail[..length]).map_err(|error| error.to_string())
 }
 
+static INVERT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+static INVERT_CAMERA: AtomicBool = AtomicBool::new(false);
+static BLOCK_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+
+fn clock_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Negates a stick axis. The lowest value has no positive twin, so it maps to the highest.
+fn invert_axis(value: i16) -> i16 {
+    value.checked_neg().unwrap_or(i16::MAX)
+}
+
+fn invert_sticks(gamepad: &mut XInputGamepad, camera: bool) {
+    gamepad.thumb_lx = invert_axis(gamepad.thumb_lx);
+    gamepad.thumb_ly = invert_axis(gamepad.thumb_ly);
+    if camera {
+        gamepad.thumb_rx = invert_axis(gamepad.thumb_rx);
+        gamepad.thumb_ry = invert_axis(gamepad.thumb_ry);
+    }
+}
+
+/// Leaves the right stick alone, so the player can still look around.
+fn blank_player_input(gamepad: &mut XInputGamepad) {
+    gamepad.buttons = 0;
+    gamepad.left_trigger = 0;
+    gamepad.right_trigger = 0;
+    gamepad.thumb_lx = 0;
+    gamepad.thumb_ly = 0;
+}
+
+/// D-pad down is how the player moves through the quick slots on a controller.
+pub fn switching_item() -> bool {
+    LAST_BUTTONS.load(Ordering::Acquire) as u16 & XINPUT_GAMEPAD_DPAD_DOWN != 0
+}
+
+pub fn block_input(seconds: i32) {
+    BLOCK_UNTIL_MS.fetch_max(clock_ms() + seconds.max(0) as u64 * 1000, Ordering::AcqRel);
+}
+
+pub fn stop_blocking_input() {
+    BLOCK_UNTIL_MS.store(0, Ordering::Release);
+}
+
+pub fn invert_controls(seconds: i32, camera: bool) -> Result<String, String> {
+    if ORIGINAL_XINPUT.load(Ordering::Acquire) == 0 {
+        return Err("XInputGetState is not hooked, so the controls cannot be inverted".to_string());
+    }
+    let until = clock_ms() + seconds.max(0) as u64 * 1000;
+    INVERT_CAMERA.store(camera, Ordering::Release);
+    INVERT_UNTIL_MS.fetch_max(until, Ordering::AcqRel);
+    Ok(format!("controls inverted for {seconds} seconds"))
+}
+
 unsafe extern "system" fn hooked_xinput_get_state(index: u32, state: *mut XInputState) -> u32 {
     let original = ORIGINAL_XINPUT.load(Ordering::Acquire);
     if original == 0 {
@@ -581,6 +631,12 @@ unsafe extern "system" fn hooked_xinput_get_state(index: u32, state: *mut XInput
         state.packet_number = state.packet_number.wrapping_add(1);
         SYNTHETIC_POLLS.fetch_add(1, Ordering::AcqRel);
     }
+    if clock_ms() < INVERT_UNTIL_MS.load(Ordering::Acquire) {
+        invert_sticks(&mut state.gamepad, INVERT_CAMERA.load(Ordering::Acquire));
+    }
+    if clock_ms() < BLOCK_UNTIL_MS.load(Ordering::Acquire) {
+        blank_player_input(&mut state.gamepad);
+    }
     result
 }
 
@@ -590,7 +646,49 @@ fn inject_button(buttons: u16, button: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{changed_bits, infer_button, inject_button, XINPUT_GAMEPAD_X};
+    use super::{
+        blank_player_input, changed_bits, infer_button, inject_button, invert_axis, invert_sticks,
+        XInputGamepad,
+        XINPUT_GAMEPAD_X,
+    };
+
+    #[test]
+    fn inverting_flips_the_chosen_sticks() {
+        assert_eq!(invert_axis(1000), -1000);
+        assert_eq!(invert_axis(-1000), 1000);
+        assert_eq!(invert_axis(0), 0);
+        assert_eq!(invert_axis(i16::MIN), i16::MAX);
+
+        let mut pad = XInputGamepad {
+            thumb_lx: 100,
+            thumb_ly: -200,
+            thumb_rx: 300,
+            thumb_ry: -400,
+            ..Default::default()
+        };
+        invert_sticks(&mut pad, false);
+        assert_eq!((pad.thumb_lx, pad.thumb_ly), (-100, 200));
+        assert_eq!((pad.thumb_rx, pad.thumb_ry), (300, -400));
+        invert_sticks(&mut pad, true);
+        assert_eq!((pad.thumb_lx, pad.thumb_rx, pad.thumb_ry), (100, -300, 400));
+    }
+
+    #[test]
+    fn blocking_input_leaves_only_the_camera() {
+        let mut pad = XInputGamepad {
+            buttons: XINPUT_GAMEPAD_X,
+            left_trigger: 200,
+            right_trigger: 200,
+            thumb_lx: 100,
+            thumb_ly: -200,
+            thumb_rx: 300,
+            thumb_ry: -400,
+        };
+        blank_player_input(&mut pad);
+        assert_eq!((pad.buttons, pad.left_trigger, pad.right_trigger), (0, 0, 0));
+        assert_eq!((pad.thumb_lx, pad.thumb_ly), (0, 0));
+        assert_eq!((pad.thumb_rx, pad.thumb_ry), (300, -400));
+    }
 
     #[test]
     fn xinput_pulse_preserves_other_buttons() {

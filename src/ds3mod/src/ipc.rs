@@ -26,6 +26,13 @@ pub enum Command {
     },
 }
 
+/// Counts connections to the manager, which needs one hello at the start of each.
+static CONNECTIONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn connection_count() -> u32 {
+    CONNECTIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn current_secret() -> String {
     SESSION_SECRET
         .get_or_init(|| Mutex::new(String::new()))
@@ -79,12 +86,12 @@ fn reconnect_loop(commands: Sender<Command>) {
                     Duration::from_secs(2),
                 ) {
                     Ok(stream) => {
-                        log::log(format!("connected to 127.0.0.1:{}", session.port));
                         let _ = stream.set_nodelay(true);
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
                         if let Ok(writer) = stream.try_clone() {
                             *OUTBOUND_SOCKET.get().expect("socket").lock().expect("socket") =
                                 Some(writer);
+                            CONNECTIONS.fetch_add(1, std::sync::atomic::Ordering::Release);
                         }
                         if let Err(error) = read_loop(stream, &commands) {
                             log::log(format!("connection closed: {error}"));

@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using CommunityToolkit.Mvvm.ComponentModel;
@@ -48,14 +49,160 @@ public partial class ArgumentEditor : ObservableObject
     private string _value;
 }
 
+/// <summary>One row on the Events page. Changes reach the preset straight away.</summary>
+public partial class EventToggle : ObservableObject
+{
+    public const string RedeemKind = "redeem";
+    public const string BitsKind = "bits";
+    public const string GiftKind = "gift";
+    public const string AllKinds = "all";
+
+    private readonly EffectPreset _preset;
+    private readonly Func<bool> _synced;
+    private readonly Action _changed;
+    private bool _quiet;
+
+    public EventToggle(EffectPreset preset, Func<bool> synced, Action changed)
+    {
+        _preset = preset;
+        _synced = synced;
+        _changed = changed;
+        _redeem = preset.RedeemEnabled;
+        _cost = preset.RedeemCost;
+        _bits = preset.BitsEnabled;
+        _bitsAmount = preset.BitsAmount;
+        _gift = preset.GiftEnabled;
+        _giftAmount = preset.GiftAmount;
+    }
+
+    public string Name => _preset.Name;
+
+    [ObservableProperty]
+    private bool _redeem;
+
+    [ObservableProperty]
+    private int _cost;
+
+    [ObservableProperty]
+    private bool _bits;
+
+    [ObservableProperty]
+    private int _bitsAmount;
+
+    [ObservableProperty]
+    private bool _gift;
+
+    [ObservableProperty]
+    private int _giftAmount;
+
+    /// <summary>For All on and All off, and for Sync, which save once for everything.</summary>
+    public void SetQuietly(string kind, bool value)
+    {
+        var wasQuiet = _quiet;
+        _quiet = true;
+        if (kind is RedeemKind or AllKinds)
+        {
+            Redeem = value;
+        }
+
+        if (kind is BitsKind or AllKinds)
+        {
+            Bits = value;
+        }
+
+        if (kind is GiftKind or AllKinds)
+        {
+            Gift = value;
+        }
+
+        _quiet = wasQuiet;
+    }
+
+    partial void OnRedeemChanged(bool value)
+    {
+        _preset.RedeemEnabled = value;
+        Switched(value);
+    }
+
+    partial void OnBitsChanged(bool value)
+    {
+        _preset.BitsEnabled = value;
+        Switched(value);
+    }
+
+    partial void OnGiftChanged(bool value)
+    {
+        _preset.GiftEnabled = value;
+        Switched(value);
+    }
+
+    partial void OnCostChanged(int value)
+    {
+        if (value < 1)
+        {
+            Cost = 1;
+            return;
+        }
+
+        _preset.RedeemCost = value;
+        _changed();
+    }
+
+    partial void OnBitsAmountChanged(int value)
+    {
+        if (value < 1)
+        {
+            BitsAmount = 1;
+            return;
+        }
+
+        _preset.BitsAmount = value;
+        _changed();
+    }
+
+    partial void OnGiftAmountChanged(int value)
+    {
+        if (value < 1)
+        {
+            GiftAmount = 1;
+            return;
+        }
+
+        _preset.GiftAmount = value;
+        _changed();
+    }
+
+    private void Switched(bool value)
+    {
+        if (_quiet)
+        {
+            return;
+        }
+
+        if (_synced())
+        {
+            SetQuietly(AllKinds, value);
+        }
+
+        _changed();
+    }
+}
+
 public partial class MainViewModel : ObservableObject
 {
+    /// <summary>Tools for working on the mod, shown on the Presets page only when asked for.</summary>
+    private static readonly HashSet<string> DiagnosticHandlers = ["dump_player_data", "watch_item_button"];
+
     private readonly SynchronizationContext _ui;
     private readonly Catalog _catalog;
     private readonly ManagerSettings _settings;
     private readonly GameBridgeServer _bridge;
     private readonly EffectQueue _queue;
     private readonly ManualTriggerSource _manual;
+    private readonly TwitchTriggerSource _twitchSource;
+    private readonly TwitchConnection _twitch;
+    private static readonly HttpClient TwitchHttp = new();
+    private CancellationTokenSource? _twitchSignIn;
 
     public MainViewModel()
     {
@@ -63,11 +210,45 @@ public partial class MainViewModel : ObservableObject
         _catalog = CatalogStore.LoadOrCreate();
         _settings = ManagerSettingsStore.Load();
         _focusGameForItemTest = _settings.FocusGameForItemTest;
+        _effectsPaused = _settings.EffectsPaused;
+        _gapSeconds = _settings.GapSeconds;
+        _waitingLimit = _settings.WaitingLimit;
+        _showQueue = _settings.ShowQueue;
+        _showDevTools = _settings.ShowDevTools;
+        _syncTriggers = _settings.SyncTriggers;
+        foreach (var preset in _catalog.Presets.Where(IsDiagnostic))
+        {
+            preset.RedeemEnabled = false;
+            preset.BitsEnabled = false;
+            preset.GiftEnabled = false;
+        }
+
         _bridge = new GameBridgeServer(SessionSecret.Create());
-        _queue = new EffectQueue(_catalog, _bridge);
+        _queue = new EffectQueue(_catalog, _bridge)
+        {
+            Paused = _effectsPaused,
+            MinGap = TimeSpan.FromSeconds(_gapSeconds),
+            Trace = WriteLogFile
+        };
+        _queue.Changed += () => Post(RefreshQueue);
         _manual = new ManualTriggerSource();
         _manual.Start(_queue);
-        Presets = new ObservableCollection<EffectPreset>(_catalog.Presets);
+        void LogFromTwitch(string message) => Post(() => AddLog(message));
+        _twitchSource = new TwitchTriggerSource(_catalog, LogFromTwitch)
+        {
+            Paused = _effectsPaused,
+            WaitingLimit = _waitingLimit
+        };
+        _twitchSource.Start(_queue);
+        _twitch = new TwitchConnection(
+            _twitchSource,
+            new TwitchTokenStore(AppPaths.TwitchTokensFile),
+            TwitchHttp,
+            LogFromTwitch);
+        _twitch.StatusChanged += status => Post(() => ApplyTwitchStatus(status));
+        _twitch.RewardsChanged += () => Post(() => CatalogStore.Save(_catalog));
+        RebuildPresets();
+        RebuildEvents();
         _bridge.Logged += message => Post(() => AddLog(message));
         _bridge.StateChanged += () => Post(ApplyState);
         _bridge.HandlersReceived += handlers => Post(() =>
@@ -90,8 +271,17 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("Increase Speed", "increase_speed"),
                 _catalog.EnsurePreset("1 HP", "one_hp"),
                 _catalog.EnsurePreset("1 Hit Run", "one_hit_run"),
+                _catalog.EnsurePreset("Invincible", "invincible"),
                 _catalog.EnsurePreset("Random Weapon", "random_weapon"),
                 _catalog.EnsurePreset("Random Armor", "random_armor"),
+                _catalog.EnsurePreset("Temporary Armor", "temporary_armor"),
+                _catalog.EnsurePreset("Bombardier", "bombardier"),
+                _catalog.EnsurePreset("Shuffle Stats", "shuffle_stats"),
+                _catalog.EnsurePreset("Spawn Random Enemy", "spawn_random_enemy"),
+                _catalog.EnsurePreset("Oversaturate", "oversaturate"),
+                _catalog.EnsurePreset("Blind", "blind"),
+                _catalog.EnsurePreset("Freeze", "freeze"),
+                _catalog.EnsurePreset("Invert Controls", "invert_controls"),
                 _catalog.EnsurePreset("Set health to 50%", "set_health_percent"),
                 _catalog.EnsurePreset("Set health to random %", "set_health_random_percent"),
                 _catalog.EnsurePreset("Watch item button", "watch_item_button")
@@ -102,24 +292,21 @@ public partial class MainViewModel : ObservableObject
             }
 
             CatalogStore.Save(_catalog);
-            foreach (var preset in removed)
-            {
-                Presets.Remove(preset);
-            }
-
-            foreach (var preset in added)
-            {
-                Presets.Add(preset);
-            }
-
+            RebuildPresets();
+            RebuildEvents();
             LoadEditor();
         });
         _ = StartAsync();
+        _ = _twitch.ResumeAsync();
     }
 
-    public ObservableCollection<EffectPreset> Presets { get; }
+    public ObservableCollection<EffectPreset> Presets { get; } = [];
     public ObservableCollection<string> LogLines { get; } = [];
     public ObservableCollection<ArgumentEditor> Arguments { get; } = [];
+    public ObservableCollection<EventToggle> Events { get; } = [];
+    public ObservableCollection<QueuedEffect> QueueRows { get; } = [];
+    public string QueueHeader => QueueRows.Count == 0 ? "Queue" : $"Queue ({QueueRows.Count})";
+    public bool QueueHidden => !ShowQueue;
 
     [ObservableProperty]
     private EffectPreset? _selectedPreset;
@@ -131,9 +318,6 @@ public partial class MainViewModel : ObservableObject
     private string _editName = "";
 
     [ObservableProperty]
-    private bool _editEnabled = true;
-
-    [ObservableProperty]
     private int _editCooldown;
 
     [ObservableProperty]
@@ -141,6 +325,34 @@ public partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private bool _focusGameForItemTest;
+
+    [ObservableProperty]
+    private bool _effectsPaused;
+
+    [ObservableProperty]
+    private int _gapSeconds;
+
+    [ObservableProperty]
+    private int _waitingLimit;
+
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(QueueHidden))]
+    private bool _showQueue;
+
+    [ObservableProperty]
+    private bool _showDevTools;
+
+    [ObservableProperty]
+    private bool _syncTriggers;
+
+    [ObservableProperty]
+    private bool _useTwitchTestServer;
+
+    [ObservableProperty]
+    private string _twitchStatus = "Twitch: not connected";
+
+    [ObservableProperty]
+    private string _twitchButtonText = "Connect Twitch";
 
     private string _loggedStatus = "";
 
@@ -168,11 +380,81 @@ public partial class MainViewModel : ObservableObject
         TestCommand.NotifyCanExecuteChanged();
     }
 
-    partial void OnEditEnabledChanged(bool value) => TestCommand.NotifyCanExecuteChanged();
-
     partial void OnFocusGameForItemTestChanged(bool value)
     {
         _settings.FocusGameForItemTest = value;
+        SaveSettings();
+    }
+
+    partial void OnEffectsPausedChanged(bool value)
+    {
+        _settings.EffectsPaused = value;
+        _queue.Paused = value;
+        _twitchSource.Paused = value;
+        SaveSettings();
+        _twitch.RequestSync();
+        ApplyState();
+    }
+
+    partial void OnGapSecondsChanged(int value)
+    {
+        if (value < 0)
+        {
+            GapSeconds = 0;
+            return;
+        }
+
+        _settings.GapSeconds = value;
+        _queue.MinGap = TimeSpan.FromSeconds(value);
+        SaveSettings();
+    }
+
+    partial void OnWaitingLimitChanged(int value)
+    {
+        if (value < 0)
+        {
+            WaitingLimit = 0;
+            return;
+        }
+
+        _settings.WaitingLimit = value;
+        _twitchSource.WaitingLimit = value;
+        SaveSettings();
+    }
+
+    partial void OnShowQueueChanged(bool value)
+    {
+        _settings.ShowQueue = value;
+        SaveSettings();
+    }
+
+    partial void OnShowDevToolsChanged(bool value)
+    {
+        _settings.ShowDevTools = value;
+        SaveSettings();
+        RebuildPresets();
+    }
+
+    partial void OnUseTwitchTestServerChanged(bool value)
+    {
+        if (value)
+        {
+            _twitch.StartTestServer();
+        }
+        else
+        {
+            _ = _twitch.StopTestServerAsync();
+        }
+    }
+
+    partial void OnSyncTriggersChanged(bool value)
+    {
+        _settings.SyncTriggers = value;
+        SaveSettings();
+    }
+
+    private void SaveSettings()
+    {
         try
         {
             ManagerSettingsStore.Save(_settings);
@@ -194,24 +476,158 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    [RelayCommand(CanExecute = nameof(CanTest))]
+    [RelayCommand(AllowConcurrentExecutions = true)]
+    private async Task ToggleTwitchAsync()
+    {
+        if (_twitchSignIn is not null)
+        {
+            _twitchSignIn.Cancel();
+            return;
+        }
+
+        if (_twitch.SignedIn)
+        {
+            await _twitch.SignOutAsync();
+            TwitchButtonText = "Connect Twitch";
+            return;
+        }
+
+        using var signIn = new CancellationTokenSource();
+        _twitchSignIn = signIn;
+        TwitchButtonText = "Cancel";
+        try
+        {
+            await _twitch.SignInAsync(device => Post(() => ShowTwitchCode(device)), signIn.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            TwitchStatus = "Twitch: not connected";
+        }
+        catch (Exception exception) when (exception is TwitchException or HttpRequestException)
+        {
+            TwitchStatus = "Twitch: not connected";
+            AddLog($"Twitch: {exception.Message}");
+        }
+        finally
+        {
+            _twitchSignIn = null;
+            TwitchButtonText = _twitch.SignedIn ? "Disconnect Twitch" : "Connect Twitch";
+        }
+    }
+
+    private void ShowTwitchCode(TwitchDeviceCode device)
+    {
+        TwitchStatus = $"Twitch: enter code {device.UserCode}";
+        AddLog($"Twitch: approve the sign-in with code {device.UserCode} at {device.VerificationUri}");
+        try
+        {
+            Process.Start(new ProcessStartInfo(device.VerificationUri) { UseShellExecute = true });
+        }
+        catch (System.ComponentModel.Win32Exception exception)
+        {
+            AddLog($"Twitch: could not open the browser: {exception.Message}");
+        }
+    }
+
+    private void ApplyTwitchStatus(string status)
+    {
+        TwitchStatus = status;
+        if (_twitchSignIn is null)
+        {
+            TwitchButtonText = _twitch.SignedIn ? "Disconnect Twitch" : "Connect Twitch";
+        }
+    }
+
+    /// <summary>Called as the window closes, so viewers cannot redeem with nothing listening.</summary>
+    public void PauseTwitchRewards()
+    {
+        _queue.Clear();
+        Task.Run(_twitch.PauseRewardsAsync).Wait(TimeSpan.FromSeconds(3));
+    }
+
+    [RelayCommand]
+    private void AllOn(string kind) => SetAllEvents(kind, true);
+
+    [RelayCommand]
+    private void AllOff(string kind) => SetAllEvents(kind, false);
+
+    private void SetAllEvents(string kind, bool on)
+    {
+        foreach (var row in Events)
+        {
+            row.SetQuietly(SyncTriggers ? EventToggle.AllKinds : kind, on);
+        }
+
+        EventsChanged();
+    }
+
+    [RelayCommand]
+    private void ClearQueue()
+    {
+        var cleared = _queue.Clear();
+        AddLog($"cleared {cleared} from the queue");
+    }
+
+    private static bool IsDiagnostic(EffectPreset preset) => DiagnosticHandlers.Contains(preset.HandlerId);
+
+    private void RebuildPresets()
+    {
+        var selected = SelectedPreset;
+        Presets.Clear();
+        foreach (var preset in _catalog.Presets.Where(preset => ShowDevTools || !IsDiagnostic(preset)))
+        {
+            Presets.Add(preset);
+        }
+
+        SelectedPreset = selected is null ? null : Presets.FirstOrDefault(preset => preset.Id == selected.Id);
+    }
+
+    private void RebuildEvents()
+    {
+        Events.Clear();
+        foreach (var preset in _catalog.Presets.Where(preset => !IsDiagnostic(preset)))
+        {
+            Events.Add(new EventToggle(preset, () => SyncTriggers, EventsChanged));
+        }
+    }
+
+    private void EventsChanged()
+    {
+        CatalogStore.Save(_catalog);
+        _twitch.RequestSync();
+    }
+
+    private void RefreshQueue()
+    {
+        QueueRows.Clear();
+        foreach (var effect in _queue.Snapshot())
+        {
+            QueueRows.Add(effect);
+        }
+
+        OnPropertyChanged(nameof(QueueHeader));
+    }
+
+    [RelayCommand(CanExecute = nameof(CanTest), AllowConcurrentExecutions = true)]
     private async Task TestAsync()
     {
-        if (SelectedPreset is null)
+        var preset = SelectedPreset;
+        if (preset is null)
         {
             return;
         }
 
         CommitEditor();
         CatalogStore.Save(_catalog);
-        if (SelectedPreset.HandlerId == "use_selected_item"
+        if (preset.HandlerId == "use_selected_item"
+            && ShowDevTools
             && FocusGameForItemTest
             && !FocusGameWindow())
         {
             AddLog("Could not foreground Dark Souls III; the input will remain queued until the game is active.");
         }
-        var result = await _manual.FireAsync(SelectedPreset.Id);
-        AddLog($"{SelectedPreset.Name}: {result.Status} — {result.Message}");
+        var result = await _manual.FireAsync(preset.Id);
+        AddLog($"{preset.Name}: {result.Status} — {result.Message}");
     }
 
     private static bool FocusGameWindow()
@@ -244,24 +660,24 @@ public partial class MainViewModel : ObservableObject
     {
         CommitEditor();
         CatalogStore.Save(_catalog);
-        var selected = SelectedPreset;
-        Presets.Clear();
-        foreach (var preset in _catalog.Presets)
-        {
-            Presets.Add(preset);
-        }
-        SelectedPreset = selected is null ? null : Presets.FirstOrDefault(preset => preset.Id == selected.Id);
+        RebuildPresets();
+        RebuildEvents();
         AddLog("saved presets");
+        _twitch.RequestSync();
     }
 
-    private bool CanTest() => IsSafe && SelectedPreset is not null && EditEnabled;
+    private bool CanTest() => _bridge.State.CanWait && SelectedPreset is not null;
 
     private async Task StartAsync()
     {
         try
         {
             await _bridge.StartAsync();
-            Post(() => AddLog($"Listening on 127.0.0.1:{_bridge.Port}"));
+            Post(() =>
+            {
+                AddLog($"Listening on 127.0.0.1:{_bridge.Port}");
+                ApplyState();
+            });
         }
         catch (Exception exception)
         {
@@ -273,7 +689,7 @@ public partial class MainViewModel : ObservableObject
     {
         var state = _bridge.State;
         IsSafe = state.IsSafe;
-        var status = Describe(state);
+        var status = EffectsPaused ? $"Effects paused · {Describe(state)}" : Describe(state);
         if (status != Status)
         {
             Status = status;
@@ -366,13 +782,11 @@ public partial class MainViewModel : ObservableObject
         if (SelectedPreset is null)
         {
             EditName = "";
-            EditEnabled = false;
             EditCooldown = 0;
             return;
         }
 
         EditName = SelectedPreset.Name;
-        EditEnabled = SelectedPreset.Enabled;
         EditCooldown = SelectedPreset.CooldownSeconds;
         var handler = _catalog.FindHandler(SelectedPreset.HandlerId);
         if (handler is null)
@@ -402,7 +816,6 @@ public partial class MainViewModel : ObservableObject
         }
 
         SelectedPreset.Name = EditName;
-        SelectedPreset.Enabled = EditEnabled;
         SelectedPreset.CooldownSeconds = Math.Max(0, EditCooldown);
         var handler = _catalog.FindHandler(SelectedPreset.HandlerId);
         foreach (var argument in Arguments)
@@ -435,6 +848,16 @@ public partial class MainViewModel : ObservableObject
 
     private void AddLog(string message)
     {
+        WriteLogFile(message);
+        LogLines.Insert(0, $"{DateTime.Now:HH:mm:ss}  {message}");
+        while (LogLines.Count > 200)
+        {
+            LogLines.RemoveAt(LogLines.Count - 1);
+        }
+    }
+
+    private static void WriteLogFile(string message)
+    {
         try
         {
             var path = Path.Combine(
@@ -446,12 +869,6 @@ public partial class MainViewModel : ObservableObject
         }
         catch (IOException)
         {
-        }
-
-        LogLines.Insert(0, $"{DateTime.Now:HH:mm:ss}  {message}");
-        while (LogLines.Count > 200)
-        {
-            LogLines.RemoveAt(LogLines.Count - 1);
         }
     }
 

@@ -1,22 +1,26 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use darksouls3::app_menu::NewMenuSystem;
 use darksouls3::param::{
-    EQUIP_PARAM_PROTECTOR_ST, EQUIP_PARAM_WEAPON_ST, REINFORCE_PARAM_WEAPON_ST,
+    EQUIP_PARAM_PROTECTOR_ST, EQUIP_PARAM_WEAPON_ST, NPC_PARAM_ST, NPC_THINK_PARAM_ST,
+    REINFORCE_PARAM_WEAPON_ST,
 };
 use darksouls3::sprj::{
-    CSRegulationManager, GameDataMan, ItemCategory, ItemId, MenuMan, PlayerGameData, PlayerIns,
+    CSRegulationManager, GameDataMan, ItemCategory, ItemId, MenuMan, PlayerGameData, PlayerInfo, PlayerIns,
     WorldChrMan,
 };
 use pelite::pe64::Pe;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use fromsoftware_shared::{FromStatic, Program};
 
 use crate::pattern::{self, find_unique};
 
 pub const HELD_SOULS_OFFSET: usize = 0x74;
+pub const SOUL_LEVEL_OFFSET: usize = 0x70;
+const SOUL_SCALE_BASE_LEVEL: i32 = 10;
 pub const QUICK_ITEM_OFFSET: usize = 0x5AC;
 pub const QUICK_ITEM_COUNT: usize = 10;
 /// Player data index of the highlighted quick item. 0 was Estus, 1 was Ashen Estus
@@ -50,15 +54,46 @@ const FIND_ITEM_PATTERN: &str =
 /// item first and is what the event script's remove-item command uses.
 const REMOVE_ITEM_PATTERN: &str =
     "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 41 0F B6 F1 41 0F B6 E8 8B FA 48 8B D9 E8";
+/// Debug creator entry used by the 1.15.2 character spawner. edx 1 creates and edx 2 deletes.
+const CREATE_NPC_PATTERN: &str =
+    "48 83 EC ?? FF CA 74 ?? FF CA 74 ?? FF CA 75 ?? 48 8B 0D ?? ?? ?? ?? 48 85 C9";
+/// WorldChrMan field that points at the debug character creator.
+const DEBUG_CHR_CREATOR: usize = 0x3018;
+const CREATOR_THINK_ID: usize = 0x124;
+const CREATOR_NPC_PARAM_ID: usize = 0x128;
+const CREATOR_CHR_ID: usize = 0x1B0;
+const CREATOR_DISTANCE: usize = 0x1B4;
+const CREATOR_HEIGHT: usize = 0x1B8;
+const CREATOR_ANGLE: usize = 0x1BC;
+const CREATE_NPC_COMMAND: u32 = 1;
+const SPAWN_DISTANCE_METERS: f32 = 3.0;
+const SPAWN_DISTANCE_STEPS: u32 = 4;
+const SPAWN_HEIGHT_METERS: f32 = 0.5;
+/// Set while the creator is idle.
+const CREATOR_READY: usize = 0x1C0;
+/// The character made by the last request. Creation finishes a few frames later.
+const CREATOR_RESULT: usize = 0x1C8;
+/// Normal spawns appear within a second, so a longer wait only delays the replacement.
+const SPAWN_WAIT_FRAMES: u32 = 120;
+/// The game turns an NPC id into a model by dividing by 100, so 110000 is c1100.
+const NPC_IDS_PER_MODEL: u32 = 100;
+/// Without bosses, rows above this count as boss-like.
+const MAX_RANDOM_ENEMY_HP: i32 = 3000;
+/// How many failed spawns a batch replaces with another pick.
+const MAX_SPAWN_REPLACEMENTS: u32 = 15;
+
+
 struct Located {
     game_man_slot: Result<usize, String>,
     add_soul: Result<usize, String>,
     set_text_effect: Result<usize, String>,
     fade: Result<FadeSystem, String>,
+    scene_slot: Result<usize, String>,
     save_request: Result<usize, String>,
     equip_item: Result<usize, String>,
     find_item: Result<usize, String>,
     remove_item: Result<usize, String>,
+    create_npc: Result<usize, String>,
 }
 
 #[derive(Clone, Copy)]
@@ -72,25 +107,27 @@ static LOCATED: OnceLock<Located> = OnceLock::new();
 /// Scans the executable once. Call this from the worker thread before the frame hook.
 pub fn prepare() {
     let _ = LOCATED.get_or_init(|| {
-        crate::log::log("resolving game patterns off the game thread");
         let located = Located {
             game_man_slot: locate_game_man_slot(),
             add_soul: find_unique(ADD_SOUL_PATTERN),
             set_text_effect: find_unique(SET_TEXT_EFFECT_PATTERN),
             fade: locate_fade_system(),
+            scene_slot: locate_scene_slot(),
             save_request: find_unique(SAVE_REQUEST_PATTERN),
             equip_item: find_unique(EQUIP_ITEM_PATTERN),
             find_item: find_unique(FIND_ITEM_PATTERN),
             remove_item: find_unique(REMOVE_ITEM_PATTERN),
+            create_npc: find_unique(CREATE_NPC_PATTERN),
         };
         crate::log::log(format!(
-            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={}",
+            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={} spawn={}",
             located.game_man_slot.is_ok(),
             located.add_soul.is_ok(),
             located.set_text_effect.is_ok(),
             located.fade.is_ok(),
             located.save_request.is_ok(),
             located.equip_item.is_ok() && located.find_item.is_ok() && located.remove_item.is_ok(),
+            located.create_npc.is_ok(),
         ));
         located
     });
@@ -150,13 +187,63 @@ pub fn gate() -> Result<(), String> {
     Ok(())
 }
 
+/// Why an effect should wait, if the session is fine but the moment is not. Problems
+/// that waiting cannot fix, such as being online, are left to [gate].
+pub fn not_ready_reason() -> Option<String> {
+    let snapshot = snapshot();
+    if !snapshot.exe_match || !snapshot.session_known || !snapshot.offline {
+        return None;
+    }
+    let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+    let alive = local_player()
+        .is_ok_and(|player| unsafe { &*player }.super_chr_ins.modules.data.hp > 0);
+    wait_reason(load_screen_open(), snapshot.in_game, alive, fake_death).map(str::to_string)
+}
+
+pub fn wait_reason(
+    load_screen: bool,
+    in_game: bool,
+    alive: bool,
+    fake_death: bool,
+) -> Option<&'static str> {
+    if load_screen {
+        Some("a load screen is open")
+    } else if !in_game {
+        Some("no character is loaded")
+    } else if fake_death {
+        Some("a fake death is running")
+    } else if !alive {
+        Some("the player is dead")
+    } else {
+        None
+    }
+}
+
 pub fn apply_soul_delta(current: i32, delta: i32) -> i32 {
     let target = (current as i64 + delta as i64).clamp(0, i32::MAX as i64);
     (target - current as i64) as i32
 }
 
-pub fn adjust_souls(delta: i32) -> Result<String, String> {
+/// The souls the game charges to go from this level to the next one.
+pub fn next_level_cost(level: i32) -> f64 {
+    let level = f64::from(level.max(1));
+    let steepness = ((level - 11.0) * 0.02).max(0.0) + 0.1;
+    steepness * (level + 81.0).powi(2) + 1.0
+}
+
+/// The amount applies as written at the base level and follows the level-up cost from there.
+pub fn soul_delta_for_level(delta: i32, level: i32) -> i32 {
+    let scale = next_level_cost(level) / next_level_cost(SOUL_SCALE_BASE_LEVEL);
+    (f64::from(delta) * scale).round() as i32
+}
+
+pub fn adjust_souls(delta: i32, scale_with_level: bool) -> Result<String, String> {
     let pgd = player_game_data()?;
+    let delta = if scale_with_level {
+        soul_delta_for_level(delta, read_i32(pgd, SOUL_LEVEL_OFFSET)?)
+    } else {
+        delta
+    };
     let before = read_souls(pgd)?;
     let applied = apply_soul_delta(before, delta);
     let target = before.saturating_add(applied);
@@ -213,10 +300,9 @@ const TEXT_EFFECT_YOU_DIED: u32 = 2;
 /// Measured on a real death (3745 ms to 7967 ms).
 const STAGED_BLACK_AFTER_DEAD: Duration = Duration::from_millis(4220);
 const STAGED_BLACK_FADE: Duration = Duration::from_millis(500);
-/// Carry on anyway if the dead bit never shows up. The latest seen was frame 358.
-const STAGED_DEAD_BIT_TIMEOUT_FRAMES: u32 = 480;
+/// When a real death starts the banner and grey, measured once.
+const STAGED_DEAD_AFTER: Duration = Duration::from_millis(3745);
 const STAGED_BLACK_HOLD_FRAMES: u32 = 30;
-const STAGED_TRACE_FRAMES: u32 = 60;
 /// Fade plate that holds the death grey. The game starts it when it sees the dead
 /// bit and only clears it on the respawn path, so it stays until something resets it.
 const GREY_FADE_PLATE: u32 = 6;
@@ -226,6 +312,9 @@ const BLACK_FADE_PLATE: u32 = 2;
 const BLACK_FADE_SECONDS: f32 = 0.5;
 const FADE_CLEAR: [f32; 4] = [0.0; 4];
 const FADE_BLACK: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+/// What the game itself fades plate 6 to when it sees the dead bit.
+const FADE_GREY: [f32; 4] = [1.0, 1.0, 1.0, 0.0];
+const GREY_FADE_SECONDS: f32 = 1.5;
 /// The death event's only test is bit 0 of the byte at
 /// `chr_set_entry -> +0x30 -> +0x8C`. Setting it starts the respawn chain.
 const CHR_SET_ENTRY_OFFSET: usize = 0x18;
@@ -242,10 +331,10 @@ struct FakeDeath {
     saved_stain_souls: i32,
     saved_flags: u32,
     saved_chr_state: u32,
-    elapsed: u32,
     remaining: u32,
     restoring: bool,
     restore_failures: u32,
+    started: Instant,
     staged: StagedDeath,
 }
 
@@ -254,15 +343,12 @@ struct FakeDeath {
 struct StagedDeath {
     banner_queued: bool,
     black_on: bool,
-    dead_at: Option<Instant>,
-    dead_bit_cleared: u32,
 }
 
 static FAKE_DEATH: Mutex<Option<FakeDeath>> = Mutex::new(None);
 
 pub fn start_fake_death() -> Result<String, String> {
     let saved_hp = begin_fake_death()?;
-    crate::log::log(format!("staged fake death started from HP {saved_hp}"));
     Ok(format!(
         "Fake death started from {saved_hp} HP. YOU DIED shows during the fall, then you stand back up at {saved_hp}."
     ))
@@ -294,10 +380,10 @@ fn begin_fake_death() -> Result<i32, String> {
         saved_stain_souls,
         saved_flags,
         saved_chr_state,
-        elapsed: 0,
         remaining: 0,
         restoring: false,
         restore_failures: 0,
+        started: Instant::now(),
         staged: StagedDeath::default(),
     });
     Ok(saved_hp)
@@ -313,7 +399,6 @@ pub fn show_you_died() -> Result<String, String> {
         return Err("the game rejected the YOU DIED text effect".to_string());
     }
     let message = "queued the YOU DIED banner".to_string();
-    crate::log::log(format!("show you died: {message}"));
     Ok(message)
 }
 
@@ -331,7 +416,6 @@ pub fn poll_fake_death() {
             return;
         }
         if !fake.restoring {
-            fake.elapsed = fake.elapsed.saturating_add(1);
             let _ = write_souls_if_player(fake.saved_souls);
             let _ = write_persistent_hp(fake.saved_hp);
             if !advance_staged_death(fake) {
@@ -342,10 +426,6 @@ pub fn poll_fake_death() {
             if let Err(error) = set_fade_plate(GREY_FADE_PLATE, &FADE_CLEAR, 0.0) {
                 crate::log::log(format!("staged fake death grey reset failed: {error}"));
             }
-            crate::log::log(format!(
-                "fake death restoring at frame {}",
-                fake.elapsed
-            ));
         }
         match restore_fake_death(fake) {
             Ok(()) => {
@@ -355,10 +435,6 @@ pub fn poll_fake_death() {
                     release_black(fake);
                 }
                 if fake.remaining == 0 {
-                    crate::log::log(format!(
-                        "fake death finished; HP restored to {}",
-                        fake.saved_hp
-                    ));
                     save_living_player();
                     slot.take();
                 }
@@ -384,7 +460,7 @@ pub fn poll_fake_death() {
 
 /// Runs one frame of the staged death. Returns true once it is time to stand up.
 fn advance_staged_death(fake: &mut FakeDeath) -> bool {
-    let elapsed = fake.elapsed;
+    let since_start = fake.started.elapsed();
     let staged = &mut fake.staged;
     let Ok(player) = local_player() else {
         return false;
@@ -393,42 +469,23 @@ fn advance_staged_death(fake: &mut FakeDeath) -> bool {
     let player_addr = player as *mut PlayerIns as usize;
 
     player.super_chr_ins.modules.data.hp = 0;
-    match clear_dead_event_bit(player_addr) {
-        Ok(true) => {
-            staged.dead_bit_cleared += 1;
-            staged.dead_at.get_or_insert_with(Instant::now);
-            if staged.dead_bit_cleared == 1 {
-                crate::log::log(format!(
-                    "staged fake death: the game set the dead bit at frame {elapsed}; cleared it"
-                ));
-            }
-        }
-        Ok(false) => {}
-        Err(error) => crate::log::log(format!("staged fake death dead bit: {error}")),
-    }
-    if elapsed % STAGED_TRACE_FRAMES == 0 {
-        crate::log::log(format!(
-            "staged fake death frame={elapsed} hp={} anim={} deadBitClears={}",
-            player.super_chr_ins.modules.data.hp,
-            current_animation(player_addr).unwrap_or(-1),
-            staged.dead_bit_cleared,
-        ));
+    if let Err(error) = clear_dead_event_bit(player_addr) {
+        crate::log::log(format!("staged fake death dead bit: {error}"));
     }
 
-    if staged.dead_at.is_none() && elapsed >= STAGED_DEAD_BIT_TIMEOUT_FRAMES {
-        crate::log::log("staged fake death: no dead bit, continuing without it");
-        staged.dead_at = Some(Instant::now());
-    }
-    let Some(dead_at) = staged.dead_at else {
+    if since_start < STAGED_DEAD_AFTER {
         return false;
-    };
+    }
     if !staged.banner_queued {
         staged.banner_queued = true;
         if let Err(error) = show_you_died() {
             crate::log::log(format!("staged fake death banner failed: {error}"));
         }
+        if let Err(error) = set_fade_plate(GREY_FADE_PLATE, &FADE_GREY, GREY_FADE_SECONDS) {
+            crate::log::log(format!("staged fake death grey failed: {error}"));
+        }
     }
-    let since_dead = dead_at.elapsed();
+    let since_dead = since_start - STAGED_DEAD_AFTER;
     if since_dead >= STAGED_BLACK_AFTER_DEAD && !staged.black_on {
         staged.black_on = true;
         if let Err(error) = set_fade_plate(BLACK_FADE_PLATE, &FADE_BLACK, BLACK_FADE_SECONDS) {
@@ -447,11 +504,6 @@ fn release_black(fake: &mut FakeDeath) {
     if let Err(error) = set_fade_plate(BLACK_FADE_PLATE, &FADE_CLEAR, BLACK_FADE_SECONDS) {
         crate::log::log(format!("staged fake death fade from black failed: {error}"));
     }
-}
-
-fn current_animation(player: usize) -> Result<i32, String> {
-    let action = module_pointer(player, ACTION_REQUEST_OFFSET)?;
-    read_u32_checked(action.wrapping_add(CURRENT_ANIM_OFFSET)).map(|value| value as i32)
 }
 
 fn dead_flags_address(player: usize) -> Result<usize, String> {
@@ -491,7 +543,11 @@ fn save_living_player() {
     };
     let request_save: extern "C" fn() = unsafe { std::mem::transmute(address) };
     request_save();
-    crate::log::log("fake death: requested a save of the living player");
+}
+
+fn locate_scene_slot() -> Result<usize, String> {
+    let site = find_unique(SCENE_PATTERN)?;
+    Ok(pattern::rip_target(site, 3, 7)?)
 }
 
 fn locate_fade_system() -> Result<FadeSystem, String> {
@@ -528,7 +584,31 @@ fn set_fade_plate(plate: u32, color: &[f32; 4], seconds: f32) -> Result<(), Stri
         seconds,
     };
     set_fade(fade, plate, color, &duration);
-    crate::log::log(format!("fade plate {plate} -> {color:?} over {seconds}s"));
+    Ok(())
+}
+
+const CHR_CTRL_OFFSET: usize = 0x50;
+/// Hit flags of the character controller. The game keeps a copy at +0x188 and only
+/// recalculates hit layers when the two differ, so the copy must be left alone here.
+const HIT_FLAGS_OFFSET: usize = 0x186;
+/// The game's death routine sets this as the death animation ends. While it is set, the
+/// game puts the player on corpse collision layers and attacks pass straight through.
+const HITS_OFF_BIT: u16 = 1;
+
+fn read_u16_checked(address: usize) -> Result<u16, String> {
+    let mut bytes = [0u8; 2];
+    if copy_readable(address, &mut bytes) != 2 {
+        return Err(format!("address {address:#X} is not readable"));
+    }
+    Ok(u16::from_ne_bytes(bytes))
+}
+
+fn enable_player_hits(player: usize) -> Result<(), String> {
+    let flags_address = read_usize_checked(player.wrapping_add(CHR_CTRL_OFFSET))?.wrapping_add(HIT_FLAGS_OFFSET);
+    let flags = read_u16_checked(flags_address)?;
+    if flags & HITS_OFF_BIT != 0 {
+        write_bytes_checked(flags_address, &(flags & !HITS_OFF_BIT).to_ne_bytes())?;
+    }
     Ok(())
 }
 
@@ -541,6 +621,7 @@ fn restore_fake_death(fake: &FakeDeath) -> Result<(), String> {
     let player_addr = player as *mut PlayerIns as usize;
     write_data_flags(player_addr, fake.saved_flags)?;
     write_chr_state(player_addr, fake.saved_chr_state)?;
+    enable_player_hits(player_addr)?;
     write_revive_animation(player_addr)?;
     clear_fall_death_camera()?;
     Ok(())
@@ -723,6 +804,134 @@ pub fn empty_stamina() -> Result<String, String> {
     Ok(format!("player stamina {before} -> 0"))
 }
 
+/// The death grey's own path to the scene object, which holds the colour correction.
+const SCENE_PATTERN: &str = "48 8B 05 ?? ?? ?? ?? 48 8B 58 10 BA 06 00 00 00 48 8B CF E8";
+const SCENE_OWNER_SCENE: usize = 0x10;
+const SCENE_DRAW_SOURCE: usize = 0x340;
+const DRAW_SOURCE_GET_PARAMS: usize = 0x18;
+/// How strongly the colour correction applies, from 0 to 1.
+const COLOR_BLEND_RATE: usize = 0x3928;
+/// Saturation for red, green and blue. The death grey sets these to 0.
+const COLOR_SATURATION: usize = 0x3930;
+
+struct Oversaturation {
+    until: Instant,
+    saturation: f32,
+    logged: bool,
+}
+
+static OVERSATURATION: Mutex<Option<Oversaturation>> = Mutex::new(None);
+
+pub fn oversaturate(seconds: i32, percent: i32) -> Result<String, String> {
+    cached()?.scene_slot.as_ref().map_err(|error| error.clone())?;
+    let until = Instant::now() + Duration::from_secs(seconds.max(1) as u64);
+    let saturation = percent as f32 / 100.0;
+    let mut slot = OVERSATURATION.lock().unwrap_or_else(|poison| poison.into_inner());
+    match slot.as_mut() {
+        Some(state) => {
+            state.until = state.until.max(until);
+            state.saturation = saturation;
+        }
+        None => {
+            *slot = Some(Oversaturation {
+                until,
+                saturation,
+                logged: false,
+            });
+        }
+    }
+    Ok(format!("colours at {percent}% for {seconds} seconds"))
+}
+
+fn color_params() -> Result<usize, String> {
+    let slot = *cached()?.scene_slot.as_ref().map_err(|error| error.clone())?;
+    let owner = read_usize_checked(slot)?;
+    let scene = read_usize_checked(owner + SCENE_OWNER_SCENE)?;
+    let source = read_usize_checked(scene + SCENE_DRAW_SOURCE)?;
+    let getter = read_usize_checked(read_usize_checked(source)? + DRAW_SOURCE_GET_PARAMS)?;
+    let call: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(getter) };
+    let params = call(source);
+    if params < 0x10_000 {
+        return Err("the colour settings are missing".to_string());
+    }
+    Ok(params)
+}
+
+/// The game rewrites these every frame, so this runs after that and before the scene draws.
+pub fn poll_oversaturation() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = OVERSATURATION.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(state) = slot.as_mut() else {
+            return;
+        };
+        if Instant::now() >= state.until {
+            slot.take();
+            return;
+        }
+        let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        if fake_death || load_screen_open() {
+            return;
+        }
+        let params = match color_params() {
+            Ok(params) => params,
+            Err(error) => {
+                if !state.logged {
+                    state.logged = true;
+                    crate::log::log(format!("oversaturate: {error}"));
+                }
+                return;
+            }
+        };
+        if !state.logged {
+            state.logged = true;
+        }
+        let saturation = state.saturation.to_ne_bytes();
+        let _ = write_bytes_checked(params + COLOR_BLEND_RATE, &1f32.to_ne_bytes());
+        for channel in 0..3 {
+            let _ = write_bytes_checked(params + COLOR_SATURATION + channel * 4, &saturation);
+        }
+    }));
+}
+
+/// When the screen starts fading back in.
+static BLIND_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// A second use while blind only extends the hold.
+pub fn blind(seconds: i32) -> Result<String, String> {
+    if FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
+        return Err("Fake Death is using the black screen".to_string());
+    }
+    let hold = Duration::from_secs(seconds.max(1) as u64);
+    let mut slot = BLIND_UNTIL.lock().unwrap_or_else(|poison| poison.into_inner());
+    let until = match *slot {
+        Some(current) => current.max(Instant::now() + hold),
+        None => {
+            set_fade_plate(BLACK_FADE_PLATE, &FADE_BLACK, BLACK_FADE_SECONDS)?;
+            Instant::now() + Duration::from_secs_f32(BLACK_FADE_SECONDS) + hold
+        }
+    };
+    *slot = Some(until);
+    Ok(format!("blind for {seconds} seconds"))
+}
+
+/// A load screen waits, so the fade back in cannot be lost and leave the screen black.
+pub fn poll_blind() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = BLIND_UNTIL.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(until) = *slot else {
+            return;
+        };
+        if Instant::now() < until || load_screen_open() {
+            return;
+        }
+        if let Err(error) = set_fade_plate(BLACK_FADE_PLATE, &FADE_CLEAR, BLACK_FADE_SECONDS) {
+            crate::log::log(format!("blind fade back in is waiting: {error}"));
+            return;
+        }
+        slot.take();
+    }));
+}
+
 static STAMINA_LOCK: Mutex<Option<Instant>> = Mutex::new(None);
 /// Rolling and attacking still worked with stamina held at exactly 0. Below 0 is the
 /// overdrawn state the game itself refuses actions in, with room for a frame of regen.
@@ -756,7 +965,6 @@ pub fn poll_stamina_lock() {
         }
         if finished {
             slot.take();
-            crate::log::log("stamina lock ended");
         }
     }));
 }
@@ -850,7 +1058,6 @@ pub fn poll_speed_changes() {
         }
         if load_screen_open() {
             changes.clear();
-            crate::log::log("speed changes ended by a load screen");
             return;
         }
         let now = Instant::now();
@@ -865,8 +1072,54 @@ pub fn poll_speed_changes() {
         if let Ok(player) = local_player() {
             apply_speed_for_animation(player as usize, moving, acting, now);
         }
-        if changes.is_empty() {
-            crate::log::log("speed back to normal");
+    }));
+}
+
+/// Just above zero, so the animation update never sees a frame time of nothing.
+const FROZEN_SPEED: f32 = 0.001;
+
+static FREEZE_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn freeze(seconds: i32) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    if FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some() {
+        return Err("a fake death is running".to_string());
+    }
+    let until = Instant::now() + Duration::from_secs(seconds.max(0) as u64);
+    let mut slot = FREEZE_UNTIL.lock().unwrap_or_else(|poison| poison.into_inner());
+    *slot = Some(slot.map_or(until, |current| current.max(until)));
+    crate::input::block_input(seconds);
+    Ok(format!("player frozen for {seconds} seconds"))
+}
+
+/// Runs after the speed changes, so a freeze wins over them. They take over again when it ends.
+pub fn poll_freeze() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = FREEZE_UNTIL.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(until) = *slot else {
+            return;
+        };
+        let now = Instant::now();
+        let player = local_player();
+        let alive = player
+            .as_ref()
+            .is_ok_and(|player| unsafe { &**player }.super_chr_ins.modules.data.hp > 0);
+        let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        // A frozen death animation would hold up the respawn.
+        let finished = now >= until || !alive || fake_death || load_screen_open();
+        if !finished {
+            if let Ok(player) = player {
+                apply_speed_for_animation(player as usize, FROZEN_SPEED, FROZEN_SPEED, now);
+            }
+            return;
+        }
+        slot.take();
+        crate::input::stop_blocking_input();
+        if let Ok(player) = player {
+            let _ = write_player_speed(player as usize, NORMAL_SPEED);
         }
     }));
 }
@@ -906,7 +1159,6 @@ pub fn poll_one_hit_run() {
         };
         if Instant::now() >= until || load_screen_open() {
             slot.take();
-            crate::log::log("1 hit run ended");
             return;
         }
         if let Ok(player) = local_player() {
@@ -918,9 +1170,90 @@ pub fn poll_one_hit_run() {
     }));
 }
 
+/// Data-module byte used by the debug "No Damage" switch. Bit 1 blocks hit damage.
+const NO_DAMAGE_FLAG_OFFSET: usize = 0x1C0;
+const NO_DAMAGE_BIT: u8 = 1 << 1;
+
+struct Invincibility {
+    until: Instant,
+    clear_on_end: bool,
+}
+
+static INVINCIBILITY: Mutex<Option<Invincibility>> = Mutex::new(None);
+
+pub fn with_no_damage_bit(flags: u8, enabled: bool) -> u8 {
+    if enabled {
+        flags | NO_DAMAGE_BIT
+    } else {
+        flags & !NO_DAMAGE_BIT
+    }
+}
+
+fn set_no_damage(player: &mut PlayerIns, enabled: bool) -> Result<bool, String> {
+    let data = player.super_chr_ins.modules.data.as_ptr() as usize;
+    if data < 0x10_000 {
+        return Err("player data is missing".to_string());
+    }
+    let address = data + NO_DAMAGE_FLAG_OFFSET;
+    let mut byte = [0u8; 1];
+    if copy_readable(address, &mut byte) != 1 {
+        return Err("the no-damage flag is not readable".to_string());
+    }
+    let was_set = byte[0] & NO_DAMAGE_BIT != 0;
+    let next = with_no_damage_bit(byte[0], enabled);
+    if next != byte[0] {
+        write_bytes_checked(address, &[next])?;
+    }
+    Ok(was_set)
+}
+
+pub fn invincible(seconds: i32) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let already = set_no_damage(player, true)?;
+    let requested = Instant::now() + Duration::from_secs(seconds.max(0) as u64);
+    let mut slot = INVINCIBILITY.lock().unwrap_or_else(|poison| poison.into_inner());
+    let until = match slot.as_mut() {
+        Some(current) => {
+            current.until = current.until.max(requested);
+            current.until
+        }
+        None => {
+            *slot = Some(Invincibility {
+                until: requested,
+                clear_on_end: !already,
+            });
+            requested
+        }
+    };
+    let remaining = until.saturating_duration_since(Instant::now()).as_secs().max(1);
+    Ok(format!("invincible for {remaining} seconds"))
+}
+
+pub fn poll_invincibility() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = INVINCIBILITY.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(state) = slot.as_mut() else {
+            return;
+        };
+        let finished = Instant::now() >= state.until || load_screen_open();
+        let enabled = !finished || !state.clear_on_end;
+        if let Ok(player) = local_player() {
+            let _ = set_no_damage(unsafe { &mut *player }, enabled);
+        }
+        if finished {
+            slot.take();
+        }
+    }));
+}
+
 const RIGHT_HAND_SLOT: u32 = 1;
 const EQUIP_BUFFER_SIZE: usize = 0x100;
 const EQUIP_BUFFER_INVENTORY_INDEX: usize = 0x38;
+/// -1 here makes the menu routine empty the slot.
+const EQUIP_BUFFER_UNEQUIP: usize = 0x3C;
 /// Bit 0 here allows equipment changes outside the menu.
 const EQUIP_UNLOCK_MODULE_OFFSET: usize = 0;
 const EQUIP_UNLOCK_FLAGS_OFFSET: usize = 0x10;
@@ -1097,18 +1430,86 @@ fn choose_weapon(options: &WeaponOptions, current: u32, stats: [u32; 4]) -> Resu
     Ok((variant + level, candidates.len()))
 }
 
+/// Calls the menu routine for `slot`. A negative `index` empties the slot.
+fn call_equip(player: &mut PlayerIns, slot: u32, index: i32) -> Result<(), String> {
+    let equip_item = *cached()?.equip_item.as_ref().map_err(|error| error.clone())?;
+    let mut buffer = [0u8; EQUIP_BUFFER_SIZE];
+    let (offset, value) = if index < 0 {
+        (EQUIP_BUFFER_UNEQUIP, -1)
+    } else {
+        (EQUIP_BUFFER_INVENTORY_INDEX, index)
+    };
+    buffer[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    let equip: extern "C" fn(u32, *const u8) = unsafe { std::mem::transmute(equip_item) };
+
+    let player_addr = player as *mut PlayerIns as usize;
+    let flags_address = module_pointer(player_addr, EQUIP_UNLOCK_MODULE_OFFSET)?
+        .wrapping_add(EQUIP_UNLOCK_FLAGS_OFFSET);
+    let flags = read_u32_checked(flags_address)?;
+    write_u32_checked(flags_address, flags | 1)?;
+    equip(slot, buffer.as_ptr());
+    write_u32_checked(flags_address, flags)
+}
+
+fn is_armor(entry: &darksouls3::sprj::EquipInventoryDataListEntry, piece: u32) -> bool {
+    entry.item_id.category() as u32 == ItemCategory::Protector as u32 && entry.item_id.param_id() == piece
+}
+
+fn count_armor(player: &PlayerIns, piece: u32) -> u32 {
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    equipment
+        .equip_inventory_data
+        .items_data
+        .items()
+        .filter(|entry| is_armor(entry, piece))
+        .count() as u32
+}
+
+/// Copies of an armor piece are identical, so any copy that is not being worn will do.
+fn spare_armor_index(player: &PlayerIns, piece: u32) -> Option<i32> {
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    let inventory = &equipment.equip_inventory_data;
+    (0..=u32::try_from(inventory.max_item_index).ok()?)
+        .find(|index| {
+            inventory.items_data[*index].as_option().is_some_and(|entry| is_armor(entry, piece))
+                && !equipment.equipment_indexes.contains(&(*index as i32))
+        })
+        .map(|index| index as i32)
+}
+
+fn holds_item(player: &PlayerIns, param: u32, index: i32) -> bool {
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    u32::try_from(index)
+        .ok()
+        .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+        .is_some_and(|entry| entry.item_id.param_id() == param)
+}
+
+/// Where an item is now. A save can come back with its inventory in a different order,
+/// so a remembered index is only trusted if it still holds the same item.
+fn current_index(player: &mut PlayerIns, category: ItemCategory, param: u32, index: i32) -> Option<i32> {
+    if holds_item(player, param, index) {
+        return Some(index);
+    }
+    let equipment = unsafe { &mut player.player_game_data.as_mut().equipment };
+    let raw_id = ItemId::new(category, param).ok()?.into_inner();
+    let find_item = *cached().ok()?.find_item.as_ref().ok()?;
+    let find: extern "C" fn(*mut std::ffi::c_void, *const u32) -> i32 =
+        unsafe { std::mem::transmute(find_item) };
+    let inventory = &mut equipment.equip_inventory_data as *mut _ as *mut std::ffi::c_void;
+    let found = find(inventory, &raw_id);
+    (found >= 0).then_some(found)
+}
+
 /// Gives one of `item` and equips it through the menu routine. Returns its inventory
 /// index once the slot is confirmed to hold it.
 fn give_and_equip(player: &mut PlayerIns, item: ItemId, slot: u32) -> Result<i32, String> {
-    let located = cached()?;
-    let equip_item = *located.equip_item.as_ref().map_err(|error| error.clone())?;
-    let find_item = *located.find_item.as_ref().map_err(|error| error.clone())?;
+    let find_item = *cached()?.find_item.as_ref().map_err(|error| error.clone())?;
     let game_data = unsafe { GameDataMan::instance_mut() }
         .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
     game_data.give_item_directly(item, 1);
 
     let raw_id = item.into_inner();
-    let player_addr = player as *mut PlayerIns as usize;
     let equipment = unsafe { &mut player.player_game_data.as_mut().equipment };
     let find: extern "C" fn(*mut std::ffi::c_void, *const u32) -> i32 =
         unsafe { std::mem::transmute(find_item) };
@@ -1118,17 +1519,7 @@ fn give_and_equip(player: &mut PlayerIns, item: ItemId, slot: u32) -> Result<i32
         return Err(format!("item {raw_id:#X} was not found in the inventory after giving it"));
     }
 
-    let mut buffer = [0u8; EQUIP_BUFFER_SIZE];
-    buffer[EQUIP_BUFFER_INVENTORY_INDEX..EQUIP_BUFFER_INVENTORY_INDEX + 4]
-        .copy_from_slice(&index.to_le_bytes());
-    let equip: extern "C" fn(u32, *const u8) = unsafe { std::mem::transmute(equip_item) };
-
-    let flags_address = module_pointer(player_addr, EQUIP_UNLOCK_MODULE_OFFSET)?
-        .wrapping_add(EQUIP_UNLOCK_FLAGS_OFFSET);
-    let flags = read_u32_checked(flags_address)?;
-    write_u32_checked(flags_address, flags | 1)?;
-    equip(slot, buffer.as_ptr());
-    write_u32_checked(flags_address, flags)?;
+    call_equip(player, slot, index)?;
 
     let equipped = equipment.equipment_indexes[slot as usize];
     if equipped != index {
@@ -1157,6 +1548,33 @@ fn remove_inventory_entry(player: &mut PlayerIns, index: i32) -> Result<bool, St
 pub struct ArmorOptions {
     pub remove_old: bool,
     pub include_missing_dlc: bool,
+    pub style: ArmorStyle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArmorStyle {
+    RandomPieces,
+    MatchingSet,
+    EitherAtRandom,
+}
+
+impl ArmorStyle {
+    pub fn from_index(index: i64) -> Self {
+        match index {
+            1 => Self::MatchingSet,
+            2 => Self::EitherAtRandom,
+            _ => Self::RandomPieces,
+        }
+    }
+
+    /// `roll` only matters for [Self::EitherAtRandom], where odd means a set.
+    pub fn uses_set(self, roll: usize) -> bool {
+        match self {
+            Self::RandomPieces => false,
+            Self::MatchingSet => true,
+            Self::EitherAtRandom => roll % 2 == 1,
+        }
+    }
 }
 
 /// Head, body, hands, legs.
@@ -1197,12 +1615,8 @@ fn armor_pools(include_missing_dlc: bool) -> Result<[Vec<u32>; 4], String> {
         .map(|dlc| (dlc.dlc1_installed, dlc.dlc2_installed))
         .unwrap_or((false, false));
     let mut pools: [Vec<u32>; 4] = Default::default();
-    let mut dlc_rows = 0;
     for (id, row) in regulation.get_param::<EQUIP_PARAM_PROTECTOR_ST>().iter() {
         let id = id as u32;
-        if ASHES_OF_ARIANDEL_ARMOR.contains(&id) || RINGED_CITY_ARMOR.contains(&id) {
-            dlc_rows += 1;
-        }
         if !is_listed_armor(id) {
             continue;
         }
@@ -1214,25 +1628,60 @@ fn armor_pools(include_missing_dlc: bool) -> Result<[Vec<u32>; 4], String> {
             pools[slot].push(id);
         }
     }
-    crate::log::log(format!(
-        "armor pools {:?}, {dlc_rows} of {} listed DLC ids found",
-        pools.iter().map(Vec::len).collect::<Vec<_>>(),
-        ASHES_OF_ARIANDEL_ARMOR.len() + RINGED_CITY_ARMOR.len(),
-    ));
     Ok(pools)
 }
 
-pub fn random_armor(options: ArmorOptions) -> Result<String, String> {
-    let player = unsafe { &mut *local_player()? };
-    if player.super_chr_ins.modules.data.hp <= 0 {
-        return Err("the local player is dead".to_string());
+/// Groups the pools into sets. Pieces of a set share an id apart from the thousands
+/// digit. Lone pieces, such as a single mask, are not treated as sets.
+pub fn armor_sets(pools: &[Vec<u32>; 4]) -> Vec<[Option<u32>; 4]> {
+    let mut sets = std::collections::BTreeMap::<u32, [Option<u32>; 4]>::new();
+    for (slot, pool) in pools.iter().enumerate() {
+        for id in pool {
+            sets.entry(id / 10_000).or_default()[slot] = Some(*id);
+        }
     }
-    let pools = armor_pools(options.include_missing_dlc)?;
+    sets.into_values()
+        .filter(|set| set.iter().flatten().count() >= 2)
+        .collect()
+}
 
-    let mut equipped = Vec::new();
-    let mut removed = 0;
+/// One slot changed by [roll_armor], with what it needs to be put back.
+#[derive(Deserialize, Serialize)]
+struct ArmorSwap {
+    slot: u32,
+    old_index: i32,
+    old_id: u32,
+    /// Copies of `piece` before the swap, because the temporary copy goes back by count.
+    owned_before: u32,
+    piece: u32,
+}
+
+struct ArmorRoll {
+    swaps: Vec<ArmorSwap>,
+    failure: Option<String>,
+    used_set: bool,
+}
+
+/// Gives and equips a new piece for each armor slot.
+fn roll_armor(
+    player: &mut PlayerIns,
+    style: ArmorStyle,
+    include_missing_dlc: bool,
+) -> Result<ArmorRoll, String> {
+    let pools = armor_pools(include_missing_dlc)?;
+    let set = if style.uses_set(random_index(2)) {
+        let sets = armor_sets(&pools);
+        if sets.is_empty() {
+            return Err("no armor sets were found in the game data".to_string());
+        }
+        Some(sets[random_index(sets.len())])
+    } else {
+        None
+    };
+
+    let mut swaps = Vec::new();
     let mut failure = None;
-    for (slot, pool) in ARMOR_SLOTS.into_iter().zip(&pools) {
+    for (position, (slot, pool)) in ARMOR_SLOTS.into_iter().zip(&pools).enumerate() {
         if pool.is_empty() {
             continue;
         }
@@ -1248,38 +1697,750 @@ pub fn random_armor(options: ArmorOptions) -> Result<String, String> {
             .unwrap_or(0);
 
         // Choosing the piece already worn would change nothing.
-        let choices: Vec<u32> = pool.iter().copied().filter(|id| *id != old_id).collect();
+        let choices: Vec<u32> = match set {
+            Some(set) => set[position].into_iter().collect(),
+            None => pool.clone(),
+        };
+        let choices: Vec<u32> = choices.into_iter().filter(|id| *id != old_id).collect();
         let Some(&piece) = choices.get(random_index(choices.len())) else {
             continue;
         };
         let item = ItemId::new(ItemCategory::Protector, piece)
             .map_err(|error| format!("armor {piece} has an invalid id: {error:?}"))?;
 
+        let owned_before = count_armor(player, piece);
         match give_and_equip(player, item, slot) {
-            Ok(_) => {
-                equipped.push(piece);
-                if options.remove_old
-                    && is_real_armor(old_id)
-                    && remove_inventory_entry(player, old_index)?
-                {
-                    removed += 1;
-                }
-            }
+            Ok(_) => swaps.push(ArmorSwap { slot, old_index, old_id, owned_before, piece }),
             Err(error) => failure = Some(error),
         }
     }
-    match failure {
+    Ok(ArmorRoll { swaps, failure, used_set: set.is_some() })
+}
+
+pub fn random_armor(options: ArmorOptions) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    if pending().bombardier.is_some() {
+        return Err(BOMBARDIER_ACTIVE.to_string());
+    }
+    let roll = roll_armor(player, options.style, options.include_missing_dlc)?;
+
+    let mut removed = 0;
+    if options.remove_old {
+        for swap in &roll.swaps {
+            if is_real_armor(swap.old_id) && remove_inventory_entry(player, swap.old_index)? {
+                removed += 1;
+            }
+        }
+    }
+    let equipped: Vec<u32> = roll.swaps.iter().map(|swap| swap.piece).collect();
+    match roll.failure {
         Some(error) if equipped.is_empty() => Err(error),
         Some(error) => Ok(format!("equipped armor {equipped:?}, but one piece failed: {error}")),
         None if equipped.is_empty() => Err("no armor was found in the game data".to_string()),
-        None => Ok(format!("equipped armor {equipped:?}, removed {removed} old pieces")),
+        None => {
+            let style = if roll.used_set { "set" } else { "pieces" };
+            Ok(format!("equipped armor {style} {equipped:?}, removed {removed} old pieces"))
+        }
     }
+}
+
+#[derive(Deserialize, Serialize)]
+struct TemporaryArmor {
+    until: u64,
+    character: String,
+    swaps: Vec<ArmorSwap>,
+}
+
+const PENDING_RESTORES_FILE: &str = "pending-restores.json";
+const OTHER_CHARACTER_WAITING: &str = "another character is still waiting to get its gear or stats back";
+
+/// Everything a temporary swap must put back. It lives in a file as well, so a crash or
+/// a quit cannot leave a character stuck with the swap.
+#[derive(Default, Deserialize, Serialize)]
+struct PendingRestores {
+    armor: Option<TemporaryArmor>,
+    bombardier: Option<Bombardier>,
+    stats: Option<ShuffledStats>,
+}
+
+impl PendingRestores {
+    fn is_empty(&self) -> bool {
+        self.armor.is_none() && self.bombardier.is_none() && self.stats.is_none()
+    }
+}
+
+static PENDING: Mutex<PendingRestores> =
+    Mutex::new(PendingRestores { armor: None, bombardier: None, stats: None });
+
+fn pending() -> MutexGuard<'static, PendingRestores> {
+    PENDING.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Wall-clock time, because the end of a swap has to mean something after a restart.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn write_pending(restores: &PendingRestores) -> Result<(), String> {
+    let path = crate::log::app_dir()?.join(PENDING_RESTORES_FILE);
+    if restores.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(()),
+        };
+    }
+    let text = serde_json::to_string_pretty(restores).map_err(|error| error.to_string())?;
+    // Written beside the real file first, so a crash mid-write cannot lose the old one.
+    let partial = path.with_extension("tmp");
+    std::fs::write(&partial, text).map_err(|error| error.to_string())?;
+    std::fs::rename(&partial, &path).map_err(|error| error.to_string())
+}
+
+fn save_pending(restores: &PendingRestores) {
+    if let Err(error) = write_pending(restores) {
+        crate::log::log(format!("could not save pending restores: {error}"));
+    }
+}
+
+/// Picks up swaps from before a crash or a quit. The polls below finish them once that
+/// character is back in the world.
+pub fn load_pending_restores() {
+    let Ok(dir) = crate::log::app_dir() else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(dir.join(PENDING_RESTORES_FILE)) else {
+        return;
+    };
+    match serde_json::from_str::<PendingRestores>(&text) {
+        Ok(restores) => {
+            *pending() = restores;
+        }
+        Err(error) => crate::log::log(format!("pending restores could not be read: {error}")),
+    }
+}
+
+pub fn temporary_armor(
+    seconds: i32,
+    style: ArmorStyle,
+    include_missing_dlc: bool,
+) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let until = unix_now() + seconds.max(0) as u64;
+    let character = read_character().1;
+    let mut slot = pending();
+    if slot.bombardier.is_some() {
+        return Err(BOMBARDIER_ACTIVE.to_string());
+    }
+    if let Some(active) = slot.armor.as_mut() {
+        if active.character != character {
+            return Err(OTHER_CHARACTER_WAITING.to_string());
+        }
+        // A second outfit would lose track of the armor to put back.
+        active.until = active.until.max(until);
+        save_pending(&slot);
+        return Ok(format!("temporary armor extended to at least {seconds} more seconds"));
+    }
+    let roll = roll_armor(player, style, include_missing_dlc)?;
+    if roll.swaps.is_empty() {
+        return Err(roll.failure.unwrap_or_else(|| "no armor was found in the game data".to_string()));
+    }
+    let equipped: Vec<u32> = roll.swaps.iter().map(|swap| swap.piece).collect();
+    slot.armor = Some(TemporaryArmor { until, character, swaps: roll.swaps });
+    save_pending(&slot);
+    Ok(format!("temporary armor {equipped:?} for {seconds} seconds"))
+}
+
+/// Armor goes back only while the player is in the world and not mid-death.
+pub fn can_restore_armor(load_screen: bool, player_loaded: bool, alive: bool, fake_death: bool) -> bool {
+    !load_screen && player_loaded && alive && !fake_death
+}
+
+fn restore_armor_slot(player: &mut PlayerIns, swap: &ArmorSwap) -> Result<(), String> {
+    let owned = current_index(player, ItemCategory::Protector, swap.old_id, swap.old_index);
+    let target = owned.filter(|_| is_real_armor(swap.old_id)).unwrap_or(-1);
+    call_equip(player, swap.slot, target)?;
+
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    let equipped = equipment.equipment_indexes[swap.slot as usize];
+    if target >= 0 && equipped != target {
+        return Err(format!("slot {} holds {equipped}, wanted {target}", swap.slot));
+    }
+    // After a crash before a save the count is unchanged, so nothing is removed. One copy
+    // at most goes, so a copy picked up during the swap stays.
+    if count_armor(player, swap.piece) > swap.owned_before {
+        if let Some(index) = spare_armor_index(player, swap.piece) {
+            remove_inventory_entry(player, index)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn poll_temporary_armor() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = pending();
+        let Some(active) = slot.armor.as_ref() else {
+            return;
+        };
+        if unix_now() < active.until {
+            return;
+        }
+        let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        let player = local_player();
+        let alive = player
+            .as_ref()
+            .is_ok_and(|player| unsafe { &**player }.super_chr_ins.modules.data.hp > 0);
+        if !can_restore_armor(load_screen_open(), player.is_ok(), alive, fake_death) {
+            return;
+        }
+        let (loaded, character) = read_character();
+        let Ok(player) = player else {
+            return;
+        };
+        if !loaded || character != active.character {
+            return;
+        }
+        let Some(active) = slot.armor.take() else {
+            return;
+        };
+        let player = unsafe { &mut *player };
+        for swap in &active.swaps {
+            if let Err(error) = restore_armor_slot(player, swap) {
+                crate::log::log(format!("temporary armor slot {} restore failed: {error}", swap.slot));
+            }
+        }
+        save_pending(&slot);
+    }));
+}
+
+/// Left and right hands, three weapons each.
+const WEAPON_SLOTS: [u32; 6] = [0, 1, 2, 3, 4, 5];
+const BLACK_FIREBOMB: u32 = 0x129;
+/// How a quick slot stores the item: the category in the top bits, then the param id.
+const BLACK_FIREBOMB_SLOT_VALUE: i32 = 0x4000_0129;
+/// The game's own limit. A stack above it spills onto the floor, so the event stays at it
+/// and refills as bombs are thrown.
+const BOMB_COUNT: u32 = 10;
+/// The Mirrah Chain Set, in [ARMOR_SLOTS] order.
+const BOMBARDIER_ARMOR: [u32; 4] = [79_000_000, 79_001_000, 79_002_000, 79_003_000];
+const BOMBARDIER_ACTIVE: &str = "Bombardier is using the armor slots";
+/// The equip routine numbers the quick slots from here, after the gear slots.
+const QUICK_EQUIP_SLOT: u32 = 0x16;
+/// The real quick slots: a gaitem handle then an inventory index, 8 bytes each. The ids at
+/// [QUICK_ITEM_OFFSET] are only a copy of what these hold.
+const QUICK_PAIRS_OFFSET: usize = 0x490;
+const ESTUS_PARAMS: std::ops::RangeInclusive<u32> = 190..=220;
+const GOODS_CATEGORY: u32 = 4;
+const ITEM_PARAM_MASK: u32 = 0x0FFF_FFFF;
+
+#[derive(Deserialize, Serialize)]
+struct RemovedWeapon {
+    slot: u32,
+    index: i32,
+    weapon: u32,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Bombardier {
+    until: u64,
+    character: String,
+    weapons: Vec<RemovedWeapon>,
+    /// Saved swaps from before the armor was added have no such field.
+    #[serde(default)]
+    armor: Vec<ArmorSwap>,
+    bombs_before: u32,
+    quick_slot: usize,
+    quick_item: i32,
+    quick_index: i32,
+    selected_before: i32,
+    #[serde(skip)]
+    selection_settled: bool,
+    #[serde(skip)]
+    weapons_changed: bool,
+}
+
+fn black_firebomb() -> Result<ItemId, String> {
+    ItemId::new(ItemCategory::Goods, BLACK_FIREBOMB)
+        .map_err(|error| format!("the Black Firebomb id is invalid: {error:?}"))
+}
+
+fn write_i32(pgd: *mut PlayerGameData, offset: usize, value: i32) -> Result<(), String> {
+    if pgd.is_null() {
+        return Err("player data is missing".to_string());
+    }
+    unsafe { pgd.cast::<u8>().add(offset).cast::<i32>().write(value) };
+    Ok(())
+}
+
+pub fn is_estus(item: i32) -> bool {
+    let item = item as u32;
+    item >> 28 == GOODS_CATEGORY && ESTUS_PARAMS.contains(&(item & ITEM_PARAM_MASK))
+}
+
+/// A slot already holding the bombs, then a free slot, then anything that is not Estus.
+pub fn pick_bomb_slot(items: &[i32]) -> Option<usize> {
+    items
+        .iter()
+        .position(|item| *item == BLACK_FIREBOMB_SLOT_VALUE)
+        .or_else(|| items.iter().position(|item| is_empty_item(*item)))
+        .or_else(|| items.iter().position(|item| !is_estus(*item)))
+}
+
+/// Equips like the menu does, which takes off whatever the slot held. A negative `index`
+/// empties it. If the game ignores the request, the slot is written directly.
+fn equip_quick_item(player: &mut PlayerIns, slot: usize, index: i32, item: i32) -> Result<(), String> {
+    call_equip(player, QUICK_EQUIP_SLOT + slot as u32, index)?;
+    let pgd = player.player_game_data.as_ptr();
+    let pair = QUICK_PAIRS_OFFSET + slot * 8;
+    if read_i32(pgd, pair + 4)? == index {
+        return Ok(());
+    }
+    crate::log::log(format!("quick slot {slot}: the equip routine did not take it, writing directly"));
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    let handle = u32::try_from(index)
+        .ok()
+        .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+        .map_or(0, |entry| entry.gaitem_handle.get());
+    write_i32(pgd, pair, handle as i32)?;
+    write_i32(pgd, pair + 4, index)?;
+    write_i32(pgd, QUICK_ITEM_OFFSET + slot * 4, item)
+}
+
+fn set_bomb_count(pgd: *mut PlayerGameData, count: u32) -> Result<(), String> {
+    set_stack(pgd, count)?;
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    let main = &mut *game_data.main_player_game_data as *mut PlayerGameData;
+    if main != pgd {
+        set_stack(main, count)?;
+    }
+    Ok(())
+}
+
+fn set_stack(pgd: *mut PlayerGameData, count: u32) -> Result<(), String> {
+    let data = unsafe { pgd.as_mut() }.ok_or("player data is missing")?;
+    data.equipment
+        .equip_inventory_data
+        .items_data
+        .items_mut()
+        .find(|entry| item_matches(entry.item_id, BLACK_FIREBOMB_SLOT_VALUE))
+        .map(|entry| entry.quantity = count)
+        .ok_or_else(|| "the Black Firebombs did not reach the inventory".to_string())
+}
+
+/// Wears the set, and returns what each slot needs to get its own armor back.
+fn wear_bombardier_armor(player: &mut PlayerIns) -> Vec<ArmorSwap> {
+    let mut swaps = Vec::new();
+    for (slot, piece) in ARMOR_SLOTS.into_iter().zip(BOMBARDIER_ARMOR) {
+        let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+        let old_index = equipment.equipment_indexes[slot as usize];
+        let old_id = u32::try_from(old_index)
+            .ok()
+            .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+            .map_or(0, |entry| entry.item_id.param_id());
+        if old_id == piece {
+            continue;
+        }
+        let owned_before = count_armor(player, piece);
+        let equipped = ItemId::new(ItemCategory::Protector, piece)
+            .map_err(|error| format!("armor {piece} has an invalid id: {error:?}"))
+            .and_then(|item| give_and_equip(player, item, slot));
+        match equipped {
+            Ok(_) => swaps.push(ArmorSwap { slot, old_index, old_id, owned_before, piece }),
+            Err(error) => crate::log::log(format!("Bombardier: armor slot {slot} failed: {error}")),
+        }
+    }
+    swaps
+}
+
+/// Leaves any bombs the player owned before, even if some of the event's bombs are still unused.
+pub fn bombs_to_remove(remaining: u32, before: u32) -> u32 {
+    remaining.saturating_sub(before)
+}
+
+pub fn bombardier(seconds: i32) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let until = unix_now() + seconds as u64;
+    let character = read_character().1;
+    let pgd = player.player_game_data.as_ptr();
+    let mut slot = pending();
+    if let Some(active) = slot.bombardier.as_mut() {
+        if active.character != character {
+            return Err(OTHER_CHARACTER_WAITING.to_string());
+        }
+        active.until = active.until.max(until);
+        save_pending(&slot);
+        return Ok(format!("Bombardier extended to at least {seconds} more seconds"));
+    }
+
+    let quick_items = (0..QUICK_ITEM_COUNT)
+        .map(|quick_slot| quick_item_id(pgd, quick_slot))
+        .collect::<Result<Vec<_>, _>>()?;
+    let quick_slot = pick_bomb_slot(&quick_items).ok_or("every quick slot holds an Estus Flask")?;
+    let quick_item = quick_items[quick_slot];
+    let quick_index = read_i32(pgd, QUICK_PAIRS_OFFSET + quick_slot * 8 + 4)?;
+    let selected_before = read_i32(pgd, SELECTED_QUICK_SLOT_OFFSET)?;
+    let bombs_before = item_quantity(pgd, BLACK_FIREBOMB_SLOT_VALUE).unwrap_or(0);
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    // Only what is missing, because anything over the limit would land on the floor.
+    let missing = BOMB_COUNT.saturating_sub(bombs_before);
+    if missing > 0 {
+        game_data.give_item_directly(black_firebomb()?, missing);
+    }
+
+    let mut weapons = Vec::new();
+    for weapon_slot in WEAPON_SLOTS {
+        let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+        let index = equipment.equipment_indexes[weapon_slot as usize];
+        let weapon = u32::try_from(index)
+            .ok()
+            .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+            .map(|entry| entry.item_id.param_id());
+        let Some(weapon) = weapon else {
+            continue;
+        };
+        if !is_removable_weapon(weapon) {
+            continue;
+        }
+        call_equip(player, weapon_slot, -1)?;
+        weapons.push(RemovedWeapon { slot: weapon_slot, index, weapon });
+    }
+    // Temporary Armor already remembers the player's own armor, so a second swap on top
+    // of it could lose track of what goes back.
+    let armor = if slot.armor.is_some() { Vec::new() } else { wear_bombardier_armor(player) };
+    let removed = weapons.len();
+    slot.bombardier = Some(Bombardier {
+        until,
+        character,
+        weapons,
+        armor,
+        bombs_before,
+        quick_slot,
+        quick_item,
+        quick_index,
+        selected_before,
+        selection_settled: false,
+        weapons_changed: false,
+    });
+    save_pending(&slot);
+    let bomb_index = current_index(player, ItemCategory::Goods, BLACK_FIREBOMB, -1)
+        .ok_or("the Black Firebombs did not reach the inventory")?;
+    equip_quick_item(player, quick_slot, bomb_index, BLACK_FIREBOMB_SLOT_VALUE)?;
+    write_i32(pgd, SELECTED_QUICK_SLOT_OFFSET, quick_slot as i32)?;
+    Ok(format!(
+        "Bombardier for {seconds} seconds: {removed} weapons removed, quick slot {quick_slot} holds {} bombs",
+        item_quantity(pgd, BLACK_FIREBOMB_SLOT_VALUE).unwrap_or(0),
+    ))
+}
+
+fn end_bombardier(player: &mut PlayerIns, active: &Bombardier) -> Result<(), String> {
+    for removed in &active.weapons {
+        match current_index(player, ItemCategory::Weapon, removed.weapon, removed.index) {
+            Some(index) => call_equip(player, removed.slot, index)?,
+            None => crate::log::log(format!("Bombardier: weapon {} is no longer owned", removed.weapon)),
+        }
+    }
+    for swap in &active.armor {
+        if let Err(error) = restore_armor_slot(player, swap) {
+            crate::log::log(format!("Bombardier: armor slot {} restore failed: {error}", swap.slot));
+        }
+    }
+    let param = active.quick_item as u32 & ITEM_PARAM_MASK;
+    let target = if is_empty_item(active.quick_item) {
+        -1
+    } else {
+        current_index(player, ItemCategory::Goods, param, active.quick_index).unwrap_or(-1)
+    };
+    let item = if target < 0 { -1 } else { active.quick_item };
+    equip_quick_item(player, active.quick_slot, target, item)?;
+    let pgd = player.player_game_data.as_ptr();
+    write_i32(pgd, SELECTED_QUICK_SLOT_OFFSET, active.selected_before)?;
+    let remaining = item_quantity(pgd, BLACK_FIREBOMB_SLOT_VALUE).unwrap_or(0);
+    let extra = bombs_to_remove(remaining, active.bombs_before);
+    if extra > 0 {
+        let game_data = unsafe { GameDataMan::instance_mut() }
+            .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+        game_data.remove_item(black_firebomb()?, extra);
+    }
+    Ok(())
+}
+
+/// The game can move the selection back by itself once after the bombs are equipped.
+/// Only the first change is corrected, so the player can still switch to Estus after.
+fn keep_bombs_selected(active: &mut Bombardier) {
+    if active.selection_settled {
+        return;
+    }
+    let Ok(player) = local_player() else {
+        return;
+    };
+    let pgd = unsafe { &*player }.player_game_data.as_ptr();
+    let Ok(selected) = read_i32(pgd, SELECTED_QUICK_SLOT_OFFSET) else {
+        return;
+    };
+    if selected == active.quick_slot as i32 {
+        return;
+    }
+    active.selection_settled = true;
+    if crate::input::switching_item() {
+        return;
+    }
+    let _ = write_i32(pgd, SELECTED_QUICK_SLOT_OFFSET, active.quick_slot as i32);
+}
+
+/// Tops the stack up each frame, so it never reaches 0 and leaves the quick slot. If the
+/// bombs are gone anyway, for example discarded in the menu, they are given and equipped again.
+fn keep_bombs_stocked(active: &Bombardier) -> Result<(), String> {
+    let player = unsafe { &mut *local_player()? };
+    let pgd = player.player_game_data.as_ptr();
+    match item_quantity(pgd, BLACK_FIREBOMB_SLOT_VALUE) {
+        Some(count) if count >= BOMB_COUNT => Ok(()),
+        Some(_) => set_bomb_count(pgd, BOMB_COUNT),
+        None => {
+            let game_data = unsafe { GameDataMan::instance_mut() }
+                .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+            game_data.give_item_directly(black_firebomb()?, BOMB_COUNT);
+            let index = current_index(player, ItemCategory::Goods, BLACK_FIREBOMB, -1)
+                .ok_or("the Black Firebombs did not reach the inventory")?;
+            equip_quick_item(player, active.quick_slot, index, BLACK_FIREBOMB_SLOT_VALUE)
+        }
+    }
+}
+
+/// Weapons stay in the inventory, so anything equipped from the menu comes straight off.
+/// The first time, it is remembered so that slot's own weapon is not lost at the end.
+fn keep_hands_empty(active: &mut Bombardier) {
+    let Ok(player) = local_player() else {
+        return;
+    };
+    let player = unsafe { &mut *player };
+    for weapon_slot in WEAPON_SLOTS {
+        let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+        let index = equipment.equipment_indexes[weapon_slot as usize];
+        let weapon = u32::try_from(index)
+            .ok()
+            .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+            .map(|entry| entry.item_id.param_id());
+        let Some(weapon) = weapon.filter(|weapon| is_removable_weapon(*weapon)) else {
+            continue;
+        };
+        if let Err(error) = call_equip(player, weapon_slot, -1) {
+            crate::log::log(format!("Bombardier: could not clear slot {weapon_slot}: {error}"));
+            continue;
+        }
+        if !active.weapons.iter().any(|removed| removed.slot == weapon_slot) {
+            active.weapons.push(RemovedWeapon { slot: weapon_slot, index, weapon });
+            active.weapons_changed = true;
+        }
+    }
+}
+
+pub fn poll_bombardier() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = pending();
+        let Some(active) = slot.bombardier.as_mut() else {
+            return;
+        };
+        keep_bombs_selected(active);
+        if !load_screen_open() {
+            keep_hands_empty(active);
+            if unix_now() < active.until {
+                let _ = keep_bombs_stocked(active);
+            }
+        }
+        if std::mem::take(&mut active.weapons_changed) {
+            save_pending(&slot);
+        }
+        let Some(active) = slot.bombardier.as_ref() else {
+            return;
+        };
+        if unix_now() < active.until {
+            return;
+        }
+        let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        let player = local_player();
+        let alive = player
+            .as_ref()
+            .is_ok_and(|player| unsafe { &**player }.super_chr_ins.modules.data.hp > 0);
+        if !can_restore_armor(load_screen_open(), player.is_ok(), alive, fake_death) {
+            return;
+        }
+        let (loaded, character) = read_character();
+        let Ok(player) = player else {
+            return;
+        };
+        if !loaded || character != active.character {
+            return;
+        }
+        let Some(active) = slot.bombardier.take() else {
+            return;
+        };
+        if let Err(error) = end_bombardier(unsafe { &mut *player }, &active) {
+            crate::log::log(format!("Bombardier restore failed: {error}"));
+        }
+        save_pending(&slot);
+    }));
+}
+
+const STAT_COUNT: usize = 9;
+const STAT_NAMES: [&str; STAT_COUNT] = ["Vig", "Att", "End", "Vit", "Str", "Dex", "Int", "Fth", "Lck"];
+const MAX_SHUFFLE_ROLLS: usize = 20;
+
+#[derive(Deserialize, Serialize)]
+struct ShuffledStats {
+    until: u64,
+    character: String,
+    original: [u32; STAT_COUNT],
+}
+
+
+fn read_stats(info: &PlayerInfo) -> [u32; STAT_COUNT] {
+    [
+        info.vigor,
+        info.attunement,
+        info.endurance,
+        info.vitality,
+        info.strength,
+        info.dexterity,
+        info.intelligence,
+        info.faith,
+        info.luck,
+    ]
+}
+
+fn write_stats(info: &mut PlayerInfo, stats: [u32; STAT_COUNT]) {
+    let [vigor, attunement, endurance, vitality, strength, dexterity, intelligence, faith, luck] = stats;
+    info.vigor = vigor;
+    info.attunement = attunement;
+    info.endurance = endurance;
+    info.vitality = vitality;
+    info.strength = strength;
+    info.dexterity = dexterity;
+    info.intelligence = intelligence;
+    info.faith = faith;
+    info.luck = luck;
+}
+
+fn apply_stats(player: &mut PlayerIns, stats: [u32; STAT_COUNT]) -> Result<(), String> {
+    write_stats(unsafe { &mut player.player_game_data.as_mut().player_info }, stats);
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    write_stats(&mut game_data.main_player_game_data.player_info, stats);
+    Ok(())
+}
+
+/// Fisher-Yates, so every stat value is kept and only their places change.
+pub fn shuffled_stats(mut stats: [u32; STAT_COUNT], mut roll: impl FnMut(usize) -> usize) -> [u32; STAT_COUNT] {
+    for index in (1..STAT_COUNT).rev() {
+        stats.swap(index, roll(index + 1));
+    }
+    stats
+}
+
+/// A shuffle keeps the total, so a different total means the player levelled up or the
+/// game loaded older stats. Putting the remembered ones back would then lose levels.
+pub fn can_restore_stats(current: [u32; STAT_COUNT], original: [u32; STAT_COUNT]) -> bool {
+    current.iter().sum::<u32>() == original.iter().sum::<u32>()
+}
+
+fn describe_stats(stats: [u32; STAT_COUNT]) -> String {
+    STAT_NAMES
+        .iter()
+        .zip(stats)
+        .map(|(name, value)| format!("{name} {value}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn shuffle_stats(seconds: i32) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let current = read_stats(unsafe { &player.player_game_data.as_ref().player_info });
+    let shuffled = (0..MAX_SHUFFLE_ROLLS)
+        .map(|_| shuffled_stats(current, random_index))
+        .find(|stats| *stats != current)
+        .ok_or_else(|| "every stat has the same value, so there is nothing to shuffle".to_string())?;
+    let character = read_character().1;
+    let mut slot = pending();
+    if slot.stats.as_ref().is_some_and(|active| active.character != character) {
+        return Err(OTHER_CHARACTER_WAITING.to_string());
+    }
+    if seconds == 0 {
+        slot.stats = None;
+    } else {
+        let until = unix_now() + seconds as u64;
+        match slot.stats.as_mut() {
+            // Shuffling again must still bring back the real stats, not the last shuffle.
+            Some(active) => active.until = active.until.max(until),
+            None => slot.stats = Some(ShuffledStats { until, character, original: current }),
+        }
+    }
+    apply_stats(player, shuffled)?;
+    save_pending(&slot);
+    Ok(format!("stats shuffled: {}", describe_stats(shuffled)))
+}
+
+pub fn poll_shuffled_stats() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = pending();
+        let Some(active) = slot.stats.as_ref() else {
+            return;
+        };
+        if unix_now() < active.until {
+            return;
+        }
+        let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        let player = local_player();
+        let alive = player
+            .as_ref()
+            .is_ok_and(|player| unsafe { &**player }.super_chr_ins.modules.data.hp > 0);
+        if !can_restore_armor(load_screen_open(), player.is_ok(), alive, fake_death) {
+            return;
+        }
+        let (loaded, character) = read_character();
+        let Ok(player) = player else {
+            return;
+        };
+        if !loaded || character != active.character {
+            return;
+        }
+        let Some(active) = slot.stats.take() else {
+            return;
+        };
+        let player = unsafe { &mut *player };
+        let current = read_stats(unsafe { &player.player_game_data.as_ref().player_info });
+        if can_restore_stats(current, active.original) {
+            if let Err(error) = apply_stats(player, active.original) {
+                crate::log::log(format!("stat shuffle restore failed: {error}"));
+            }
+        } else {
+            crate::log::log("stat shuffle not restored: the stat total changed");
+        }
+        save_pending(&slot);
+    }));
 }
 
 pub fn random_weapon(options: WeaponOptions) -> Result<String, String> {
     let player = unsafe { &mut *local_player()? };
     if player.super_chr_ins.modules.data.hp <= 0 {
         return Err("the local player is dead".to_string());
+    }
+    if pending().bombardier.is_some() {
+        return Err("Bombardier has taken the weapons away".to_string());
     }
     let player_data = unsafe { player.player_game_data.as_ref() };
     let info = &player_data.player_info;
@@ -1364,9 +2525,6 @@ pub fn use_selected_item() -> Result<String, String> {
     }
     let menu_open = menus_open()?;
     let sent = crate::input::queue_use_item(menu_open)?;
-    crate::log::log(format!(
-        "quick slot {slot} item {item_id:#X}: {sent}"
-    ));
     Ok(sent)
 }
 
@@ -1628,13 +2786,561 @@ fn current_exe_is_ds3() -> bool {
         .eq_ignore_ascii_case("DarkSoulsIII.exe")
 }
 
+fn create_npc_address() -> Result<usize, String> {
+    let address = *cached()?.create_npc.as_ref().map_err(|error| error.clone())?;
+    let mut bytes = [0u8; 7];
+    if copy_readable(address, &mut bytes) != 7
+        || bytes != [0x48, 0x83, 0xEC, bytes[3], 0xFF, 0xCA, 0x74]
+    {
+        return Err("the NPC spawn routine does not start with the expected prologue".to_string());
+    }
+    Ok(address)
+}
+
+fn debug_creator() -> Result<usize, String> {
+    let world = unsafe { WorldChrMan::instance() }
+        .map_err(|error| format!("WorldChrMan is unavailable: {error:?}"))?;
+    let slot = (world as *const WorldChrMan as usize).wrapping_add(DEBUG_CHR_CREATOR);
+    let creator = read_usize_checked(slot)?;
+    if creator < 0x10_000 {
+        return Err("the debug character creator is not available".to_string());
+    }
+    Ok(creator)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EnemyChoice {
+    npc_id: u32,
+    think_id: u32,
+}
+
+/// Boss models are c5000 to c5999.
+pub fn is_boss_row(id: u32) -> bool {
+    (500_000..600_000).contains(&id)
+}
+
+/// Only rows with a model and real health, leaving out the c8000 range and up, which holds
+/// no regular enemies. Without bosses, very high health also rules out boss-like rows.
+pub fn is_spawnable_enemy(id: u32, hp: i32, bosses: bool) -> bool {
+    (100_000..800_000).contains(&id)
+        && hp > 1
+        && (bosses || (hp <= MAX_RANDOM_ENEMY_HP && !is_boss_row(id)))
+}
+
+/// Regular enemies share one team, so the most common team tells them from friendly NPCs.
+/// Bosses may be on teams of their own, which `enemy_teams` adds.
+pub fn most_common_team(teams: impl Iterator<Item = u8>) -> Option<u8> {
+    let mut counts = [0u32; 256];
+    for team in teams {
+        counts[team as usize] += 1;
+    }
+    let (team, count) = counts.iter().enumerate().max_by_key(|(_, count)| **count)?;
+    (*count > 0).then_some(team as u8)
+}
+
+pub fn enemy_teams(rows: &[(u32, u8)]) -> Vec<u8> {
+    let regular = rows.iter().filter(|(id, _)| !is_boss_row(*id)).map(|(_, team)| *team);
+    let mut teams: Vec<u8> = most_common_team(regular).into_iter().collect();
+    teams.extend(rows.iter().filter(|(id, _)| is_boss_row(*id)).map(|(_, team)| *team));
+    teams.sort_unstable();
+    teams.dedup();
+    teams
+}
+
+pub fn has_fight_logic(logic_id: i32, battle_goal_id: i32) -> bool {
+    logic_id > 0 && battle_goal_id > 0 && battle_goal_id != GENERIC_BATTLE_GOAL
+}
+
+/// Prefers the AI rows placed enemies really run, because the table also holds idle and
+/// scripted variants. Fight scripts only load with their own area, so an enemy from
+/// elsewhere borrows a local AI. Its moves are written for another model, so it may act oddly.
+pub fn ai_choices(npc_id: u32, think_ids: &[u32], placed: &[(u32, u32)], models: &[u32]) -> Vec<u32> {
+    let model = npc_id / NPC_IDS_PER_MODEL;
+    let own: Vec<u32> = placed
+        .iter()
+        .filter(|(placed_model, _)| *placed_model == model)
+        .map(|(_, think)| *think)
+        .collect();
+    if !own.is_empty() {
+        return own;
+    }
+    if models.contains(&model) {
+        return think_candidates(npc_id, think_ids);
+    }
+    placed.iter().map(|(_, think)| *think).collect()
+}
+
+/// The AI rows an enemy can use. The NPC row itself holds 0, a generic AI that never
+/// fights, because placed enemies get theirs from the map. AI rows are numbered like NPC
+/// rows, so the same id is the best match, then any row for the same model.
+pub fn think_candidates(npc_id: u32, think_ids: &[u32]) -> Vec<u32> {
+    if think_ids.contains(&npc_id) {
+        return vec![npc_id];
+    }
+    think_ids
+        .iter()
+        .copied()
+        .filter(|id| id / NPC_IDS_PER_MODEL == npc_id / NPC_IDS_PER_MODEL)
+        .collect()
+}
+
+/// "c1100_00" becomes 1100. The player model c0000 is not an enemy.
+pub fn model_from_chr_name(name: &str) -> Option<u32> {
+    let (model, _) = name.strip_prefix('c')?.split_once('_').unwrap_or((&name[1..], ""));
+    let model = model.parse::<u32>().ok()?;
+    (model != 0).then_some(model)
+}
+
+const BLOCK_CHR_SET_CAPACITY: usize = 0x80;
+const BLOCK_CHR_SET_ENTRIES: usize = 0x88;
+const CHR_SET_ENTRY_SIZE: usize = 0x38;
+const MAX_CHRS_PER_BLOCK: u32 = 4096;
+const CHR_DATA_NAME: usize = 0x130;
+const CHR_DATA_HP_FIELD: usize = 0xD8;
+/// Empty on spawns whose model never loaded. They stay invisible and do nothing.
+const CHR_MODEL: usize = 0x48;
+/// A spawn with no model by now is frozen.
+const SPAWN_CHECK_FRAMES: u32 = 150;
+/// While the list is full, the queue only looks again after this many frames.
+const FULL_RECHECK_FRAMES: u32 = 15;
+/// While the list is full, one living enemy is removed every this many checks.
+const REPLACE_OLDEST_CHECKS: u32 = 4;
+/// WorldChrMan keeps spawned characters here in creation order, oldest first.
+const SPAWN_ORDER_BEGIN: usize = 0x2FF8;
+/// The AI row a placed enemy really runs.
+const ENEMY_THINK_ID: usize = 0x1FB8;
+/// Inside the creator routine: the jump to the "delete last character" command.
+const DELETE_LAST_JUMP: usize = 0x81;
+/// Inside that command: the jump to the function that deletes any character.
+const DELETE_CHR_JUMP: usize = 0x1F;
+/// The goal of AI rows with no fight logic. Enemies that only follow map events use it.
+const GENERIC_BATTLE_GOAL: i32 = 11000;
+
+fn chr_name(chr: usize) -> Option<String> {
+    let data = module_pointer(chr, DATA_MODULE_OFFSET).ok()?;
+    let mut raw = [0u8; 16];
+    if copy_readable(data + CHR_DATA_NAME, &mut raw) != raw.len() {
+        return None;
+    }
+    let units: Vec<u16> = raw
+        .chunks_exact(2)
+        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
+/// The model and AI row of each character in the loaded map. These models spawn reliably,
+/// while other models are sometimes not available to the creator.
+fn placed_enemies() -> Result<Vec<(u32, u32)>, String> {
+    let world = unsafe { WorldChrMan::instance() }
+        .map_err(|error| format!("WorldChrMan is unavailable: {error:?}"))?;
+    let slots = world.world_block_chr.as_ptr() as usize;
+    let slot_size = std::mem::size_of_val(&world.world_block_chr) / world.world_block_chr.len();
+    let mut placed = Vec::new();
+    for block in (0..world.world_block_chr.len()).map(|index| slots + index * slot_size) {
+        let capacity = read_u32_checked(block + BLOCK_CHR_SET_CAPACITY).unwrap_or(0);
+        let entries = read_usize_checked(block + BLOCK_CHR_SET_ENTRIES).unwrap_or(0);
+        if capacity == 0 || capacity > MAX_CHRS_PER_BLOCK || entries < 0x10_000 {
+            continue;
+        }
+        for index in 0..capacity as usize {
+            let chr = read_usize_checked(entries + index * CHR_SET_ENTRY_SIZE).unwrap_or(0);
+            if chr < 0x10_000 {
+                continue;
+            }
+            if let Some(model) = chr_name(chr).as_deref().and_then(model_from_chr_name) {
+                placed.push((model, read_u32_checked(chr + ENEMY_THINK_ID).unwrap_or(0)));
+            }
+        }
+    }
+    placed.sort_unstable();
+    placed.dedup();
+    Ok(placed)
+}
+
+struct EnemyInFlight {
+    previous: usize,
+    frames: u32,
+}
+
+/// The creator makes one character at a time, so the rest wait here.
+struct EnemyQueue {
+    creator: usize,
+    routine: usize,
+    remaining: Vec<EnemyChoice>,
+    pool: Vec<EnemyChoice>,
+    replace_oldest: bool,
+    limit: usize,
+    full_frames: u32,
+    pause_frames: u32,
+    replacements: u32,
+    checks: Vec<SpawnCheck>,
+    in_flight: Option<EnemyInFlight>,
+    started: u32,
+}
+
+static ENEMY_QUEUE: Mutex<Option<EnemyQueue>> = Mutex::new(None);
+
+/// Spawned characters live in a small list of their own, and the creator silently fails
+/// once it is full. Returns how many slots are used and how many there are.
+fn spawned_chr_slots() -> Option<(usize, usize)> {
+    let world = unsafe { WorldChrMan::instance() }.ok()?;
+    let set = &world.debug_chr_set;
+    Some((set.iter().count(), set.capacity as usize))
+}
+
+/// Enemies already being deleted do not count, but they keep their slot in the game's list.
+fn spawned_chrs_full(limit: usize) -> bool {
+    let Some((used, capacity)) = spawned_chr_slots() else {
+        return false;
+    };
+    let requested = DELETE_REQUESTED.lock().unwrap_or_else(|poison| poison.into_inner());
+    let active = spawned_chrs()
+        .iter()
+        .filter(|chr| !requested.contains(chr))
+        .count();
+    used >= capacity || active >= limit
+}
+
+fn spawned_chrs() -> Vec<usize> {
+    let Ok(world) = (unsafe { WorldChrMan::instance() }) else {
+        return Vec::new();
+    };
+    world
+        .debug_chr_set
+        .iter()
+        .map(|entry| &*entry.chr as *const _ as usize)
+        .collect()
+}
+
+fn chr_health(chr: usize) -> Option<i32> {
+    let data = module_pointer(chr, DATA_MODULE_OFFSET).ok()?;
+    read_u32_checked(data + CHR_DATA_HP_FIELD).ok().map(|hp| hp as i32)
+}
+
+fn dead_spawns() -> Vec<usize> {
+    spawned_chrs()
+        .into_iter()
+        .filter(|chr| chr_health(*chr).is_some_and(|hp| hp <= 0))
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpawnState {
+    Fine,
+    Gone,
+    Frozen,
+}
+
+pub fn spawn_state(present: bool, model: usize) -> SpawnState {
+    match (present, model) {
+        (false, _) => SpawnState::Gone,
+        (true, 0) => SpawnState::Frozen,
+        (true, _) => SpawnState::Fine,
+    }
+}
+
+struct SpawnCheck {
+    chr: usize,
+    frames: u32,
+}
+
+fn poll_spawn_checks(queue: &mut EnemyQueue) {
+    if queue.checks.is_empty() {
+        return;
+    }
+    let present = spawned_chrs();
+    let mut frozen = Vec::new();
+    let mut failed = 0;
+    for check in queue.checks.iter_mut() {
+        check.frames += 1;
+        let exists = present.contains(&check.chr);
+        if exists && check.frames < SPAWN_CHECK_FRAMES {
+            continue;
+        }
+        check.frames = SPAWN_CHECK_FRAMES;
+        let model = if exists {
+            read_usize_checked(check.chr + CHR_MODEL).unwrap_or(0)
+        } else {
+            0
+        };
+        let state = spawn_state(exists, model);
+        match state {
+            SpawnState::Fine => {}
+            SpawnState::Gone => failed += 1,
+            SpawnState::Frozen => {
+                failed += 1;
+                frozen.push(check.chr);
+            }
+        }
+    }
+    queue.checks.retain(|check| check.frames < SPAWN_CHECK_FRAMES);
+    if !frozen.is_empty() {
+        let mut requested = DELETE_REQUESTED.lock().unwrap_or_else(|poison| poison.into_inner());
+        if let Err(error) = delete_spawns(&frozen, &mut requested) {
+            crate::log::log(format!("spawn enemy: frozen enemies not removed: {error}"));
+        }
+    }
+    for _ in 0..failed {
+        replace_failed_spawn(queue);
+    }
+}
+
+fn replace_failed_spawn(queue: &mut EnemyQueue) {
+    if queue.replacements < MAX_SPAWN_REPLACEMENTS {
+        queue.replacements += 1;
+        let replacement = queue.pool[random_index(queue.pool.len())];
+        queue.remaining.push(replacement);
+    }
+}
+
+fn jump_target(address: usize) -> Result<usize, String> {
+    let mut bytes = [0u8; 5];
+    if copy_readable(address, &mut bytes) != bytes.len() || bytes[0] != 0xE9 {
+        return Err(format!("expected a jump at {address:#x}"));
+    }
+    let offset = i32::from_ne_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    Ok((address + bytes.len()).wrapping_add_signed(offset as isize))
+}
+
+/// The game's own function for deleting a character, found through the creator routine.
+fn delete_chr_address() -> Result<usize, String> {
+    let delete_last = jump_target(create_npc_address()? + DELETE_LAST_JUMP)?;
+    let delete = jump_target(delete_last + DELETE_CHR_JUMP)?;
+    let mut bytes = [0u8; 5];
+    if copy_readable(delete, &mut bytes) != bytes.len() || bytes != [0x48, 0x85, 0xD2, 0x0F, 0x84] {
+        return Err("the character delete function does not look as expected".to_string());
+    }
+    Ok(delete)
+}
+
+/// Deletion finishes a few frames later, so each character is only requested once.
+static DELETE_REQUESTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn delete_spawns(chrs: &[usize], requested: &mut Vec<usize>) -> Result<(), String> {
+    let delete = delete_chr_address()?;
+    let world = unsafe { WorldChrMan::instance() }
+        .map_err(|error| format!("WorldChrMan is unavailable: {error:?}"))?;
+    let world = world as *const WorldChrMan as usize;
+    let call: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(delete) };
+    for chr in chrs.iter().copied() {
+        if !requested.contains(&chr) {
+            call(world, chr);
+            requested.push(chr);
+        }
+    }
+    Ok(())
+}
+
+/// Makes room in a full list: dead enemies go first, then the oldest living one if allowed.
+/// A delete can take a while to finish, so the next one does not wait for it.
+fn free_spawn_slot(replace_oldest: bool, full_frames: u32) -> Result<(), String> {
+    let mut requested = DELETE_REQUESTED.lock().unwrap_or_else(|poison| poison.into_inner());
+    let present = spawned_chrs();
+    requested.retain(|chr| present.contains(chr));
+    let dead = dead_spawns();
+    if !dead.is_empty() {
+        delete_spawns(&dead, &mut requested)?;
+    }
+    if !replace_oldest || full_frames % REPLACE_OLDEST_CHECKS != 0 {
+        return Ok(());
+    }
+    let world = unsafe { WorldChrMan::instance() }
+        .map_err(|error| format!("WorldChrMan is unavailable: {error:?}"))?;
+    let order = world as *const WorldChrMan as usize + SPAWN_ORDER_BEGIN;
+    let (begin, end) = (read_usize_checked(order)?, read_usize_checked(order + 8)?);
+    if begin == end {
+        return Ok(());
+    }
+    let oldest = read_usize_checked(begin)?;
+    if present.contains(&oldest) {
+        delete_spawns(&[oldest], &mut requested)?;
+    }
+    Ok(())
+}
+
+pub fn spawn_random_enemy(
+    amount: i32,
+    whole_game: bool,
+    bosses: bool,
+    only_bosses: bool,
+    replace_oldest: bool,
+    limit: usize,
+) -> Result<String, String> {
+    let bosses = bosses || only_bosses;
+    let routine = create_npc_address()?;
+    let creator = debug_creator()?;
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the NPC list is unavailable: {error:?}"))?;
+    let placed = placed_enemies()?;
+    let mut models: Vec<u32> = placed.iter().map(|(model, _)| *model).collect();
+    models.dedup();
+    let npcs = regulation.get_param::<NPC_PARAM_ST>();
+    let thinks = regulation.get_param::<NPC_THINK_PARAM_ST>();
+    let mut think_ids: Vec<u32> = thinks
+        .iter()
+        .filter(|(id, row)| *id > 0 && has_fight_logic(row.logic_id(), row.battle_goal_id()))
+        .map(|(id, _)| id as u32)
+        .collect();
+    think_ids.sort_unstable();
+    let placed: Vec<(u32, u32)> = placed
+        .into_iter()
+        .filter(|(_, think)| think_ids.binary_search(think).is_ok())
+        .collect();
+    let team_rows: Vec<(u32, u8)> = npcs
+        .iter()
+        .filter(|(id, row)| is_spawnable_enemy(*id as u32, row.hp(), bosses))
+        .map(|(id, row)| (id as u32, row.team_type()))
+        .collect();
+    let teams = enemy_teams(&team_rows);
+    let pool: Vec<EnemyChoice> = npcs
+        .iter()
+        .filter(|(id, row)| {
+            is_spawnable_enemy(*id as u32, row.hp(), bosses)
+                && (!only_bosses || is_boss_row(*id as u32))
+                && teams.contains(&row.team_type())
+                && (whole_game || models.binary_search(&(*id as u32 / NPC_IDS_PER_MODEL)).is_ok())
+        })
+        .filter_map(|(id, _)| {
+            let npc_id = id as u32;
+            let candidates = ai_choices(npc_id, &think_ids, &placed, &models);
+            if candidates.is_empty() {
+                return None;
+            }
+            Some(EnemyChoice {
+                npc_id,
+                think_id: candidates[random_index(candidates.len())],
+            })
+        })
+        .collect();
+    if pool.is_empty() {
+        return Err("no enemies that can be spawned were found".to_string());
+    }
+    let picks: Vec<EnemyChoice> = (0..amount.max(1))
+        .map(|_| pool[random_index(pool.len())])
+        .collect();
+    let ids: Vec<u32> = picks.iter().map(|pick| pick.npc_id).collect();
+    let mut slot = ENEMY_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let found = pool.len();
+    match slot.as_mut() {
+        Some(queue) => {
+            queue.remaining.extend(picks);
+            queue.pool = pool;
+            queue.replace_oldest = replace_oldest;
+            queue.limit = limit;
+            queue.replacements = 0;
+        }
+        None => {
+            *slot = Some(EnemyQueue {
+                creator,
+                routine,
+                remaining: picks,
+                pool,
+                replace_oldest,
+                limit,
+                full_frames: 0,
+                pause_frames: 0,
+                replacements: 0,
+                checks: Vec::new(),
+                in_flight: None,
+                started: 0,
+            });
+        }
+    }
+    Ok(format!("spawning enemies {ids:?}, picked from {found}"))
+}
+
+fn start_enemy_spawn(queue: &mut EnemyQueue, enemy: EnemyChoice) -> Result<(), String> {
+    let creator = queue.creator;
+    let distance = SPAWN_DISTANCE_METERS + (queue.started % SPAWN_DISTANCE_STEPS) as f32;
+    write_u32_checked(creator + CREATOR_CHR_ID, enemy.npc_id / NPC_IDS_PER_MODEL)?;
+    write_bytes_checked(creator + CREATOR_DISTANCE, &distance.to_ne_bytes())?;
+    write_bytes_checked(creator + CREATOR_HEIGHT, &SPAWN_HEIGHT_METERS.to_ne_bytes())?;
+    write_bytes_checked(creator + CREATOR_ANGLE, &0f32.to_ne_bytes())?;
+    write_u32_checked(creator + CREATOR_NPC_PARAM_ID, enemy.npc_id)?;
+    write_u32_checked(creator + CREATOR_THINK_ID, enemy.think_id)?;
+    let previous = read_usize_checked(creator + CREATOR_RESULT).unwrap_or(0);
+    let call: extern "C" fn(usize, u32) = unsafe { std::mem::transmute(queue.routine) };
+    call(creator, CREATE_NPC_COMMAND);
+    queue.started += 1;
+    queue.in_flight = Some(EnemyInFlight {
+        previous,
+        frames: 0,
+    });
+    Ok(())
+}
+
+pub fn poll_enemy_queue() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = ENEMY_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(queue) = slot.as_mut() else {
+            return;
+        };
+        // The world goes away before the load screen shows, and the creator needs it.
+        if load_screen_open() || unsafe { WorldChrMan::instance() }.is_err() {
+            slot.take();
+            return;
+        }
+        poll_spawn_checks(queue);
+        if let Some(flight) = queue.in_flight.as_mut() {
+            flight.frames += 1;
+            let chr = read_usize_checked(queue.creator + CREATOR_RESULT).unwrap_or(0);
+            if chr >= 0x10_000 && chr != flight.previous {
+                queue.checks.push(SpawnCheck {
+                    chr,
+                    frames: 0,
+                });
+                queue.in_flight = None;
+            } else if flight.frames >= SPAWN_WAIT_FRAMES {
+                queue.in_flight = None;
+                replace_failed_spawn(queue);
+            }
+            return;
+        }
+        if queue.pause_frames > 0 {
+            queue.pause_frames -= 1;
+            return;
+        }
+        let Some(enemy) = queue.remaining.pop() else {
+            if queue.checks.is_empty() {
+                slot.take();
+            }
+            return;
+        };
+        if spawned_chrs_full(queue.limit) {
+            if let Err(error) = free_spawn_slot(queue.replace_oldest, queue.full_frames) {
+                crate::log::log(format!("enemy spawns stopped: {error}"));
+                slot.take();
+                return;
+            }
+            queue.full_frames += 1;
+            queue.pause_frames = FULL_RECHECK_FRAMES;
+            queue.remaining.push(enemy);
+            return;
+        }
+        queue.full_frames = 0;
+        let mut ready = [0u8; 1];
+        if copy_readable(queue.creator + CREATOR_READY, &mut ready) != 1 || ready[0] == 0 {
+            queue.remaining.push(enemy);
+            return;
+        }
+        if let Err(error) = start_enemy_spawn(queue, enemy) {
+            crate::log::log(format!("spawn enemy: {} failed: {error}", enemy.npc_id));
+        }
+    }));
+}
+
 pub fn schemas_json() -> Value {
     json!([
         {
             "id": "adjust_souls",
             "name": "Adjust souls",
             "description": "Adds a signed amount to held souls. Negative values remove souls and the result is clamped at 0.",
-            "arguments": [{ "name": "delta", "type": "int", "default": -100, "min": -999999999, "max": 999999999 }]
+            "arguments": [
+                { "name": "delta", "type": "int", "default": -100, "min": -999999999, "max": 999999999 },
+                { "name": "scaleWithLevel", "type": "bool", "default": 0, "min": 0, "max": 1, "label": "Scale with level", "hint": "Grows with the cost of your next level. The amount is what you lose at level 10, so -100 takes about 1800 souls at level 50 and 7400 at level 100." }
+            ]
         },
         {
             "id": "use_selected_item",
@@ -1705,6 +3411,12 @@ pub fn schemas_json() -> Value {
             "arguments": [{ "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 }]
         },
         {
+            "id": "invincible",
+            "name": "Invincible",
+            "description": "The player takes no hit damage for the chosen number of seconds. A second use keeps the longer remaining time.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 }]
+        },
+        {
             "id": "random_weapon",
             "name": "Random Weapon",
             "description": "Gives you a random weapon and equips it in right hand slot 1.",
@@ -1721,8 +3433,63 @@ pub fn schemas_json() -> Value {
             "name": "Random Armor",
             "description": "Gives you a random piece for each armor slot and equips all four.",
             "arguments": [
+                { "name": "armorStyle", "type": "choice", "label": "Armor style", "hint": "Matching set picks one armor set. If it has no piece for a slot, that slot stays as it is.", "options": ["Random pieces", "Matching set", "Either at random"], "default": 0, "min": 0, "max": 2 },
                 { "name": "removeOld", "type": "bool", "label": "Remove previous armor", "hint": "Permanently deletes the armor you were wearing. Empty slots are skipped.", "default": 1, "min": 0, "max": 1 },
                 { "name": "includeMissingDlc", "type": "bool", "label": "Include armor from DLC you do not have (experimental)", "hint": "Weapons from a missing DLC worked in a short test, but armor has not been tried.", "default": 0, "min": 0, "max": 1 }
+            ]
+        },
+        {
+            "id": "temporary_armor",
+            "name": "Temporary Armor",
+            "description": "Swaps all armor slots for a random outfit, then puts your own armor back when the time is up.",
+            "arguments": [
+                { "name": "seconds", "type": "int", "default": 60, "min": 1, "max": 600 },
+                { "name": "armorStyle", "type": "choice", "label": "Armor style", "hint": "Matching set picks one armor set. If it has no piece for a slot, that slot stays as it is.", "options": ["Random pieces", "Matching set", "Either at random"], "default": 0, "min": 0, "max": 2 },
+                { "name": "includeMissingDlc", "type": "bool", "label": "Include armor from DLC you do not have (experimental)", "hint": "Weapons from a missing DLC worked in a short test, but armor has not been tried.", "default": 0, "min": 0, "max": 1 }
+            ]
+        },
+        {
+            "id": "bombardier",
+            "name": "Bombardier",
+            "description": "Takes away all your weapons, dresses you in the Mirrah Chain Set and gives you endless Black Firebombs in a free quick slot, then puts everything back when the time is up.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 60, "min": 5, "max": 600 }]
+        },
+        {
+            "id": "shuffle_stats",
+            "name": "Shuffle Stats",
+            "description": "Randomly swaps your nine stats with each other, so your level stays the same.",
+            "arguments": [
+                { "name": "seconds", "type": "int", "label": "Seconds", "hint": "How long until your real stats come back. 0 keeps the shuffle, and it saves to your character.", "default": 0, "min": 0, "max": 600 }
+            ]
+        },
+        {
+            "id": "oversaturate",
+            "name": "Oversaturate",
+            "description": "Pushes the colours far past normal for the chosen number of seconds, for a badly over-edited look.",
+            "arguments": [
+                { "name": "seconds", "type": "int", "default": 15, "min": 1, "max": 300 },
+                { "name": "percent", "type": "int", "default": 2000, "min": 100, "max": 2000 }
+            ]
+        },
+        {
+            "id": "blind",
+            "name": "Blind",
+            "description": "Fades the screen to black, holds it for the chosen number of seconds, then fades back in.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 5, "min": 1, "max": 60 }]
+        },
+        {
+            "id": "freeze",
+            "name": "Freeze",
+            "description": "Freezes the player in place for the chosen number of seconds. The camera still moves.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 5, "min": 1, "max": 60 }]
+        },
+        {
+            "id": "invert_controls",
+            "name": "Invert Controls",
+            "description": "Inverts the controller sticks for the chosen number of seconds. Controller only.",
+            "arguments": [
+                { "name": "seconds", "type": "int", "default": 15, "min": 1, "max": 300 },
+                { "name": "camera", "type": "bool", "label": "Invert camera too", "hint": "Also flips the right stick. Off means only movement is inverted.", "default": 1, "min": 0, "max": 1 }
             ]
         },
         {
@@ -1738,10 +3505,17 @@ pub fn schemas_json() -> Value {
             "arguments": []
         },
         {
-            "id": "spawn_npc_invader",
-            "name": "Spawn NPC invader",
-            "description": "Reserved. A working invader spawn needs the game's character spawn routine, which is not called in this version.",
-            "arguments": [{ "name": "npcParamIds", "type": "string", "defaultText": "" }]
+            "id": "spawn_random_enemy",
+            "name": "Spawn Random Enemy",
+            "description": "Spawns random enemies near you, from the current map unless Whole game is on.",
+            "arguments": [
+                { "name": "amount", "type": "int", "default": 1, "min": 1, "max": 10 },
+                { "name": "limit", "type": "int", "label": "Enemy limit", "hint": "How many spawned enemies can be active at once. The game itself stops at 16.", "default": 5, "min": 1, "max": 16 },
+                { "name": "wholeGame", "type": "bool", "label": "Whole game (experimental)", "hint": "Picks from every area and gives enemies from elsewhere a random local AI. They may act oddly.", "default": 0, "min": 0, "max": 1 },
+                { "name": "bosses", "type": "bool", "label": "Include bosses", "hint": "Bosses can spawn too. Many rely on map events, so some may act oddly.", "default": 1, "min": 0, "max": 1 },
+                { "name": "onlyBosses", "type": "bool", "label": "Only bosses", "hint": "Spawns nothing but bosses. Without Whole game, only bosses from the current map can appear.", "default": 0, "min": 0, "max": 1 },
+                { "name": "replaceOldest", "type": "bool", "label": "Replace oldest at limit", "hint": "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot.", "default": 1, "min": 0, "max": 1 }
+            ]
         },
         {
             "id": "dump_player_data",
@@ -2042,12 +3816,23 @@ fn format_values(track: &Track) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_soul_delta, armor_available, classify_slot, combined_speed, is_real_armor, health_at_percent, is_base_weapon_id,
+        apply_soul_delta, bombs_to_remove, can_restore_stats, is_estus, next_level_cost, pick_bomb_slot,
+        shuffled_stats,
+        ArmorSwap, Bombardier, PendingRestores, RemovedWeapon, ShuffledStats, TemporaryArmor, soul_delta_for_level, armor_available, armor_sets, can_restore_armor, classify_slot, ArmorStyle, combined_speed, is_real_armor, health_at_percent, is_base_weapon_id,
         is_empty_item, is_listed_armor, is_movement_animation, is_removable_weapon, pick_infusion,
         pick_level,
-        usable_two_handed, weapon_available,
-        weapon_infusion, weapon_level, WeaponTrait,
+        ai_choices, enemy_teams, has_fight_logic, is_spawnable_enemy, most_common_team, spawn_state,
+        SpawnState, model_from_chr_name, think_candidates, usable_two_handed, wait_reason, weapon_available,
+        weapon_infusion, weapon_level, WeaponTrait, with_no_damage_bit,
     };
+
+    #[test]
+    fn no_damage_bit_leaves_the_other_flags_alone() {
+        assert_eq!(with_no_damage_bit(0, true), 0x02);
+        assert_eq!(with_no_damage_bit(0x05, true), 0x07);
+        assert_eq!(with_no_damage_bit(0x07, false), 0x05);
+        assert_eq!(with_no_damage_bit(0xFF, false), 0xFD);
+    }
 
     #[test]
     fn dlc_weapons_need_their_dlc() {
@@ -2069,6 +3854,118 @@ mod tests {
         assert!(armor_available(vilhelm_helm, true, false));
         assert!(!armor_available(ringed_knight_hood, true, false));
         assert!(armor_available(ringed_knight_hood, false, true));
+    }
+
+    #[test]
+    fn armor_groups_into_sets_and_skips_lone_pieces() {
+        let pools = [
+            vec![20_000_000, 83_500_000],
+            vec![20_001_000, 64_501_000],
+            vec![20_002_000, 64_502_000],
+            vec![20_003_000, 64_503_000],
+        ];
+        let sets = armor_sets(&pools);
+        assert_eq!(sets.len(), 2);
+        assert!(sets.contains(&[
+            Some(20_000_000),
+            Some(20_001_000),
+            Some(20_002_000),
+            Some(20_003_000),
+        ]));
+        assert!(sets.contains(&[None, Some(64_501_000), Some(64_502_000), Some(64_503_000)]));
+    }
+
+    #[test]
+    fn armor_style_decides_when_a_set_is_used() {
+        assert!(!ArmorStyle::from_index(0).uses_set(1));
+        assert!(ArmorStyle::from_index(1).uses_set(0));
+        assert!(!ArmorStyle::from_index(2).uses_set(0));
+        assert!(ArmorStyle::from_index(2).uses_set(1));
+    }
+
+    #[test]
+    fn armor_only_goes_back_when_it_is_safe() {
+        assert!(can_restore_armor(false, true, true, false));
+        assert!(!can_restore_armor(true, true, true, false));
+        assert!(!can_restore_armor(false, false, true, false));
+        assert!(!can_restore_armor(false, true, false, false));
+        assert!(!can_restore_armor(false, true, true, true));
+    }
+
+    #[test]
+    fn effects_wait_for_a_safe_moment() {
+        assert_eq!(wait_reason(false, true, true, false), None);
+        assert!(wait_reason(true, true, true, false).is_some());
+        assert!(wait_reason(false, false, true, false).is_some());
+        assert!(wait_reason(false, true, false, false).is_some());
+        assert!(wait_reason(false, true, true, true).is_some());
+    }
+
+    #[test]
+    fn chr_names_give_their_model() {
+        assert_eq!(model_from_chr_name("c1100_00"), Some(1100));
+        assert_eq!(model_from_chr_name("c1100"), Some(1100));
+        assert_eq!(model_from_chr_name("c0000_00"), None);
+        assert_eq!(model_from_chr_name("m1100"), None);
+        assert_eq!(model_from_chr_name(""), None);
+    }
+
+    #[test]
+    fn only_real_non_boss_enemies_can_spawn() {
+        assert!(is_spawnable_enemy(110_000, 300, false));
+        assert!(!is_spawnable_enemy(27_700, 300, true));
+        assert!(!is_spawnable_enemy(110_000, 0, true));
+        assert!(!is_spawnable_enemy(110_000, 1, true));
+        assert!(!is_spawnable_enemy(890_230, 300, true));
+        assert!(!is_spawnable_enemy(110_000, 20_000, false));
+        assert!(!is_spawnable_enemy(528_000, 300, false));
+        assert!(is_spawnable_enemy(528_000, 20_000, true));
+    }
+
+    #[test]
+    fn generic_ai_rows_do_not_count_as_fighters() {
+        assert!(has_fight_logic(10_000, 224_000));
+        assert!(!has_fight_logic(10_000, 11_000));
+        assert!(!has_fight_logic(0, 224_000));
+        assert!(!has_fight_logic(10_000, 0));
+    }
+
+    #[test]
+    fn spawns_without_a_model_count_as_frozen() {
+        assert_eq!(spawn_state(false, 0), SpawnState::Gone);
+        assert_eq!(spawn_state(true, 0), SpawnState::Frozen);
+        assert_eq!(spawn_state(true, 0x7FF4_9F0A_6F00), SpawnState::Fine);
+    }
+
+    #[test]
+    fn boss_teams_count_as_enemy_teams() {
+        let rows = [(110_000, 6), (120_000, 6), (620_000, 24), (528_000, 7)];
+        assert_eq!(enemy_teams(&rows), vec![6, 7]);
+    }
+
+    #[test]
+    fn the_enemy_team_is_the_most_common_one() {
+        assert_eq!(most_common_team([6, 6, 24].into_iter()), Some(6));
+        assert_eq!(most_common_team(std::iter::empty()), None);
+    }
+
+    #[test]
+    fn enemies_use_what_placed_enemies_really_run() {
+        let rows = [110_000, 110_054, 120_000, 130_000];
+        let placed = [(1100, 110_054), (1200, 120_000)];
+        let models = [1100, 1200, 1300];
+        assert_eq!(ai_choices(110_070, &rows, &placed, &models), vec![110_054]);
+        assert_eq!(ai_choices(130_000, &rows, &placed, &models), vec![130_000]);
+        assert_eq!(ai_choices(140_000, &rows, &placed, &models), vec![110_054, 120_000]);
+        assert_eq!(ai_choices(140_000, &rows, &[], &models), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn enemies_prefer_their_own_ai_row_then_their_model() {
+        let rows = [110_000, 110_010, 120_000];
+        assert_eq!(think_candidates(110_010, &rows), vec![110_010]);
+        assert_eq!(think_candidates(110_055, &rows), vec![110_000, 110_010]);
+        assert_eq!(think_candidates(130_000, &rows), Vec::<u32>::new());
     }
 
     #[test]
@@ -2094,6 +3991,95 @@ mod tests {
         assert_eq!(weapon_infusion(16_000_805), 8);
         assert_eq!(weapon_level(16_000_805), 5);
         assert_eq!(weapon_infusion(3_000_000), 0);
+    }
+
+    #[test]
+    fn pending_restores_survive_a_restart() {
+        let saved = PendingRestores {
+            armor: Some(TemporaryArmor {
+                until: 100,
+                character: "Ash".to_string(),
+                swaps: vec![ArmorSwap { slot: 12, old_index: 4, old_id: 5, owned_before: 6, piece: 7 }],
+            }),
+            bombardier: Some(Bombardier {
+                until: 200,
+                character: "Ash".to_string(),
+                weapons: vec![RemovedWeapon { slot: 1, index: 2, weapon: 3_000_000 }],
+                armor: vec![ArmorSwap { slot: 13, old_index: 8, old_id: 9, owned_before: 0, piece: 79_001_000 }],
+                bombs_before: 8,
+                quick_slot: 2,
+                quick_item: 0x4000_0097,
+                quick_index: 0x8B,
+                selected_before: 1,
+                selection_settled: true,
+                weapons_changed: false,
+            }),
+            stats: Some(ShuffledStats {
+                until: 300,
+                character: "Ash".to_string(),
+                original: [12, 10, 11, 15, 13, 12, 9, 9, 7],
+            }),
+        };
+
+        let text = serde_json::to_string(&saved).unwrap();
+        let loaded: PendingRestores = serde_json::from_str(&text).unwrap();
+
+        assert!(!loaded.is_empty());
+        let armor = loaded.armor.unwrap();
+        assert_eq!((armor.until, armor.swaps[0].piece), (100, 7));
+        let bombardier = loaded.bombardier.unwrap();
+        assert_eq!((bombardier.weapons[0].weapon, bombardier.quick_item), (3_000_000, 0x4000_0097));
+        assert_eq!(bombardier.armor[0].piece, 79_001_000);
+        assert_eq!(loaded.stats.unwrap().original[3], 15);
+        assert!(PendingRestores::default().is_empty());
+    }
+
+    #[test]
+    fn a_bombardier_saved_before_the_armor_still_loads() {
+        let text = r#"{"bombardier":{"until":1,"character":"Ash","weapons":[],"bombs_before":0,
+            "bomb_cap_before":10,"quick_slot":2,"quick_item":-1,"quick_index":-1,"selected_before":0}}"#;
+        let loaded: PendingRestores = serde_json::from_str(text).unwrap();
+        assert!(loaded.bombardier.unwrap().armor.is_empty());
+    }
+
+    #[test]
+    fn stats_are_only_restored_if_the_total_is_unchanged() {
+        let original = [12, 10, 11, 15, 13, 12, 9, 9, 7];
+        assert!(can_restore_stats([7, 10, 11, 15, 13, 12, 9, 9, 12], original));
+        assert!(!can_restore_stats([8, 10, 11, 15, 13, 12, 9, 9, 12], original));
+    }
+
+    #[test]
+    fn bombs_go_into_a_free_slot_and_never_over_estus() {
+        const ESTUS: i32 = 0x4000_00BF;
+        const ASHEN: i32 = 0x4000_00C9;
+        const OTHER: i32 = 0x4000_0097;
+        const BOMBS: i32 = 0x4000_0129;
+        const EMPTY: i32 = -1;
+        assert!(is_estus(ESTUS) && is_estus(ASHEN) && !is_estus(OTHER) && !is_estus(EMPTY));
+        assert_eq!(pick_bomb_slot(&[ESTUS, OTHER, EMPTY, EMPTY]), Some(2));
+        assert_eq!(pick_bomb_slot(&[ESTUS, ASHEN, OTHER]), Some(2));
+        assert_eq!(pick_bomb_slot(&[ESTUS, EMPTY, BOMBS]), Some(2));
+        assert_eq!(pick_bomb_slot(&[ESTUS, ASHEN]), None);
+    }
+
+    #[test]
+    fn bombs_the_player_already_owned_are_kept() {
+        assert_eq!(bombs_to_remove(100, 0), 100);
+        assert_eq!(bombs_to_remove(100, 8), 92);
+        assert_eq!(bombs_to_remove(3, 8), 0);
+    }
+
+    #[test]
+    fn shuffling_keeps_every_stat_value() {
+        let stats = [12, 10, 11, 15, 13, 12, 9, 9, 7];
+        let mut rolls = [3usize, 1, 0, 5, 2, 4, 1, 0].into_iter().cycle();
+        let mut shuffled = shuffled_stats(stats, |length| rolls.next().unwrap() % length);
+        assert_ne!(shuffled, stats);
+        shuffled.sort_unstable();
+        let mut sorted = stats;
+        sorted.sort_unstable();
+        assert_eq!(shuffled, sorted);
     }
 
     #[test]
@@ -2159,6 +4145,15 @@ mod tests {
         assert_eq!(40i32.saturating_add(apply_soul_delta(40, -100)), 0);
         assert_eq!(apply_soul_delta(500, -100), -100);
         assert_eq!(apply_soul_delta(0, -1), 0);
+        assert_eq!(next_level_cost(1).round(), 673.0);
+        assert_eq!(next_level_cost(11).round(), 847.0);
+        assert_eq!(next_level_cost(12).round(), 1039.0);
+        assert_eq!(soul_delta_for_level(-100, 10), -100);
+        assert_eq!(soul_delta_for_level(-100, 1), -81);
+        assert_eq!(soul_delta_for_level(-100, 50), -1822);
+        assert_eq!(soul_delta_for_level(-100, 100), -7429);
+        assert_eq!(soul_delta_for_level(100, 0), 81);
+        assert_eq!(soul_delta_for_level(-999_999_999, 802), i32::MIN);
     }
 
     #[test]

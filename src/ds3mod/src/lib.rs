@@ -50,7 +50,6 @@ pub extern "system" fn DllMain(_module: *mut std::ffi::c_void, reason: u32, _: *
 unsafe extern "system" fn worker_thread(_: *mut std::ffi::c_void) -> u32 {
     Sleep(300);
     log::init();
-    log::log("ds3mod worker started");
     if let Err(error) = std::panic::catch_unwind(run) {
         log::log(format!("worker panicked: {error:?}"));
     }
@@ -59,6 +58,7 @@ unsafe extern "system" fn worker_thread(_: *mut std::ffi::c_void) -> u32 {
 
 fn run() {
     game::prepare();
+    game::load_pending_restores();
     input::prepare();
     if !game::snapshot().exe_match && !exe_name_only() {
         log::log("refusing to run outside DarkSoulsIII.exe");
@@ -85,7 +85,6 @@ fn run() {
 
     match SprjTaskImp::wait_for_instance(Duration::from_secs(120)) {
         Ok(tasks) => {
-            log::log("registering the game-thread task");
             let handle = tasks.run_recurring(
                 |_data: &usize| {
                     on_frame();
@@ -112,6 +111,7 @@ fn run() {
                     input::sample_current(input::Phase::ChrInsPreBehavior);
                     game::poll_stamina_lock();
                     game::poll_speed_changes();
+                    game::poll_freeze();
                 },
                 SprjTaskGroupIndex::ChrIns_PreBehavior,
             );
@@ -119,6 +119,7 @@ fn run() {
             let handle = tasks.run_recurring(
                 |_data: &usize| {
                     game::poll_speed_changes();
+                    game::poll_freeze();
                 },
                 SprjTaskGroupIndex::ChrIns_BehaviorSafe,
             );
@@ -126,8 +127,16 @@ fn run() {
             let handle = tasks.run_recurring(
                 |_data: &usize| {
                     game::poll_speed_changes();
+                    game::poll_freeze();
                 },
                 SprjTaskGroupIndex::ChrIns_PrePhysicsSafe,
+            );
+            std::mem::forget(handle);
+            let handle = tasks.run_recurring(
+                |_data: &usize| {
+                    game::poll_oversaturation();
+                },
+                SprjTaskGroupIndex::DrawBegin,
             );
             std::mem::forget(handle);
         }
@@ -146,21 +155,28 @@ fn run() {
 fn on_frame() {
     input::frame_begin();
     game::poll_fake_death();
+    game::poll_blind();
+    game::poll_enemy_queue();
+    game::poll_temporary_armor();
+    game::poll_bombardier();
+    game::poll_shuffled_stats();
     game::poll_one_hit_run();
+    game::poll_invincibility();
     game::poll_speed_changes();
+    game::poll_freeze();
     game::poll_stamina_lock();
     game::poll_button_watch();
-    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static HELLO_CONNECTION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let Some(outbound) = OUTBOUND.get() else {
         return;
     };
-    if !STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+    let connection = ipc::connection_count();
+    if HELLO_CONNECTION.swap(connection, std::sync::atomic::Ordering::Relaxed) != connection {
         let _ = outbound.send(ipc::hello_line());
     }
     let frame = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if frame % 30 == 0 {
-        let _ = outbound.send(ipc::hello_line());
         let _ = outbound.send(ipc::state_line());
     }
     let Some(commands) = COMMANDS.get() else {
