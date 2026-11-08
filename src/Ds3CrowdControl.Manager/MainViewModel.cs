@@ -562,6 +562,38 @@ public partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private void SaveSupportLogs()
+    {
+        try
+        {
+            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            var path = SupportBundle.Create(AppPaths.Root, desktop, SupportSummary(), SupportBundle.DefaultCrashDumpFolder, DateTime.Now);
+            AddLog($"logs saved to {path}");
+            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true });
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+        {
+            AddLog($"could not save the logs: {exception.Message}");
+        }
+    }
+
+    private string SupportSummary()
+    {
+        static string Stamp(string file) =>
+            File.Exists(file) ? File.GetLastWriteTime(file).ToString("yyyy-MM-dd HH:mm") : "missing";
+        var manager = Environment.ProcessPath ?? "";
+        return string.Join(Environment.NewLine,
+            $"saved: {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+            $"windows: {Environment.OSVersion.VersionString}",
+            $".net: {Environment.Version}",
+            $"manager build: {Stamp(manager)}",
+            $"mod build: {Stamp(DllPath)}",
+            $"game: {Status}",
+            $"twitch: {TwitchStatus}",
+            $"effects paused: {EffectsPaused}, gap {GapSeconds} s, waiting limit {WaitingLimit}");
+    }
+
+    [RelayCommand]
     private void ClearQueue()
     {
         var cleared = _queue.Clear();
@@ -865,7 +897,7 @@ public partial class MainViewModel : ObservableObject
                 "Ds3CrowdControl",
                 "manager.log");
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            File.AppendAllText(path, $"{DateTime.Now:HH:mm:ss}  {message}{Environment.NewLine}");
+            File.AppendAllText(path, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {message}{Environment.NewLine}");
         }
         catch (IOException)
         {

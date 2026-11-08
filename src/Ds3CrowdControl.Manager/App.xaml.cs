@@ -12,10 +12,28 @@ public partial class App : Application
             "Ds3CrowdControl",
             "manager.log");
         Directory.CreateDirectory(Path.GetDirectoryName(log)!);
+        void Record(string kind, object error)
+        {
+            try
+            {
+                File.AppendAllText(log, $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  {kind}: {error}{Environment.NewLine}");
+            }
+            catch (IOException)
+            {
+            }
+        }
+
         DispatcherUnhandledException += (_, args) =>
         {
-            File.AppendAllText(log, args.Exception + Environment.NewLine);
+            Record("unexpected error", args.Exception);
             args.Handled = true;
+        };
+        // Background work, such as Twitch, fails on other threads where nothing else would see it.
+        AppDomain.CurrentDomain.UnhandledException += (_, args) => Record("crash", args.ExceptionObject);
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            Record("background error", args.Exception);
+            args.SetObserved();
         };
         base.OnStartup(e);
         try
@@ -25,7 +43,7 @@ public partial class App : Application
         }
         catch (Exception exception)
         {
-            File.WriteAllText(log, exception.ToString());
+            Record("could not start", exception);
             Shutdown(1);
         }
     }

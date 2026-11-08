@@ -146,7 +146,9 @@ public sealed class TwitchApi(HttpClient http, Uri apiUrl, string clientId, Twit
 
         if ((int)status is < 200 or >= 300)
         {
-            throw new TwitchException(TwitchAuth.ErrorMessage(text), status);
+            // The endpoint and status make a log line useful on its own.
+            var endpoint = path.Split('?')[0];
+            throw new TwitchException($"{TwitchAuth.ErrorMessage(text)} ({method} {endpoint}, {(int)status})", status);
         }
 
         return text;

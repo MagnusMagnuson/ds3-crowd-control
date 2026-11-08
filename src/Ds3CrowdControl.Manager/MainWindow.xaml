@@ -64,6 +64,10 @@
                         <TextBox Text="{Binding WaitingLimit, UpdateSourceTrigger=PropertyChanged}" Width="100" HorizontalAlignment="Left" Margin="0,4,0,0" />
                         <TextBlock Text="Redeems past this many waiting are refunded. 0 means no limit." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
 
+                        <TextBlock Text="Help" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <Button Content="Save logs for support" Command="{Binding SaveSupportLogsCommand}" Padding="12,6" HorizontalAlignment="Left" />
+                        <TextBlock Text="Saves a zip to your Desktop with everything needed to look into a problem. It never contains your Twitch sign-in." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
+
                         <CheckBox Content="Show developer tools" IsChecked="{Binding ShowDevTools}"
                                   ToolTip="Adds Dump player data and Watch item button to the Presets page." />
                         <CheckBox Content="Focus game for item test" IsChecked="{Binding FocusGameForItemTest}" Margin="0,8,0,0"

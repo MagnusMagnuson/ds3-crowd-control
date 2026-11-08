@@ -39,6 +39,10 @@ The Twitch CLI can fake events on this PC, so Bits, gift subs and redeems can be
 
 A redeem finds its event by `--item-name`, which must match the preset name. The manager logs whether it would be completed or refunded.
 
+## Reporting a problem
+
+Press **Save logs for support** on the General page. It saves `ds3-crowd-control-logs-<date>.zip` to the Desktop and opens the folder. The zip holds the manager and mod logs (the last 5 MB of each), the presets and settings, any temporary swap waiting to be undone, and the newest Dark Souls III crash dump from the last 7 days if one exists and is under 400 MB. It never holds the Twitch sign-in or the session secret.
+
 ## Crashes and quitting
 
 Temporary Armor, Bombardier and a timed Shuffle Stats keep what they must put back in `%AppData%\Ds3CrowdControl\pending-restores.json`. After a crash or a quit, attach the mod and load that character. The swap carries on if its time has not run out, and ends as soon as the character is in the world if it has. A stat shuffle is skipped if the stat total changed, so levels are never lost.
