@@ -6,6 +6,8 @@ It has two parts: a Windows manager app where you set everything up, and `ds3mod
 
 Written with AI: the code was written by Claude (Anthropic) working with the author, with some earlier work by Grok (xAI).
 
+> **Not yet tested on a real Affiliate or Partner channel.** The Twitch part has only been tested with the [Twitch CLI](https://dev.twitch.tv/docs/cli/)'s fake events, because creating channel point redeems needs an Affiliate or Partner channel. If you use it on one, please [report any problems](https://github.com/MagnusMagnuson/ds3-crowd-control/issues) you run into.
+
 ## Setup
 
 You need 64-bit Windows 10 or 11 and the Steam version of [Dark Souls III](https://store.steampowered.com/app/374320/DARK_SOULS_III/), updated to 1.15.2. Nothing else has to be installed: the download includes everything it needs, including .NET.
@@ -79,6 +81,8 @@ The log and the queue stay at the bottom of every page. The queue shows who trig
 
 Channel points, Bits and gift subs need an Affiliate or Partner channel, signed in as the broadcaster. Press **Connect Twitch** and approve the code in the browser, then turn triggers on in the Events page.
 
+This has not been tested on a real Affiliate or Partner channel yet, only with the Twitch CLI's fake events (see below). Creating, changing and hiding redeems and refunding them are the parts most likely to need a fix, so please [report any problems](https://github.com/MagnusMagnuson/ds3-crowd-control/issues).
+
 - **Redeem:** the manager creates its own channel point redeems on the channel, using the event name and the cost and cooldown from the Events page. The cooldown only limits redeems: Bits, gift subs and Test always run, since Twitch cannot refund Bits or gift subs. Twitch does not allow two redeems with the same name, so if another tool already has one called Blind or Freeze, set a **Redeem name prefix** on the General page, such as `DS3: `. It goes in front of every redeem name, and changing it renames the redeems already made. Turning one off hides it on Twitch and never deletes it, so a custom icon stays. Redeems that fail are refunded, and so are redeems past the waiting limit. All redeems are hidden while the manager is closed.
 - **Bits:** a cheer of exactly the set amount runs the event. Power-ups count too.
 - **Gift subs:** a gift of exactly the set number of subs runs the event, at any tier.
@@ -118,6 +122,10 @@ The mod saves your equipped weapons and armor every 5 minutes, taking turns betw
 Press **Save logs for support** at the bottom of the General page. It saves `ds3-crowd-control-logs-<date>.zip` to the Desktop and opens the folder, ready to send. It holds the logs and your events and settings, with your Windows user name and PC name taken out, since many people use their real name for them. It never holds your Twitch sign-in. If the game crashed, tick **Include the game's crash dump** first to add the newest Dark Souls III crash dump from the last week. A crash dump is a copy of the game's memory and can contain your Windows user name and things like your Steam account name, so it is left out unless you tick it.
 
 Temporary Armor, Bombardier and a timed Shuffle Stats survive a crash or a quit. Attach the mod again and load the same character, and your own gear or stats come back. A stat shuffle is not undone if you levelled up in the meantime, so no levels are lost.
+
+### Reporting a problem
+
+Open an issue on the [Issues page](https://github.com/MagnusMagnuson/ds3-crowd-control/issues) and say what you did, what you expected and what happened instead. Attach the zip from **Save logs for support**. You need a free GitHub account to open an issue.
 
 ## Credits
 
