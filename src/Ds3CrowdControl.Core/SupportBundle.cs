@@ -5,7 +5,8 @@ namespace Ds3CrowdControl.Core;
 
 /// <summary>
 /// Collects the logs and settings needed to look into a problem into one zip that is easy
-/// to send. The Twitch sign-in and the session secret are never included.
+/// to send. The Twitch sign-in and the session secret are never included, and the Windows
+/// user folder, user name and PC name are replaced, since many people use their real name.
 /// </summary>
 public static class SupportBundle
 {
@@ -26,12 +27,17 @@ public static class SupportBundle
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "CrashDumps");
 
-    /// <summary>Writes the zip into <paramref name="destination"/> and returns its path.</summary>
-    public static string Create(string appFolder, string destination, string summary, string? crashDumpFolder, DateTime now)
+    /// <summary>
+    /// Writes the zip into <paramref name="destination"/> and returns its path. A null
+    /// <paramref name="crashDumpFolder"/> leaves the game crash dump out: it is a copy of the
+    /// game's memory, which can hold the Windows user name and things like the Steam account
+    /// name, and cannot be cleaned like the text files, so it goes in only when the player asks.
+    /// </summary>
+    public static string Create(string appFolder, string destination, string summary, string? crashDumpFolder, DateTime now, Anonymizer anonymizer)
     {
         Directory.CreateDirectory(destination);
         var path = Path.Combine(destination, $"ds3-crowd-control-logs-{now:yyyyMMdd-HHmmss}.zip");
-        var notes = new StringBuilder(summary.TrimEnd()).AppendLine().AppendLine();
+        var notes = new StringBuilder(anonymizer.Clean(summary.TrimEnd())).AppendLine().AppendLine();
         using (var zip = ZipFile.Open(path, ZipArchiveMode.Create))
         {
             foreach (var name in Logs)
@@ -44,7 +50,7 @@ public static class SupportBundle
                 }
 
                 var (bytes, cut) = ReadTail(file, LogTailBytes);
-                AddBytes(zip, name, bytes);
+                AddBytes(zip, name, anonymizer.Clean(bytes));
                 notes.AppendLine(cut ? $"{name}: last {LogTailBytes / 1024 / 1024} MB of a longer log" : $"{name}: complete");
             }
 
@@ -53,7 +59,7 @@ public static class SupportBundle
                 var file = Path.Combine(appFolder, name);
                 if (File.Exists(file))
                 {
-                    AddBytes(zip, name, ReadShared(file));
+                    AddBytes(zip, name, anonymizer.Clean(ReadShared(file)));
                 }
             }
 
@@ -66,7 +72,13 @@ public static class SupportBundle
 
     private static void AddCrashDump(ZipArchive zip, string? folder, DateTime now, StringBuilder notes)
     {
-        if (folder is null || !Directory.Exists(folder))
+        if (folder is null)
+        {
+            notes.AppendLine("game crash dump: not included");
+            return;
+        }
+
+        if (!Directory.Exists(folder))
         {
             notes.AppendLine("game crash dump: none found");
             return;

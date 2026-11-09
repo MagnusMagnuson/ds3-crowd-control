@@ -52,7 +52,11 @@
 
                         <TextBlock Text="Twitch" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
                         <TextBlock Text="{Binding TwitchStatus}" Margin="0,0,0,8" Foreground="#F3F3F3" />
-                        <Button Content="{Binding TwitchButtonText}" Command="{Binding ToggleTwitchCommand}" Padding="12,6" HorizontalAlignment="Left" Margin="0,0,0,16" />
+                        <Button Content="{Binding TwitchButtonText}" Command="{Binding ToggleTwitchCommand}" Padding="12,6" HorizontalAlignment="Left" Margin="0,0,0,12" />
+                        <TextBlock Text="Redeem name prefix" Foreground="#F3F3F3" />
+                        <TextBox Text="{Binding RewardPrefix, UpdateSourceTrigger=PropertyChanged}" Width="200" HorizontalAlignment="Left" Margin="0,4,0,0" />
+                        <TextBlock Text="{Binding RewardPrefixExample}" Opacity="0.75" Margin="0,4,0,0" Foreground="#F3F3F3" />
+                        <TextBlock Text="Goes in front of every redeem name, for example &quot;DS3: &quot;. Twitch does not allow two redeems with the same name, so use this if another tool already has a redeem called Blind or Freeze. Changing it renames the redeems already made. Twitch names are cut at 45 characters." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
 
                         <TextBlock Text="Effects" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
                         <CheckBox Content="Pause all effects" IsChecked="{Binding EffectsPaused}" />
@@ -83,7 +87,9 @@
 
                         <TextBlock Text="Help" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
                         <Button Content="Save logs for support" Command="{Binding SaveSupportLogsCommand}" Padding="12,6" HorizontalAlignment="Left" />
-                        <TextBlock Text="Saves a zip to your Desktop with everything needed to look into a problem. It never contains your Twitch sign-in." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
+                        <TextBlock Text="Saves a zip to your Desktop with the logs and settings needed to look into a problem. It never contains your Twitch sign-in, and your Windows user name and PC name are taken out." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,8" Foreground="#F3F3F3" />
+                        <CheckBox Content="Include the game's crash dump" IsChecked="{Binding IncludeCrashDump}" />
+                        <TextBlock Text="Only tick this if the game crashed. The dump is a copy of the game's memory from the last crash in the past 7 days, and can contain your Windows user name and things like your Steam account name." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
 
                         <CheckBox Content="Show developer tools" IsChecked="{Binding ShowDevTools}"
                                   ToolTip="Adds Dump player data and Watch item button to the Presets page." />

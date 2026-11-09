@@ -461,9 +461,68 @@ public class TwitchRedemptionTests
     [Fact]
     public void Long_preset_names_fit_the_title_limit()
     {
-        var title = TwitchTriggerSource.RewardTitle(new EffectPreset { Name = new string('x', 80) });
+        var title = TwitchTriggerSource.RewardTitle("", new string('x', 80));
 
         Assert.Equal(45, title.Length);
+    }
+
+    [Fact]
+    public void A_long_name_loses_its_end_but_keeps_the_prefix()
+    {
+        var title = TwitchTriggerSource.RewardTitle("DS3: ", new string('x', 80));
+
+        Assert.Equal(45, title.Length);
+        Assert.StartsWith("DS3: x", title);
+    }
+
+    [Fact]
+    public async Task The_prefix_goes_in_front_of_new_redeems()
+    {
+        _preset.TwitchRewardId = null;
+        _source.RewardPrefix = "DS3: ";
+
+        await _source.SyncRewardsAsync(default);
+
+        Assert.Equal("DS3: " + _preset.Name, _rewards.Created.Single().Title);
+    }
+
+    [Fact]
+    public async Task Changing_the_prefix_renames_the_redeem_already_made()
+    {
+        _rewards.Existing.Add(new TwitchReward("reward-1", _preset.Name, _preset.RedeemCost, true, _preset.CooldownSeconds));
+        _source.RewardPrefix = "DS3: ";
+
+        await _source.SyncRewardsAsync(default);
+
+        Assert.Empty(_rewards.Created);
+        Assert.Equal(("reward-1", "DS3: " + _preset.Name), (_rewards.Updated.Single().Id, _rewards.Updated.Single().Settings.Title));
+    }
+
+    [Fact]
+    public async Task A_name_taken_by_another_tool_points_to_the_prefix()
+    {
+        _preset.TwitchRewardId = null;
+        _rewards.CreateError = new TwitchException("CREATE_CUSTOM_REWARD_DUPLICATE_REWARD", HttpStatusCode.BadRequest);
+
+        await _source.SyncRewardsAsync(default);
+
+        Assert.Contains(_log, line => line.Contains("redeem name prefix"));
+    }
+
+    [Fact]
+    public async Task A_test_redeem_is_found_by_its_prefixed_title()
+    {
+        _source.TestMode = true;
+        _source.RewardPrefix = "DS3: ";
+        _preset.TwitchRewardId = null;
+        _source.RunEffect = (_, _, _) => Task.FromResult(new EffectResult("", EffectStatus.Success, "ok"));
+        var redemption = JsonDocument.Parse($$$"""
+            {"id":"redeem-1","user_name":"Viewer","status":"unfulfilled","reward":{"id":"cli","title":"DS3: {{{_preset.Name}}}"}}
+            """).RootElement;
+
+        await _source.HandleRedemptionAsync(redemption, default);
+
+        Assert.Equal(["cli/redeem-1=FULFILLED"], _rewards.Statuses);
     }
 
     private sealed class FakeRewards : ITwitchRewards

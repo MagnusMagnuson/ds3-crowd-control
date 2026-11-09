@@ -11,6 +11,7 @@ public sealed class ManagerSettings
     public bool ShowQueue { get; set; } = true;
     public bool ShowDevTools { get; set; }
     public bool SyncTriggers { get; set; }
+    public string RewardPrefix { get; set; } = "";
 }
 
 public static class ManagerSettingsStore

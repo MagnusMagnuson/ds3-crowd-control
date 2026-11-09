@@ -233,6 +233,7 @@ public partial class MainViewModel : ObservableObject
         _effectsPaused = _settings.EffectsPaused;
         _gapSeconds = _settings.GapSeconds;
         _waitingLimit = _settings.WaitingLimit;
+        _rewardPrefix = _settings.RewardPrefix ?? "";
         _showQueue = _settings.ShowQueue;
         _showDevTools = _settings.ShowDevTools;
         _syncTriggers = _settings.SyncTriggers;
@@ -257,7 +258,8 @@ public partial class MainViewModel : ObservableObject
         _twitchSource = new TwitchTriggerSource(_catalog, LogFromTwitch)
         {
             Paused = _effectsPaused,
-            WaitingLimit = _waitingLimit
+            WaitingLimit = _waitingLimit,
+            RewardPrefix = _rewardPrefix
         };
         _twitchSource.Start(_queue);
         _twitch = new TwitchConnection(
@@ -433,6 +435,33 @@ public partial class MainViewModel : ObservableObject
         _queue.MinGap = TimeSpan.FromSeconds(value);
         SaveSettings();
     }
+
+    [ObservableProperty]
+    private string _rewardPrefix = "";
+
+    partial void OnRewardPrefixChanged(string value)
+    {
+        var allowed = (value ?? "").TrimStart();
+        if (allowed.Length > TwitchTriggerSource.MaxRewardPrefixLength)
+        {
+            allowed = allowed[..TwitchTriggerSource.MaxRewardPrefixLength];
+        }
+
+        if (allowed != value)
+        {
+            RewardPrefix = allowed;
+            return;
+        }
+
+        _settings.RewardPrefix = value;
+        _twitchSource.RewardPrefix = value;
+        OnPropertyChanged(nameof(RewardPrefixExample));
+        SaveSettings();
+        _twitch.RequestSync();
+    }
+
+    public string RewardPrefixExample =>
+        $"On Twitch: \"{TwitchTriggerSource.RewardTitle(RewardPrefix, "Fake Death")}\"";
 
     partial void OnWaitingLimitChanged(int value)
     {
@@ -622,13 +651,18 @@ public partial class MainViewModel : ObservableObject
         AddLog($"Restore gear: {result.Message}");
     }
 
+    /// <summary>Off each time the manager starts, so a crash dump is only ever sent on purpose.</summary>
+    [ObservableProperty]
+    private bool _includeCrashDump;
+
     [RelayCommand]
     private void SaveSupportLogs()
     {
         try
         {
             var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-            var path = SupportBundle.Create(AppPaths.Root, desktop, SupportSummary(), SupportBundle.DefaultCrashDumpFolder, DateTime.Now);
+            var dumps = IncludeCrashDump ? SupportBundle.DefaultCrashDumpFolder : null;
+            var path = SupportBundle.Create(AppPaths.Root, desktop, SupportSummary(), dumps, DateTime.Now, Anonymizer.ForThisPc());
             AddLog($"logs saved to {path}");
             Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{path}\"") { UseShellExecute = true });
         }

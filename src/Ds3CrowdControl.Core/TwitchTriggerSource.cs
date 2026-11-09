@@ -45,8 +45,22 @@ public sealed class TwitchTriggerSource(Catalog catalog, Action<string> log) : I
 
     public void Stop() => RunEffect = null;
 
-    public static string RewardTitle(EffectPreset preset) =>
-        preset.Name.Length <= MaxRewardTitleLength ? preset.Name : preset.Name[..MaxRewardTitleLength];
+    public const int MaxRewardPrefixLength = 20;
+
+    /// <summary>
+    /// Put in front of every redeem name. Twitch refuses two redeems with the same name on one
+    /// channel, so this keeps ours apart from redeems another tool already made.
+    /// </summary>
+    public string RewardPrefix { get; set; } = "";
+
+    public string RewardTitle(EffectPreset preset) => RewardTitle(RewardPrefix, preset.Name);
+
+    /// <summary>Twitch allows 45 characters, so a long name loses its end, never the prefix.</summary>
+    public static string RewardTitle(string prefix, string name)
+    {
+        var title = prefix + name;
+        return title.Length <= MaxRewardTitleLength ? title : title[..MaxRewardTitleLength];
+    }
 
     public async Task HandleRedemptionAsync(JsonElement redemption, CancellationToken cancellationToken)
     {
@@ -261,5 +275,7 @@ public sealed class TwitchTriggerSource(Catalog catalog, Action<string> log) : I
     public static string Explain(TwitchException exception) =>
         exception.Status == HttpStatusCode.Forbidden
             ? $"{exception.Message} (channel points need an Affiliate or Partner channel)"
-            : exception.Message;
+            : exception.Message.Contains("DUPLICATE", StringComparison.OrdinalIgnoreCase)
+                ? $"{exception.Message} (another redeem on the channel already has this name; set a redeem name prefix on the General page)"
+                : exception.Message;
 }
