@@ -151,6 +151,52 @@ public sealed class TwitchAuth(HttpClient http, Uri idUrl, string clientId)
         return refreshed;
     }
 
+    /// <summary>
+    /// Asks Twitch to cancel the sign-in, so the app no longer counts as connected to the
+    /// channel. An access token runs out after a few hours and Twitch refuses to cancel an old
+    /// one, so in that case a fresh one is fetched first and cancelled instead.
+    /// </summary>
+    public async Task<bool> RevokeAsync(TwitchTokens tokens, CancellationToken cancellationToken)
+    {
+        if (await RevokeAccessTokenAsync(tokens.AccessToken, cancellationToken).ConfigureAwait(false))
+        {
+            return true;
+        }
+
+        if (string.IsNullOrEmpty(tokens.RefreshToken))
+        {
+            return false;
+        }
+
+        TwitchTokens fresh;
+        try
+        {
+            fresh = await RefreshAsync(tokens, cancellationToken).ConfigureAwait(false);
+        }
+        catch (TwitchException)
+        {
+            // The refresh token no longer works either, so nothing is left to cancel.
+            return true;
+        }
+
+        return await RevokeAccessTokenAsync(fresh.AccessToken, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<bool> RevokeAccessTokenAsync(string accessToken, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(accessToken))
+        {
+            return false;
+        }
+
+        var (status, _) = await PostAsync("oauth2/revoke", new Dictionary<string, string>
+        {
+            ["client_id"] = clientId,
+            ["token"] = accessToken
+        }, cancellationToken).ConfigureAwait(false);
+        return status == HttpStatusCode.OK;
+    }
+
     /// <summary>Twitch expects apps that keep a sign-in to validate it.</summary>
     public async Task<bool> ValidateAsync(string accessToken, CancellationToken cancellationToken)
     {

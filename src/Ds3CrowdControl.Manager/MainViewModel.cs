@@ -388,6 +388,9 @@ public partial class MainViewModel : ObservableObject
         get
         {
             var besideApp = Path.Combine(AppContext.BaseDirectory, "ds3mod.dll");
+#if DEBUG
+            // While developing, a freshly built mod in the source tree wins. Release builds
+            // only ever use the copy next to the manager.
             var justBuilt = Path.GetFullPath(Path.Combine(
                 AppContext.BaseDirectory,
                 "..", "..", "..", "..", "ds3mod", "target", "release", "ds3mod.dll"));
@@ -396,6 +399,7 @@ public partial class MainViewModel : ObservableObject
             {
                 return justBuilt;
             }
+#endif
 
             return besideApp;
         }

@@ -49,10 +49,33 @@ public sealed class TwitchConnection(
         Begin(tokens);
     }
 
+    /// <summary>
+    /// Hides the rewards, cancels the sign-in at Twitch and deletes it from this PC. The local
+    /// copy is deleted even when Twitch cannot be reached, and the log says where to finish.
+    /// </summary>
     public async Task SignOutAsync()
     {
+        var tokens = _session?.Tokens ?? store.Load();
         await PauseRewardsAsync().ConfigureAwait(false);
         Stop();
+        if (tokens is not null)
+        {
+            var revoked = false;
+            try
+            {
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                revoked = await _auth.RevokeAsync(tokens, timeout.Token).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (exception is HttpRequestException or OperationCanceledException or TwitchException)
+            {
+                log($"Twitch: could not reach Twitch to cancel the sign-in: {exception.Message}");
+            }
+
+            log(revoked
+                ? "Twitch: sign-in cancelled at Twitch and removed from this PC"
+                : "Twitch: sign-in removed from this PC, but Twitch did not confirm cancelling it. Remove the app at twitch.tv/settings/connections to be sure.");
+        }
+
         store.Delete();
         StatusChanged?.Invoke("Twitch: not connected");
     }

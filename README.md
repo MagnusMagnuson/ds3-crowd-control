@@ -85,6 +85,18 @@ Channel points, Bits and gift subs need an Affiliate or Partner channel, signed 
 
 If several events share an amount, one of them is picked at random. Twitch cannot refund Bits or gift subs, so if one of those events fails or is cleared from the queue, the viewer does not get them back.
 
+### What connecting to Twitch does
+
+- **Sign-in:** you sign in on Twitch's own website at twitch.tv/activate and enter the code the manager shows. The manager never sees your password. Twitch then gives it a key that allows only the permissions below.
+- **Permissions:**
+  - *Manage channel point redeems:* create, change and hide the event redeems, and mark redemptions as done or refunded. Twitch only lets an app edit redeems it created itself, so your own redeems are never touched.
+  - *Read Bits:* see who cheered and how many Bits.
+  - *Read subscriptions:* see gift subs. Twitch bundles reading the subscriber list into this permission, but the manager never asks for it.
+- **What it cannot do:** read or write chat, ban anyone, change the stream title or category, or see your email, payouts or stream key.
+- **Where data goes:** the manager talks only to Twitch's own servers. There is no other server in between, and nothing is sent anywhere else.
+- **On your PC:** the key is stored encrypted, readable only by your Windows account, and is never put in the logs or the support zip.
+- **Disconnect Twitch:** hides the redeems, cancels the key at Twitch and deletes it from your PC. If Twitch cannot be reached at that moment, the log says so, and you can remove the app yourself at twitch.tv/settings/connections.
+
 ### Testing without an Affiliate channel
 
 The Twitch CLI can send fake events on your own PC, so everything except creating real redeems can be tested on any channel.

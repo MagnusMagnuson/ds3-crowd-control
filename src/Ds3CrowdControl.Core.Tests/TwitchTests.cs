@@ -704,6 +704,107 @@ public class TwitchAuthTests
         Assert.Equal("""{"status":"CANCELED"}""", body);
     }
 
+    private static string Form(HttpRequestMessage request) => request.Content!.ReadAsStringAsync().Result;
+
+    [Fact]
+    public async Task Revoking_cancels_the_access_token_at_twitch()
+    {
+        var revoked = new List<string>();
+        var http = new HttpClient(new StubHandler(request =>
+        {
+            if (request.RequestUri!.AbsolutePath == "/oauth2/revoke")
+            {
+                revoked.Add(Form(request));
+                return (HttpStatusCode.OK, "");
+            }
+
+            return (HttpStatusCode.NotFound, "{}");
+        }));
+
+        var done = await new TwitchAuth(http, Id, "client").RevokeAsync(new TwitchTokens { AccessToken = "access", RefreshToken = "refresh" }, default);
+
+        Assert.True(done);
+        Assert.Equal(["client_id=client&token=access"], revoked);
+    }
+
+    [Fact]
+    public async Task An_expired_access_token_is_refreshed_and_the_new_one_cancelled()
+    {
+        var revoked = new List<string>();
+        var http = new HttpClient(new StubHandler(request =>
+        {
+            switch (request.RequestUri!.AbsolutePath)
+            {
+                case "/oauth2/revoke":
+                    var form = Form(request);
+                    revoked.Add(form);
+                    return form.Contains("token=new")
+                        ? (HttpStatusCode.OK, "")
+                        : (HttpStatusCode.BadRequest, """{"status":400,"message":"Invalid token"}""");
+                case "/oauth2/token":
+                    return (HttpStatusCode.OK, """{"access_token":"new","refresh_token":"newer"}""");
+                default:
+                    return (HttpStatusCode.NotFound, "{}");
+            }
+        }));
+
+        var done = await new TwitchAuth(http, Id, "client").RevokeAsync(new TwitchTokens { AccessToken = "old", RefreshToken = "refresh" }, default);
+
+        Assert.True(done);
+        Assert.Equal(["client_id=client&token=old", "client_id=client&token=new"], revoked);
+    }
+
+    [Fact]
+    public async Task A_sign_in_twitch_already_ended_counts_as_cancelled()
+    {
+        var http = new HttpClient(new StubHandler(request => request.RequestUri!.AbsolutePath switch
+        {
+            "/oauth2/revoke" => (HttpStatusCode.BadRequest, """{"status":400,"message":"Invalid token"}"""),
+            "/oauth2/token" => (HttpStatusCode.BadRequest, """{"status":400,"message":"Invalid refresh token"}"""),
+            _ => (HttpStatusCode.NotFound, "{}")
+        }));
+
+        Assert.True(await new TwitchAuth(http, Id, "client").RevokeAsync(new TwitchTokens { AccessToken = "old", RefreshToken = "gone" }, default));
+    }
+
+    [Fact]
+    public async Task Disconnecting_cancels_at_twitch_and_deletes_the_saved_sign_in()
+    {
+        var revoked = 0;
+        var http = new HttpClient(new StubHandler(request =>
+        {
+            revoked += request.RequestUri!.AbsolutePath == "/oauth2/revoke" ? 1 : 0;
+            return (HttpStatusCode.OK, "");
+        }));
+        var path = TempFile();
+        var store = new TwitchTokenStore(path);
+        store.Save(new TwitchTokens { AccessToken = "access", RefreshToken = "refresh", UserId = "42", Login = "streamer" });
+        var log = new List<string>();
+        var connection = new TwitchConnection(new TwitchTriggerSource(new Catalog(), log.Add), store, http, log.Add);
+
+        await connection.SignOutAsync();
+
+        Assert.Equal(1, revoked);
+        Assert.False(File.Exists(path));
+        Assert.Contains(log, line => line.Contains("cancelled at Twitch"));
+    }
+
+    [Fact]
+    public async Task Disconnecting_without_internet_still_deletes_the_saved_sign_in()
+    {
+        var http = new HttpClient(new StubHandler(_ => throw new HttpRequestException("no internet")));
+        var path = TempFile();
+        var store = new TwitchTokenStore(path);
+        store.Save(new TwitchTokens { AccessToken = "access", RefreshToken = "refresh" });
+        var log = new List<string>();
+        var connection = new TwitchConnection(new TwitchTriggerSource(new Catalog(), log.Add), store, http, log.Add);
+
+        await connection.SignOutAsync();
+
+        Assert.False(File.Exists(path));
+        Assert.Contains(log, line => line.Contains("twitch.tv/settings/connections"));
+    }
+
     private sealed class StubHandler(Func<HttpRequestMessage, (HttpStatusCode Status, string Body)> respond) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
