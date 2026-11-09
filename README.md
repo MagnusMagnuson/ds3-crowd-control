@@ -8,12 +8,32 @@ Written with AI: the code was written by Claude (Anthropic) working with the aut
 
 ## Setup
 
-You need Windows, an offline Steam copy of Dark Souls III 1.15.2, the .NET 8 SDK and Rust.
+You need 64-bit Windows 10 or 11 and the Steam version of [Dark Souls III](https://store.steampowered.com/app/374320/DARK_SOULS_III/), updated to 1.15.2. Nothing else has to be installed: the download includes everything it needs, including .NET.
 
-1. Build `src/Ds3CrowdControl.Manager`. This also builds `ds3mod.dll` and copies it beside the app.
-2. Start the manager.
+1. Download `ds3-crowd-control-v<version>.zip` from the [Releases page](https://github.com/MagnusMagnuson/ds3-crowd-control/releases) and unzip it into its own folder.
+2. Start `Ds3CrowdControl.Manager.exe`. Keep `ds3mod.dll` in the same folder.
 3. Launch Dark Souls III and choose to play offline.
 4. Load a character, then press **Attach to Dark Souls III** on the General page.
+
+Two warnings you may see, because the app is not signed and loads a DLL into the game:
+
+- Windows SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**.
+- Some antivirus programs flag tools that load a DLL into another program. If yours removes `ds3mod.dll` or blocks the manager, allow the folder.
+
+Settings, logs and the Twitch sign-in are kept in `%AppData%\Ds3CrowdControl`, so a new version can go in a new folder.
+
+### Building it yourself
+
+This is only needed to change the code. You need:
+
+- the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+- [Rust](https://rustup.rs) with its default Windows (MSVC) toolchain
+- the Microsoft C++ build tools, which Rust needs to link the mod: install [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with the "Desktop development with C++" workload. The Rust installer offers to do this for you.
+
+The first build downloads its packages, so it needs an internet connection.
+
+- `dotnet build Ds3CrowdControl.sln` builds the manager and `ds3mod.dll` into `src/Ds3CrowdControl.Manager/bin`.
+- `powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Version 0.1.0` builds the release zip in `dist`.
 
 ## Events
 
@@ -83,3 +103,19 @@ For a redeem, `--item-name` must match the event name.
 Press **Save logs for support** at the bottom of the General page. It saves `ds3-crowd-control-logs-<date>.zip` to the Desktop and opens the folder, ready to send. It holds the logs, your events and settings, and the newest Dark Souls III crash dump from the last week if there is one. It never holds your Twitch sign-in.
 
 Temporary Armor, Bombardier and a timed Shuffle Stats survive a crash or a quit. Attach the mod again and load the same character, and your own gear or stats come back. A stat shuffle is not undone if you levelled up in the meantime, so no levels are lost.
+
+## Credits
+
+- **Code:** written by Claude (Anthropic) with the author, with some earlier work by Grok (xAI).
+- **[fromsoftware-rs](https://github.com/vswarte/eldenring-rs)** (the `darksouls3` crate) by vswarte and contributors: game structures and helpers the mod is built on.
+- **[The Grand Archives Dark Souls III table](https://github.com/The-Grand-Archives/Dark-Souls-III-CT-TGA):** reference for player data offsets, such as held souls.
+- **[DS3 Item Randomiser and Auto-Equip](https://www.nexusmods.com/darksouls3/mods/2004)** by LukeYui ([source](https://github.com/LukeYui/DS3-Item-Randomiser-OS)): reference for how other mods equip items. No code was copied.
+- **[commands.gg](https://commands.gg/ds3/items):** item IDs, such as Black Firebomb and the Mirrah Chain Set.
+- **[Dark Souls III Fextralife wiki](https://darksouls3.wiki.fextralife.com/):** level-up costs and armor set details.
+- **[West Games Dark Souls leveling calculator](https://west-games.com/dark-souls-leveling-calculator/):** the level-up cost formula.
+- **[DSAnimStudio](https://github.com/Meowmaritus/DSAnimStudio)** by Meowmaritus: animation event names that helped track down the Fake Death hit bug.
+- **[Twitch developer documentation](https://dev.twitch.tv/docs/)** and the **[Twitch CLI](https://github.com/twitchdev/twitch-cli)**.
+
+Libraries and their licenses are listed in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+Dark Souls is a trademark of Bandai Namco Entertainment and FromSoftware. This is an unofficial fan project and is not affiliated with or endorsed by them.

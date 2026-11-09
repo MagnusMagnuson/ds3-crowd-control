@@ -1,0 +1,4 @@
+# Builds the C runtime into ds3mod.dll, so players do not need the Visual C++
+# Redistributable installed for the game to load the mod.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

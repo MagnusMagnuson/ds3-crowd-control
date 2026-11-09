@@ -15,4 +15,8 @@
     <Exec Command="cargo build --release --manifest-path &quot;$(MSBuildProjectDirectory)\..\ds3mod\Cargo.toml&quot;" />
     <Copy SourceFiles="$(MSBuildProjectDirectory)\..\ds3mod\target\release\ds3mod.dll" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" ContinueOnError="true" />
   </Target>
+  <!-- The mod has to sit beside the manager in a published copy too. -->
+  <Target Name="PublishDs3Mod" AfterTargets="Publish">
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\..\ds3mod\target\release\ds3mod.dll" DestinationFolder="$(PublishDir)" />
+  </Target>
 </Project>
