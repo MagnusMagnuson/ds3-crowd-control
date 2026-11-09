@@ -71,7 +71,7 @@ Use selected item presses X, which is the use-item button on the game's default 
 
 - **General:** attach to the game, connect Twitch, pause all events, set a gap between events and a limit on waiting redeems, and save logs for support.
 - **Events:** turn Redeem, Bits and Gift subs on or off for each event and set their amounts. **Sync** switches all three together. Changes save at once.
-- **Presets:** rename events, set cooldowns and options, and test them.
+- **Presets:** rename events, set their options, and test them.
 
 The log and the queue stay at the bottom of every page. The queue shows who triggered each event. Untick **Show queue** if the player does not want to see what is coming. **Clear queue** removes waiting events and refunds waiting redeems. Pausing keeps waiting events and runs them when you resume.
 
@@ -79,7 +79,7 @@ The log and the queue stay at the bottom of every page. The queue shows who trig
 
 Channel points, Bits and gift subs need an Affiliate or Partner channel, signed in as the broadcaster. Press **Connect Twitch** and approve the code in the browser, then turn triggers on in the Events page.
 
-- **Redeem:** the manager creates its own channel point redeems on the channel, using the event name, the cost from the Events page and the cooldown from the Presets page. Turning one off hides it on Twitch and never deletes it, so a custom icon stays. Redeems that fail are refunded, and so are redeems past the waiting limit. All redeems are hidden while the manager is closed.
+- **Redeem:** the manager creates its own channel point redeems on the channel, using the event name and the cost and cooldown from the Events page. The cooldown only limits redeems: Bits, gift subs and Test always run, since Twitch cannot refund Bits or gift subs. Turning one off hides it on Twitch and never deletes it, so a custom icon stays. Redeems that fail are refunded, and so are redeems past the waiting limit. All redeems are hidden while the manager is closed.
 - **Bits:** a cheer of exactly the set amount runs the event. Power-ups count too.
 - **Gift subs:** a gift of exactly the set number of subs runs the event, at any tier.
 

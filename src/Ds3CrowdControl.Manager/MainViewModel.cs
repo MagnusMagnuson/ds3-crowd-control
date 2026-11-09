@@ -69,6 +69,7 @@ public partial class EventToggle : ObservableObject
         _changed = changed;
         _redeem = preset.RedeemEnabled;
         _cost = preset.RedeemCost;
+        _cooldown = preset.CooldownSeconds;
         _bits = preset.BitsEnabled;
         _bitsAmount = preset.BitsAmount;
         _gift = preset.GiftEnabled;
@@ -82,6 +83,12 @@ public partial class EventToggle : ObservableObject
 
     [ObservableProperty]
     private int _cost;
+
+    /// <summary>Twitch allows a redeem cooldown of up to 7 days.</summary>
+    public const int MaxCooldownSeconds = 7 * 24 * 60 * 60;
+
+    [ObservableProperty]
+    private int _cooldown;
 
     [ObservableProperty]
     private bool _bits;
@@ -145,6 +152,19 @@ public partial class EventToggle : ObservableObject
         }
 
         _preset.RedeemCost = value;
+        _changed();
+    }
+
+    partial void OnCooldownChanged(int value)
+    {
+        var allowed = Math.Clamp(value, 0, MaxCooldownSeconds);
+        if (allowed != value)
+        {
+            Cooldown = allowed;
+            return;
+        }
+
+        _preset.CooldownSeconds = value;
         _changed();
     }
 
@@ -324,9 +344,6 @@ public partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private string _editName = "";
-
-    [ObservableProperty]
-    private int _editCooldown;
 
     [ObservableProperty]
     private bool _isSafe;
@@ -858,12 +875,10 @@ public partial class MainViewModel : ObservableObject
         if (SelectedPreset is null)
         {
             EditName = "";
-            EditCooldown = 0;
             return;
         }
 
         EditName = SelectedPreset.Name;
-        EditCooldown = SelectedPreset.CooldownSeconds;
         var handler = _catalog.FindHandler(SelectedPreset.HandlerId);
         if (handler is null)
         {
@@ -892,7 +907,6 @@ public partial class MainViewModel : ObservableObject
         }
 
         SelectedPreset.Name = EditName;
-        SelectedPreset.CooldownSeconds = Math.Max(0, EditCooldown);
         var handler = _catalog.FindHandler(SelectedPreset.HandlerId);
         foreach (var argument in Arguments)
         {

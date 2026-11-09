@@ -39,6 +39,7 @@ public sealed class EffectPreset
     public string Id { get; set; } = Guid.NewGuid().ToString("N");
     public string Name { get; set; } = "";
     public string HandlerId { get; set; } = "";
+    /// <summary>The redeem's cooldown on Twitch. Bits, gift subs and Test ignore it, since Bits and gift subs cannot be refunded.</summary>
     public int CooldownSeconds { get; set; }
     public bool RedeemEnabled { get; set; }
     public int RedeemCost { get; set; } = 500;

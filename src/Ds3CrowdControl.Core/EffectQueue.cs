@@ -14,7 +14,6 @@ public sealed class EffectQueue
 
     private readonly Catalog _catalog;
     private readonly GameBridgeServer _bridge;
-    private readonly Dictionary<string, DateTimeOffset> _lastSuccess = [];
     private readonly List<Entry> _entries = [];
     private readonly object _gate = new();
     private readonly SemaphoreSlim _turn = new(1, 1);
@@ -59,12 +58,6 @@ public sealed class EffectQueue
         if (preset is null)
         {
             return new EffectResult("", EffectStatus.Unavailable, "that preset does not exist");
-        }
-
-        var cooledDown = CooldownRejection(preset);
-        if (cooledDown is not null)
-        {
-            return cooledDown;
         }
 
         if (!_bridge.State.CanWait)
@@ -152,12 +145,6 @@ public sealed class EffectQueue
 
         try
         {
-            var cooledDown = CooldownRejection(preset);
-            if (cooledDown is not null)
-            {
-                return cooledDown;
-            }
-
             SetState(entry, "next");
             var deadline = DateTimeOffset.UtcNow + ReadyTimeout;
             string? announced = null;
@@ -242,7 +229,6 @@ public sealed class EffectQueue
             entry.Sent = false;
             if (result.Status == EffectStatus.Success)
             {
-                _lastSuccess[preset.Id] = DateTimeOffset.UtcNow;
                 _lastStart = startedAt;
             }
         }
@@ -286,24 +272,6 @@ public sealed class EffectQueue
         }
 
         Changed?.Invoke();
-    }
-
-    private EffectResult? CooldownRejection(EffectPreset preset)
-    {
-        lock (_gate)
-        {
-            if (_lastSuccess.TryGetValue(preset.Id, out var last) && preset.CooldownSeconds > 0)
-            {
-                var readyAt = last.AddSeconds(preset.CooldownSeconds);
-                if (DateTimeOffset.UtcNow < readyAt)
-                {
-                    var remaining = (int)Math.Ceiling((readyAt - DateTimeOffset.UtcNow).TotalSeconds);
-                    return new EffectResult("", EffectStatus.Failed, $"{preset.Name} is on cooldown for {remaining}s");
-                }
-            }
-        }
-
-        return null;
     }
 
     public static string UnsafeReason(GameState state)

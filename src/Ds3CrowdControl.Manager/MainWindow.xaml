@@ -107,6 +107,7 @@
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="260" />
                             <ColumnDefinition Width="170" />
+                            <ColumnDefinition Width="130" />
                             <ColumnDefinition Width="170" />
                             <ColumnDefinition Width="170" />
                         </Grid.ColumnDefinitions>
@@ -118,14 +119,15 @@
                                 <Button Content="All off" Command="{Binding AllOffCommand}" CommandParameter="redeem" Padding="8,2" />
                             </StackPanel>
                         </StackPanel>
-                        <StackPanel Grid.Column="2">
+                        <TextBlock Grid.Column="2" Text="Cooldown (seconds)" VerticalAlignment="Top" ToolTip="How long viewers wait before they can redeem it again. Bits, gift subs and Test ignore it." />
+                        <StackPanel Grid.Column="3">
                             <TextBlock Text="Bits (exact amount)" Margin="0,0,0,4" />
                             <StackPanel Orientation="Horizontal">
                                 <Button Content="All on" Command="{Binding AllOnCommand}" CommandParameter="bits" Padding="8,2" Margin="0,0,6,0" />
                                 <Button Content="All off" Command="{Binding AllOffCommand}" CommandParameter="bits" Padding="8,2" />
                             </StackPanel>
                         </StackPanel>
-                        <StackPanel Grid.Column="3">
+                        <StackPanel Grid.Column="4">
                             <TextBlock Text="Gift subs (exact count)" Margin="0,0,0,4" />
                             <StackPanel Orientation="Horizontal">
                                 <Button Content="All on" Command="{Binding AllOnCommand}" CommandParameter="gift" Padding="8,2" Margin="0,0,6,0" />
@@ -141,6 +143,7 @@
                                         <Grid.ColumnDefinitions>
                                             <ColumnDefinition Width="260" />
                                             <ColumnDefinition Width="170" />
+                                            <ColumnDefinition Width="130" />
                                             <ColumnDefinition Width="170" />
                                             <ColumnDefinition Width="170" />
                                         </Grid.ColumnDefinitions>
@@ -149,11 +152,12 @@
                                             <CheckBox IsChecked="{Binding Redeem}" VerticalAlignment="Center" Margin="0,0,10,0" />
                                             <TextBox Text="{Binding Cost, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding Redeem}" Width="90" />
                                         </StackPanel>
-                                        <StackPanel Grid.Column="2" Orientation="Horizontal">
+                                        <TextBox Grid.Column="2" Text="{Binding Cooldown, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding Redeem}" Width="90" HorizontalAlignment="Left" />
+                                        <StackPanel Grid.Column="3" Orientation="Horizontal">
                                             <CheckBox IsChecked="{Binding Bits}" VerticalAlignment="Center" Margin="0,0,10,0" />
                                             <TextBox Text="{Binding BitsAmount, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding Bits}" Width="90" />
                                         </StackPanel>
-                                        <StackPanel Grid.Column="3" Orientation="Horizontal">
+                                        <StackPanel Grid.Column="4" Orientation="Horizontal">
                                             <CheckBox IsChecked="{Binding Gift}" VerticalAlignment="Center" Margin="0,0,10,0" />
                                             <TextBox Text="{Binding GiftAmount, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding Gift}" Width="90" />
                                         </StackPanel>
@@ -182,8 +186,6 @@
                                 <TextBlock Text="Preset" FontSize="18" Margin="0,0,0,8" />
                                 <TextBlock Text="Name" />
                                 <TextBox Text="{Binding EditName, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,8" />
-                                <TextBlock Text="Cooldown seconds" />
-                                <TextBox Text="{Binding EditCooldown, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,8" />
                                 <ItemsControl ItemsSource="{Binding Arguments}">
                                     <ItemsControl.ItemTemplate>
                                         <DataTemplate>

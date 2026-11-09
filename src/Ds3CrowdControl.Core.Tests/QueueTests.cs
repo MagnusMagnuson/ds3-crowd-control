@@ -411,7 +411,7 @@ public class QueueTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task CooldownBlocksTheNextFire()
+    public async Task CooldownIsLeftToTwitchSoPaidTriggersAlwaysRun()
     {
         using var client = await ConnectAsync();
         await SendAsync(client, Hello(offline: true, inGame: true));
@@ -419,15 +419,12 @@ public class QueueTests : IAsyncLifetime
         var preset = _catalog.Presets.Single(item => item.HandlerId == "use_selected_item");
         preset.CooldownSeconds = 30;
 
-        var first = _queue.EnqueueAsync(preset.Id, "manual");
-        var line = await ReadLineAsync(client, new CancellationTokenSource(TimeSpan.FromSeconds(2)).Token);
-        using var document = JsonDocument.Parse(line);
-        await SendAsync(client, Result(document.RootElement.GetProperty("requestId").GetString()!, "success", "used item"));
-        Assert.Equal(EffectStatus.Success, (await first).Status);
-
-        var second = await _queue.EnqueueAsync(preset.Id, "manual");
-        Assert.Equal(EffectStatus.Failed, second.Status);
-        Assert.Contains("cooldown", second.Message);
+        foreach (var source in new[] { "twitch:Viewer", "twitch:Viewer" })
+        {
+            var run = _queue.EnqueueAsync(preset.Id, source);
+            await SendAsync(client, Result(await ReadRequestIdAsync(client), "success", "used item"));
+            Assert.Equal(EffectStatus.Success, (await run).Status);
+        }
     }
 
     private string Hello(bool offline, bool inGame, bool sessionKnown = true, bool exeMatch = true)
