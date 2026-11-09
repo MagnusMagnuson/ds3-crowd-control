@@ -38,6 +38,10 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             game::adjust_souls(delta, scale)
         }
         "use_selected_item" => game::use_selected_item(),
+        "restore_gear" => {
+            let slot = args.get("slot").and_then(Value::as_u64).unwrap_or(0);
+            game::restore_gear(slot.min(1) as usize)
+        }
         "kill_player" => game::kill_player(),
         "fake_death" => game::start_fake_death(),
         "show_you_died" => game::show_you_died(),
@@ -122,6 +126,10 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(15);
             let camera = args.get("camera").and_then(Value::as_i64).unwrap_or(1) != 0;
             crate::input::invert_controls(seconds.clamp(1, 300) as i32, camera)
+        }
+        "pacifist" => {
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
+            crate::input::pacifist(seconds.clamp(1, 300) as i32)
         }
         "spawn_random_enemy" => {
             let amount = args.get("amount").and_then(Value::as_i64).unwrap_or(1);

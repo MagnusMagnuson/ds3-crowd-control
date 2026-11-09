@@ -282,6 +282,7 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("Blind", "blind"),
                 _catalog.EnsurePreset("Freeze", "freeze"),
                 _catalog.EnsurePreset("Invert Controls", "invert_controls"),
+                _catalog.EnsurePreset("Pacifist", "pacifist"),
                 _catalog.EnsurePreset("Set health to 50%", "set_health_percent"),
                 _catalog.EnsurePreset("Set health to random %", "set_health_random_percent"),
                 _catalog.EnsurePreset("Watch item button", "watch_item_button")
@@ -298,6 +299,11 @@ public partial class MainViewModel : ObservableObject
         });
         _ = StartAsync();
         _ = _twitch.ResumeAsync();
+        RefreshGearSnapshots();
+        // The mod writes the snapshots, so the list is reread now and then.
+        var gearTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromSeconds(15) };
+        gearTimer.Tick += (_, _) => RefreshGearSnapshots();
+        gearTimer.Start();
     }
 
     public ObservableCollection<EffectPreset> Presets { get; } = [];
@@ -305,6 +311,8 @@ public partial class MainViewModel : ObservableObject
     public ObservableCollection<ArgumentEditor> Arguments { get; } = [];
     public ObservableCollection<EventToggle> Events { get; } = [];
     public ObservableCollection<QueuedEffect> QueueRows { get; } = [];
+    public ObservableCollection<GearSnapshotInfo> GearSnapshots { get; } = [];
+    public bool NoGearSnapshots => GearSnapshots.Count == 0;
     public string QueueHeader => QueueRows.Count == 0 ? "Queue" : $"Queue ({QueueRows.Count})";
     public bool QueueHidden => !ShowQueue;
 
@@ -559,6 +567,42 @@ public partial class MainViewModel : ObservableObject
         }
 
         EventsChanged();
+    }
+
+    private void RefreshGearSnapshots()
+    {
+        var latest = GearSnapshotStore.Load(AppPaths.GearSnapshotsFile);
+        if (latest.SequenceEqual(GearSnapshots))
+        {
+            return;
+        }
+
+        GearSnapshots.Clear();
+        foreach (var snapshot in latest)
+        {
+            GearSnapshots.Add(snapshot);
+        }
+
+        OnPropertyChanged(nameof(NoGearSnapshots));
+    }
+
+    [RelayCommand(AllowConcurrentExecutions = true)]
+    private async Task RestoreGearAsync(GearSnapshotInfo? snapshot)
+    {
+        if (snapshot is null)
+        {
+            return;
+        }
+
+        if (!_bridge.State.IsSafe)
+        {
+            AddLog("Restore gear: load your character in the game first");
+            return;
+        }
+
+        var args = JsonSerializer.SerializeToElement(new { slot = snapshot.Slot });
+        var result = await _bridge.TriggerAsync("restore_gear", args, CancellationToken.None);
+        AddLog($"Restore gear: {result.Message}");
     }
 
     [RelayCommand]

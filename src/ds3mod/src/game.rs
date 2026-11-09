@@ -2294,6 +2294,179 @@ pub fn poll_bombardier() {
     }));
 }
 
+const GEAR_SNAPSHOT_FILE: &str = "gear-snapshots.json";
+/// Seconds between gear snapshots.
+pub const GEAR_SNAPSHOT_EVERY: u64 = 300;
+
+/// Weapons and armor equipped at one moment, by item id. 0 or a fist or bare id means empty.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct GearSnapshot {
+    pub taken: u64,
+    pub character: String,
+    pub weapons: [u32; 6],
+    pub armor: [u32; 4],
+}
+
+/// Two snapshots that take turns, so a bad moment never overwrites both.
+#[derive(Default, Deserialize, Serialize)]
+pub struct GearSnapshots {
+    pub slots: [Option<GearSnapshot>; 2],
+    pub next: usize,
+}
+
+impl GearSnapshots {
+    pub fn store(&mut self, snapshot: GearSnapshot) {
+        let slot = self.next % self.slots.len();
+        self.slots[slot] = Some(snapshot);
+        self.next = (slot + 1) % self.slots.len();
+    }
+}
+
+pub fn gear_snapshot_due(now: u64, last: Option<u64>) -> bool {
+    last.is_none_or(|last| now >= last + GEAR_SNAPSHOT_EVERY)
+}
+
+/// When this session last took a snapshot. The first one comes as soon as it safely can.
+static LAST_GEAR_SNAPSHOT: Mutex<Option<u64>> = Mutex::new(None);
+
+fn gear_snapshot_path() -> Result<std::path::PathBuf, String> {
+    Ok(crate::log::app_dir()?.join(GEAR_SNAPSHOT_FILE))
+}
+
+fn load_gear_snapshots() -> GearSnapshots {
+    gear_snapshot_path()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_gear_snapshots(snapshots: &GearSnapshots) -> Result<(), String> {
+    let path = gear_snapshot_path()?;
+    let text = serde_json::to_string_pretty(snapshots).map_err(|error| error.to_string())?;
+    let partial = path.with_extension("tmp");
+    std::fs::write(&partial, text).map_err(|error| error.to_string())?;
+    std::fs::rename(&partial, &path).map_err(|error| error.to_string())
+}
+
+fn equipped_item(player: &PlayerIns, slot: u32) -> u32 {
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    u32::try_from(equipment.equipment_indexes[slot as usize])
+        .ok()
+        .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+        .map_or(0, |entry| entry.item_id.param_id())
+}
+
+/// Only while nothing has swapped gear temporarily, so a snapshot always holds the player's own.
+fn gear_snapshot_allowed(player: &PlayerIns) -> bool {
+    let restores = pending();
+    restores.armor.is_none()
+        && restores.bombardier.is_none()
+        && player.super_chr_ins.modules.data.hp > 0
+        && !load_screen_open()
+        && FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_none()
+}
+
+pub fn poll_gear_snapshots() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let now = unix_now();
+        let mut last = LAST_GEAR_SNAPSHOT.lock().unwrap_or_else(|poison| poison.into_inner());
+        if !gear_snapshot_due(now, *last) {
+            return;
+        }
+        let Ok(player) = local_player() else {
+            return;
+        };
+        let player = unsafe { &*player };
+        let (loaded, character) = read_character();
+        if !loaded || !gear_snapshot_allowed(player) {
+            return;
+        }
+        *last = Some(now);
+        let snapshot = GearSnapshot {
+            taken: now,
+            character,
+            weapons: WEAPON_SLOTS.map(|slot| equipped_item(player, slot)),
+            armor: ARMOR_SLOTS.map(|slot| equipped_item(player, slot)),
+        };
+        let mut snapshots = load_gear_snapshots();
+        snapshots.store(snapshot);
+        if let Err(error) = save_gear_snapshots(&snapshots) {
+            crate::log::log(format!("gear snapshot could not be saved: {error}"));
+        }
+    }));
+}
+
+/// Puts one slot back. Returns whether it changed, and whether an item had to be given back.
+fn restore_gear_slot(
+    player: &mut PlayerIns,
+    category: ItemCategory,
+    slot: u32,
+    item: u32,
+    real: bool,
+) -> Result<(bool, bool), String> {
+    if equipped_item(player, slot) == item {
+        return Ok((false, false));
+    }
+    if !real {
+        call_equip(player, slot, -1)?;
+        return Ok((true, false));
+    }
+    let mut given = false;
+    let index = match current_index(player, category, item, -1) {
+        Some(index) => index,
+        None => {
+            let id = ItemId::new(category, item).map_err(|error| format!("item {item} is invalid: {error:?}"))?;
+            let game_data = unsafe { GameDataMan::instance_mut() }
+                .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+            game_data.give_item_directly(id, 1);
+            given = true;
+            current_index(player, category, item, -1).ok_or_else(|| format!("item {item} could not be given back"))?
+        }
+    };
+    call_equip(player, slot, index)?;
+    Ok((true, given))
+}
+
+pub fn restore_gear(slot: usize) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    // One lock for both checks: taking it twice in one expression would deadlock.
+    let swapping = {
+        let restores = pending();
+        restores.armor.is_some() || restores.bombardier.is_some()
+    };
+    if swapping {
+        return Err("a temporary armor or Bombardier swap is still active".to_string());
+    }
+    let snapshots = load_gear_snapshots();
+    let snapshot = snapshots
+        .slots
+        .get(slot)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| format!("gear snapshot {} is empty", slot + 1))?;
+    if snapshot.character != read_character().1 {
+        return Err(format!("gear snapshot {} belongs to {}", slot + 1, snapshot.character));
+    }
+    let mut changed = 0;
+    let mut given = 0;
+    for (weapon_slot, weapon) in WEAPON_SLOTS.into_iter().zip(snapshot.weapons) {
+        let (did_change, did_give) =
+            restore_gear_slot(player, ItemCategory::Weapon, weapon_slot, weapon, is_removable_weapon(weapon))?;
+        changed += usize::from(did_change);
+        given += usize::from(did_give);
+    }
+    for (armor_slot, piece) in ARMOR_SLOTS.into_iter().zip(snapshot.armor) {
+        let (did_change, did_give) =
+            restore_gear_slot(player, ItemCategory::Protector, armor_slot, piece, is_real_armor(piece))?;
+        changed += usize::from(did_change);
+        given += usize::from(did_give);
+    }
+    Ok(format!("gear snapshot {} restored: {changed} slots changed, {given} items given back", slot + 1))
+}
+
 const STAT_COUNT: usize = 9;
 const STAT_NAMES: [&str; STAT_COUNT] = ["Vig", "Att", "End", "Vit", "Str", "Dex", "Int", "Fth", "Lck"];
 const MAX_SHUFFLE_ROLLS: usize = 20;
@@ -3493,6 +3666,12 @@ pub fn schemas_json() -> Value {
             ]
         },
         {
+            "id": "pacifist",
+            "name": "Pacifist",
+            "description": "No attacking, blocking or using items for the chosen number of seconds. Use selected item still works. Controller only.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 }]
+        },
+        {
             "id": "set_health_percent",
             "name": "Set health percent",
             "description": "Sets current HP to a percentage of the local player's maximum HP.",
@@ -3816,7 +3995,7 @@ fn format_values(track: &Track) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_soul_delta, bombs_to_remove, can_restore_stats, is_estus, next_level_cost, pick_bomb_slot,
+        apply_soul_delta, bombs_to_remove, gear_snapshot_due, GearSnapshot, GearSnapshots, GEAR_SNAPSHOT_EVERY, can_restore_stats, is_estus, next_level_cost, pick_bomb_slot,
         shuffled_stats,
         ArmorSwap, Bombardier, PendingRestores, RemovedWeapon, ShuffledStats, TemporaryArmor, soul_delta_for_level, armor_available, armor_sets, can_restore_armor, classify_slot, ArmorStyle, combined_speed, is_real_armor, health_at_percent, is_base_weapon_id,
         is_empty_item, is_listed_armor, is_movement_animation, is_removable_weapon, pick_infusion,
@@ -4061,6 +4240,25 @@ mod tests {
         assert_eq!(pick_bomb_slot(&[ESTUS, ASHEN, OTHER]), Some(2));
         assert_eq!(pick_bomb_slot(&[ESTUS, EMPTY, BOMBS]), Some(2));
         assert_eq!(pick_bomb_slot(&[ESTUS, ASHEN]), None);
+    }
+
+    #[test]
+    fn gear_snapshots_take_turns_and_keep_the_older_one() {
+        let snapshot = |taken| GearSnapshot { taken, character: "Ash".to_string(), weapons: [0; 6], armor: [0; 4] };
+        let mut snapshots = GearSnapshots::default();
+        snapshots.store(snapshot(1));
+        snapshots.store(snapshot(2));
+        snapshots.store(snapshot(3));
+        let taken: Vec<u64> = snapshots.slots.iter().flatten().map(|slot| slot.taken).collect();
+        assert_eq!(taken, [3, 2]);
+        assert_eq!(snapshots.next, 1);
+    }
+
+    #[test]
+    fn a_gear_snapshot_is_due_at_start_and_every_five_minutes() {
+        assert!(gear_snapshot_due(1000, None));
+        assert!(!gear_snapshot_due(1000 + GEAR_SNAPSHOT_EVERY - 1, Some(1000)));
+        assert!(gear_snapshot_due(1000 + GEAR_SNAPSHOT_EVERY, Some(1000)));
     }
 
     #[test]

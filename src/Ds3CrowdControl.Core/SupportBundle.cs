@@ -19,7 +19,8 @@ public static class SupportBundle
 
     private static readonly string[] Logs = ["manager.log", "ds3mod.log"];
 
-    private static readonly string[] Settings = ["catalog.json", "manager-settings.json", "pending-restores.json"];
+    private static readonly string[] Settings =
+        ["catalog.json", "manager-settings.json", "pending-restores.json", "gear-snapshots.json"];
 
     public static string DefaultCrashDumpFolder => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),

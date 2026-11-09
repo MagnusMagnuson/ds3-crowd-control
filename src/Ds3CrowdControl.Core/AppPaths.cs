@@ -14,5 +14,7 @@ public static class AppPaths
 
     public static string ManagerSettingsFile => Path.Combine(Root, "manager-settings.json");
 
+    public static string GearSnapshotsFile => Path.Combine(Root, "gear-snapshots.json");
+
     public static void EnsureRoot() => Directory.CreateDirectory(Root);
 }

@@ -63,6 +63,7 @@ Each event can be fired with **Test** on the Presets page, or by Twitch once its
 | Oversaturate | Pushes the colours far too high for a while. |
 | Freeze | Freezes you in place for a few seconds. The camera still moves. |
 | Invert Controls | Flips the controller sticks for a while. |
+| Pacifist | No attacking, blocking or using items for a while. Use selected item still works. Needs a controller. |
 
 Use selected item presses X, which is the use-item button on the game's default controls. If the controls were changed, turn on **Show developer tools**, run **Watch item button** and press the use-item button once, and the mod learns the new button.
 
@@ -99,6 +100,8 @@ The Twitch CLI can send fake events on your own PC, so everything except creatin
 For a redeem, `--item-name` must match the event name.
 
 ## If something goes wrong
+
+The mod saves your equipped weapons and armor every 5 minutes, taking turns between two snapshots, and skips it while a temporary swap is active. If gear ends up wrong, press **Restore** next to a snapshot on the General page. It puts that gear back on and gives back any piece that is no longer in the inventory, at the same upgrade level. A snapshot only restores onto the character it was taken from.
 
 Press **Save logs for support** at the bottom of the General page. It saves `ds3-crowd-control-logs-<date>.zip` to the Desktop and opens the folder, ready to send. It holds the logs, your events and settings, and the newest Dark Souls III crash dump from the last week if there is one. It never holds your Twitch sign-in.
 

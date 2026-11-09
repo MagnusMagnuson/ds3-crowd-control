@@ -15,6 +15,8 @@ const INPUT_DATA_OFFSET: usize = 0x140;
 const BITSET_OFFSET: usize = INPUT_DATA_OFFSET + 0x30;
 const XINPUT_GAMEPAD_X: u16 = 0x4000;
 const XINPUT_GAMEPAD_DPAD_DOWN: u16 = 0x0002;
+const XINPUT_GAMEPAD_LEFT_SHOULDER: u16 = 0x0100;
+const XINPUT_GAMEPAD_RIGHT_SHOULDER: u16 = 0x0200;
 const LEARNED_BUTTON_FILE: &str = "use-item-button.txt";
 const WATCH_FRAMES: u32 = 600;
 
@@ -113,6 +115,7 @@ pub fn frame_begin() {
         && activate_pending()
     {
     }
+    MENU_OPEN.store(matches!(crate::game::menus_open(), Ok(true)), Ordering::Release);
     sample(Phase::FrameBegin, frame);
     let finished = {
         let mut slot = TRACE.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -554,6 +557,9 @@ fn read_image_c_string(image: &[u8], offset: usize) -> Result<&str, String> {
 static INVERT_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 static INVERT_CAMERA: AtomicBool = AtomicBool::new(false);
 static BLOCK_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+static PACIFIST_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
+/// Updated once a frame, so the controller hook never has to read the menu state itself.
+static MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
 fn clock_ms() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
@@ -596,6 +602,22 @@ pub fn stop_blocking_input() {
     BLOCK_UNTIL_MS.store(0, Ordering::Release);
 }
 
+/// Takes away attacking, blocking and using items. The bumpers and triggers do all the
+/// attacking and blocking on a controller, and the use-item button uses the quick item.
+fn remove_fighting(gamepad: &mut XInputGamepad, use_item_button: u16) {
+    gamepad.buttons &= !(XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER | use_item_button);
+    gamepad.left_trigger = 0;
+    gamepad.right_trigger = 0;
+}
+
+pub fn pacifist(seconds: i32) -> Result<String, String> {
+    if ORIGINAL_XINPUT.load(Ordering::Acquire) == 0 {
+        return Err("XInputGetState is not hooked, so attacks cannot be blocked".to_string());
+    }
+    PACIFIST_UNTIL_MS.fetch_max(clock_ms() + seconds.max(0) as u64 * 1000, Ordering::AcqRel);
+    Ok(format!("no attacking, blocking or items for {seconds} seconds"))
+}
+
 pub fn invert_controls(seconds: i32, camera: bool) -> Result<String, String> {
     if ORIGINAL_XINPUT.load(Ordering::Acquire) == 0 {
         return Err("XInputGetState is not hooked, so the controls cannot be inverted".to_string());
@@ -621,6 +643,11 @@ unsafe extern "system" fn hooked_xinput_get_state(index: u32, state: *mut XInput
     LAST_CONTROLLER.store(index, Ordering::Release);
     LAST_BUTTONS.store(physical as u32, Ordering::Release);
     record_xinput(index, physical);
+    // Menus use the bumpers to switch tabs, so Pacifist leaves them alone there.
+    // This runs before the Use selected item press is added, so that press still gets through.
+    if clock_ms() < PACIFIST_UNTIL_MS.load(Ordering::Acquire) && !MENU_OPEN.load(Ordering::Acquire) {
+        remove_fighting(&mut state.gamepad, LEARNED_BUTTON.load(Ordering::Acquire) as u16);
+    }
     if SYNTHETIC_X.load(Ordering::Acquire)
         && index == SYNTHETIC_CONTROLLER.load(Ordering::Acquire)
     {
@@ -648,7 +675,7 @@ fn inject_button(buttons: u16, button: u16) -> u16 {
 mod tests {
     use super::{
         blank_player_input, changed_bits, infer_button, inject_button, invert_axis, invert_sticks,
-        XInputGamepad,
+        remove_fighting, XInputGamepad,
         XINPUT_GAMEPAD_X,
     };
 
@@ -688,6 +715,23 @@ mod tests {
         assert_eq!((pad.buttons, pad.left_trigger, pad.right_trigger), (0, 0, 0));
         assert_eq!((pad.thumb_lx, pad.thumb_ly), (0, 0));
         assert_eq!((pad.thumb_rx, pad.thumb_ry), (300, -400));
+    }
+
+    #[test]
+    fn pacifist_removes_attacks_blocks_and_items_only() {
+        let a_button = 0x1000;
+        let mut pad = XInputGamepad {
+            buttons: 0x0100 | 0x0200 | XINPUT_GAMEPAD_X | a_button,
+            left_trigger: 200,
+            right_trigger: 200,
+            thumb_lx: 100,
+            thumb_rx: 300,
+            ..Default::default()
+        };
+        remove_fighting(&mut pad, XINPUT_GAMEPAD_X);
+        assert_eq!((pad.buttons, pad.left_trigger, pad.right_trigger), (a_button, 0, 0));
+        assert_eq!((pad.thumb_lx, pad.thumb_rx), (100, 300));
+        assert_eq!(inject_button(pad.buttons, XINPUT_GAMEPAD_X) & XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_X);
     }
 
     #[test]

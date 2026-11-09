@@ -159,6 +159,7 @@ fn on_frame() {
     game::poll_enemy_queue();
     game::poll_temporary_armor();
     game::poll_bombardier();
+    game::poll_gear_snapshots();
     game::poll_shuffled_stats();
     game::poll_one_hit_run();
     game::poll_invincibility();

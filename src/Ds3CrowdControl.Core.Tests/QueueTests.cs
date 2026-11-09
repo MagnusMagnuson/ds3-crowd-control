@@ -90,6 +90,8 @@ public class CatalogTests
         Assert.Equal(0, shuffle.Arguments["seconds"].GetInt32());
         var freeze = loaded.Presets.Single(preset => preset.Name == "Freeze" && preset.HandlerId == "freeze");
         Assert.Equal(5, freeze.Arguments["seconds"].GetInt32());
+        var pacifist = loaded.Presets.Single(preset => preset.Name == "Pacifist" && preset.HandlerId == "pacifist");
+        Assert.Equal(30, pacifist.Arguments["seconds"].GetInt32());
         var bombardier = loaded.Presets.Single(preset => preset.Name == "Bombardier" && preset.HandlerId == "bombardier");
         Assert.Equal(60, bombardier.Arguments["seconds"].GetInt32());
         var souls = loaded.Presets.Single(preset => preset.HandlerId == "adjust_souls");

@@ -262,6 +262,13 @@ public static class BuiltinHandlers
         },
         new HandlerSchema
         {
+            Id = "pacifist",
+            Name = "Pacifist",
+            Description = "No attacking, blocking or using items for the chosen number of seconds. Use selected item still works. Controller only.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 1, Max = 300 }]
+        },
+        new HandlerSchema
+        {
             Id = "set_health_percent",
             Name = "Set health percent",
             Description = "Sets current HP to a percentage of the local player's maximum HP.",
@@ -347,6 +354,7 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Blind", "blind", catalog));
         catalog.Presets.Add(Preset("Freeze", "freeze", catalog));
         catalog.Presets.Add(Preset("Invert Controls", "invert_controls", catalog));
+        catalog.Presets.Add(Preset("Pacifist", "pacifist", catalog));
         catalog.Presets.Add(Preset("Set health to 50%", "set_health_percent", catalog));
         catalog.Presets.Add(Preset("Set health to random %", "set_health_random_percent", catalog));
         catalog.Presets.Add(Preset("Spawn Random Enemy", "spawn_random_enemy", catalog));

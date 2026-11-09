@@ -64,6 +64,23 @@
                         <TextBox Text="{Binding WaitingLimit, UpdateSourceTrigger=PropertyChanged}" Width="100" HorizontalAlignment="Left" Margin="0,4,0,0" />
                         <TextBlock Text="Redeems past this many waiting are refunded. 0 means no limit." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
 
+                        <TextBlock Text="Gear snapshots" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <TextBlock Text="Your equipped weapons and armor are saved every 5 minutes, taking turns between two slots. Restore puts that gear back on, and gives back any piece that is gone. Snapshots wait while a temporary swap is active." TextWrapping="Wrap" Opacity="0.75" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <TextBlock Text="No snapshot yet. The first is taken once a character is loaded." Opacity="0.75" Foreground="#F3F3F3"
+                                   Visibility="{Binding NoGearSnapshots, Converter={StaticResource BoolToVisibility}}" />
+                        <ItemsControl ItemsSource="{Binding GearSnapshots}" Margin="0,0,0,16">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                                        <Button Content="Restore" Padding="10,3" Margin="0,0,10,0"
+                                                Command="{Binding DataContext.RestoreGearCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                CommandParameter="{Binding}" />
+                                        <TextBlock Text="{Binding Description}" VerticalAlignment="Center" Foreground="#F3F3F3" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
                         <TextBlock Text="Help" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
                         <Button Content="Save logs for support" Command="{Binding SaveSupportLogsCommand}" Padding="12,6" HorizontalAlignment="Left" />
                         <TextBlock Text="Saves a zip to your Desktop with everything needed to look into a problem. It never contains your Twitch sign-in." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
