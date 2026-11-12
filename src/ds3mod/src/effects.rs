@@ -147,8 +147,15 @@ fn execute(handler: &str, args: &Value) -> Outcome {
         "spawn_npc_invader" => {
             let viewer = args.get("viewer").and_then(Value::as_str).unwrap_or("");
             let ids = args.get("npcParamIds").and_then(Value::as_str).unwrap_or("");
-            let think = args.get("thinkParamId").and_then(Value::as_i64).unwrap_or(0);
-            game::spawn_npc_invader(viewer, ids, think.clamp(0, 99_999_999) as u32)
+            let number = |name: &str, max: i64| {
+                args.get(name).and_then(Value::as_i64).unwrap_or(0).clamp(0, max) as u32
+            };
+            game::spawn_npc_invader(game::InvaderOptions {
+                viewer,
+                use_sender_name: args.get("useSenderName").and_then(Value::as_i64).unwrap_or(1) != 0,
+                ids_text: ids,
+                think_override: number("thinkParamId", 99_999_999),
+            })
         }
         "dump_player_data" => {
             let soul_count = args.get("soulCount").and_then(Value::as_i64).unwrap_or(0);

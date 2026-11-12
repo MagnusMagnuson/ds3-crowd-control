@@ -308,7 +308,7 @@ public static class BuiltinHandlers
         {
             Id = "spawn_npc_invader",
             Name = "Spawn NPC Invader",
-            Description = "Spawns a random named NPC invader near you as a Dark Spirit, with its own gear (Havel, Heysel, Hodrick and the rest of the known set).",
+            Description = "Spawns a random named NPC invader near you as a Dark Spirit, with its own gear (Havel, Heysel, Hodrick and the rest of the known set). The game announces the invasion, with the sender's name if you want.",
             Arguments =
             [
                 new EffectArgumentSchema
@@ -319,6 +319,7 @@ public static class BuiltinHandlers
                     Label = "NPC ids",
                     Hint = "Optional. Comma-separated NpcParam ids. Empty picks a random known invader."
                 },
+                new EffectArgumentSchema { Name = "useSenderName", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Name the sender in the invasion message", Hint = "On: the message names whoever triggered it. Off: it names the NPC. The name on lock-on is always the NPC's own." },
                 new EffectArgumentSchema { Name = "thinkParamId", Type = "int", Default = 0, Min = 0, Max = 99999999, Label = "AI row", Hint = "Optional. 0 picks the invader's own AI. Another NpcThinkParam id forces that AI." }
             ]
         },

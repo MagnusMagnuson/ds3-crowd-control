@@ -72,6 +72,18 @@ const MAP_CHR_FACTORY_PATTERN: &str =
 /// player-type NPC its NPC row, puts it at the entry's position and finishes it.
 const MAP_CHR_PLACE_PATTERN: &str =
     "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 41 8B E8 44 8B 44 24 50 48 8B DA BA 02 00 00 00 49 8B C9 49 8B F1 E8";
+/// Inside the game's "a phantom left" handler, used only to find two addresses: the two
+/// instructions after the constants load the message owner and call the routine
+/// `(owner, message row, invade type, name slot, name object, 0)`. That routine picks a
+/// line by row and invade type, puts the name in, and queues it for the message bar. It
+/// frees the name.
+const SUMMON_MESSAGE_SITE_PATTERN: &str =
+    "41 B9 04 00 00 00 44 8B C6 BA 0E 01 00 00 48 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 48 8B 0D";
+const SUMMON_MESSAGE_OWNER_LOAD: usize = 14;
+const SUMMON_MESSAGE_CALL: usize = 21;
+/// Builds an empty name object for that routine: a tag, a wide string and a flag.
+const NAME_OBJECT_PATTERN: &str =
+    "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 28 FE FF FF FF 48 89 5C 24 50 48 8B F9 C7 44 24 20 00 00 00 00 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 59 08 48 89 5C 24 48 48 8B CB E8 ?? ?? ?? ?? 90 C6 43 28 01";
 /// WorldChrMan field that points at the debug character creator.
 const DEBUG_CHR_CREATOR: usize = 0x3018;
 const CREATOR_THINK_ID: usize = 0x124;
@@ -112,6 +124,14 @@ struct Located {
     free_attune_slots: Result<usize, String>,
     map_chr_factory: Result<usize, String>,
     map_chr_place: Result<usize, String>,
+    summon_message: Result<SummonMessage, String>,
+    name_object: Result<usize, String>,
+}
+
+#[derive(Clone, Copy)]
+struct SummonMessage {
+    owner_slot: usize,
+    show: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -139,9 +159,11 @@ pub fn prepare() {
             free_attune_slots: find_unique(FREE_ATTUNE_SLOTS_PATTERN),
             map_chr_factory: find_unique(MAP_CHR_FACTORY_PATTERN),
             map_chr_place: find_unique(MAP_CHR_PLACE_PATTERN),
+            summon_message: locate_summon_message(),
+            name_object: find_unique(NAME_OBJECT_PATTERN),
         };
         crate::log::log(format!(
-            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={} spawn={} attune={} invader={}",
+            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={} spawn={} attune={} invader={} invasion_message={}",
             located.game_man_slot.is_ok(),
             located.add_soul.is_ok(),
             located.set_text_effect.is_ok(),
@@ -151,6 +173,7 @@ pub fn prepare() {
             located.create_npc.is_ok(),
             located.free_attune_slots.is_ok(),
             located.map_chr_factory.is_ok() && located.map_chr_place.is_ok(),
+            located.summon_message.is_ok() && located.name_object.is_ok(),
         ));
         located
     });
@@ -566,6 +589,14 @@ fn save_living_player() {
     };
     let request_save: extern "C" fn() = unsafe { std::mem::transmute(address) };
     request_save();
+}
+
+fn locate_summon_message() -> Result<SummonMessage, String> {
+    let site = find_unique(SUMMON_MESSAGE_SITE_PATTERN)?;
+    Ok(SummonMessage {
+        owner_slot: pattern::rip_target(site + SUMMON_MESSAGE_OWNER_LOAD, 3, 7)?,
+        show: pattern::rip_target(site + SUMMON_MESSAGE_CALL, 1, 5)?,
+    })
 }
 
 fn locate_scene_slot() -> Result<usize, String> {
@@ -3619,6 +3650,8 @@ struct EnemyChoice {
     /// A human NPC invader. It is built as a player-type character, not through the debug
     /// creator, and its CharaInit row has the same id as its NPC row.
     invader: bool,
+    /// Key of an invader's note: what to announce when it arrives. 0 for none.
+    label: u32,
 }
 
 /// Named human invaders. Each has an NPC row and a CharaInit row (gear, stats, face) with
@@ -4072,6 +4105,7 @@ pub fn spawn_random_enemy(
                 npc_id,
                 think_id: candidates[random_index(candidates.len())],
                 invader: false,
+                label: 0,
             })
         })
         .collect();
@@ -4469,8 +4503,125 @@ fn spawn_human_npc(queue: &EnemyQueue, enemy: EnemyChoice) -> Result<usize, Stri
     Ok(chr)
 }
 
-/// Dark Spirit look and side. The gear, health and AI already came with the character.
-fn finish_invader(chr: usize, npc_id: u32) {
+/// What to announce for an invader that is still waiting to be built, by key. The queue
+/// entries themselves are plain numbers.
+struct InvaderNote {
+    key: u32,
+    /// The sender's name, or none to use the NPC's own.
+    name: Option<String>,
+}
+
+static INVADER_NOTES: Mutex<Vec<InvaderNote>> = Mutex::new(Vec::new());
+
+fn keep_invader_note(name: Option<&str>) -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let key = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
+    let name = name.map(str::trim).filter(|name| !name.is_empty()).map(str::to_string);
+    let mut notes = INVADER_NOTES.lock().unwrap_or_else(|poison| poison.into_inner());
+    notes.push(InvaderNote { key, name });
+    key
+}
+
+fn take_invader_note(key: u32) -> Option<InvaderNote> {
+    let mut notes = INVADER_NOTES.lock().unwrap_or_else(|poison| poison.into_inner());
+    let index = notes.iter().position(|note| note.key == key)?;
+    Some(notes.remove(index))
+}
+
+/// The row the game uses when an NPC phantom arrives in the host's world, and the invade
+/// type of an invading dark spirit, which picks the wording within that row. Together
+/// they give "Invaded by dark spirit NAME!".
+const ARRIVAL_MESSAGE_ROW: u32 = 0xCA;
+const INVADE_TYPE_DARK_SPIRIT: u32 = 3;
+/// Which of the routine's ways of putting the name in. The arrival lines use the first.
+const ARRIVAL_NAME_SLOT: u32 = 1;
+/// Name object: fixed text or null, then the wide string (text or pointer, length,
+/// capacity, allocator). The fixed text wins when it is set, and a new object starts with
+/// it pointing at an empty string.
+const NAME_OBJECT_SIZE: usize = 0x40;
+const NAME_FIXED_TEXT: usize = 0x00;
+const NAME_TEXT: usize = 0x08;
+const NAME_LENGTH: usize = 0x18;
+const NAME_CAPACITY: usize = 0x20;
+const NAME_ALLOCATOR: usize = 0x28;
+/// The string keeps up to this many characters inside itself.
+const NAME_INLINE_CAPACITY: usize = 7;
+const ALLOCATOR_ALLOCATE: usize = 0x50;
+/// Long enough for any Twitch name, short enough for the message bar.
+pub const MESSAGE_NAME_LENGTH: usize = 32;
+
+/// A name cut to what the game's field holds, as UTF-16 without splitting a character pair.
+pub fn name_units(name: &str, limit: usize) -> Vec<u16> {
+    let mut units = Vec::new();
+    for character in name.chars().filter(|character| !character.is_control()) {
+        let mut pair = [0u16; 2];
+        let encoded = character.encode_utf16(&mut pair);
+        if units.len() + encoded.len() > limit {
+            break;
+        }
+        units.extend_from_slice(encoded);
+    }
+    units
+}
+
+/// Shows the game's own arrival line, such as "Invaded by dark spirit NAME". The routine
+/// takes a name object and frees its text with the string's allocator, so longer text is
+/// allocated with that same allocator.
+fn show_invasion_message(name: &str) -> Result<(), String> {
+    let located = cached()?;
+    let message = *located.summon_message.as_ref().map_err(|error| error.clone())?;
+    let make = *located.name_object.as_ref().map_err(|error| error.clone())?;
+    let owner = read_usize_checked(message.owner_slot)?;
+    if owner < 0x10_000 {
+        return Err("the message owner is not ready".to_string());
+    }
+    let units = name_units(name, MESSAGE_NAME_LENGTH);
+    if units.is_empty() {
+        return Err("no name to show".to_string());
+    }
+    let mut object = [0u64; NAME_OBJECT_SIZE / 8];
+    let base = object.as_mut_ptr() as usize;
+    let make_object: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(make) };
+    make_object(base);
+    let capacity = unsafe { ((base + NAME_CAPACITY) as *const usize).read() };
+    let allocator = unsafe { ((base + NAME_ALLOCATOR) as *const usize).read() };
+    if capacity != NAME_INLINE_CAPACITY || allocator < 0x10_000 {
+        return Err("the name object does not look as expected".to_string());
+    }
+    let text = if units.len() <= NAME_INLINE_CAPACITY {
+        base + NAME_TEXT
+    } else {
+        let allocate = read_usize_checked(read_usize_checked(allocator)? + ALLOCATOR_ALLOCATE)?;
+        if !executable_address(allocate) {
+            return Err("the string allocator is not usable".to_string());
+        }
+        let allocate: extern "C" fn(usize, usize, usize) -> usize = unsafe { std::mem::transmute(allocate) };
+        let buffer = allocate(allocator, (units.len() + 1) * 2, 8);
+        if buffer < 0x10_000 {
+            return Err("no memory for the name".to_string());
+        }
+        unsafe {
+            ((base + NAME_TEXT) as *mut usize).write(buffer);
+            ((base + NAME_CAPACITY) as *mut usize).write(units.len());
+        }
+        buffer
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(units.as_ptr(), text as *mut u16, units.len());
+        (text as *mut u16).add(units.len()).write(0);
+        ((base + NAME_LENGTH) as *mut usize).write(units.len());
+        ((base + NAME_FIXED_TEXT) as *mut usize).write(0);
+    }
+    let show: extern "C" fn(usize, u32, u32, u32, usize, u32) = unsafe { std::mem::transmute(message.show) };
+    show(owner, ARRIVAL_MESSAGE_ROW, INVADE_TYPE_DARK_SPIRIT, ARRIVAL_NAME_SLOT, base, 0);
+    Ok(())
+}
+
+/// Dark Spirit look and side, and the invasion message. The gear, health and AI already
+/// came with the character. The name shown on lock-on is the NPC's own: the game reads it
+/// from its text files through the NPC row, so only the message can carry a sender's name.
+fn finish_invader(chr: usize, npc_id: u32, note: Option<InvaderNote>) {
     let kind = read_u32_checked(chr + CHR_TYPE_OFFSET).unwrap_or(0);
     let team = read_u32_checked(chr + CHR_TEAM_OFFSET).unwrap_or(0);
     if let Err(error) = write_i32_checked(chr + CHR_TYPE_OFFSET, CHR_TYPE_DARK_SPIRIT) {
@@ -4479,15 +4630,32 @@ fn finish_invader(chr: usize, npc_id: u32) {
     if let Err(error) = write_u32_checked(chr + CHR_TEAM_OFFSET, CHR_TEAM_DARK_SPIRIT) {
         crate::log::log(format!("invader {npc_id}: team not set: {error}"));
     }
+    let shown = note
+        .as_ref()
+        .and_then(|note| note.name.as_deref())
+        .or_else(|| known_invader_name(npc_id))
+        .unwrap_or("Dark Spirit");
+    if let Err(error) = show_invasion_message(shown) {
+        crate::log::log(format!("invader {npc_id}: invasion message not shown: {error}"));
+    }
     crate::log::log(format!(
-        "invader {npc_id}: built at {chr:#x}, type {kind} -> {CHR_TYPE_DARK_SPIRIT}, team {team} -> {CHR_TEAM_DARK_SPIRIT}, hp {:?}",
+        "invader {npc_id}: built at {chr:#x}, type {kind} -> {CHR_TYPE_DARK_SPIRIT}, team {team} -> {CHR_TEAM_DARK_SPIRIT}, hp {:?}, announced as {shown:?}",
         chr_health(chr),
     ));
 }
 
-/// Queues one random named NPC invader near you. `think_override` above 0 picks the AI row
-/// by hand. `viewer` is remembered for the banner and nameplate work still to come.
-pub fn spawn_npc_invader(viewer: &str, ids_text: &str, think_override: u32) -> Result<String, String> {
+pub struct InvaderOptions<'a> {
+    /// Whoever sent it. Named in the invasion message when `use_sender_name` is on.
+    pub viewer: &'a str,
+    pub use_sender_name: bool,
+    pub ids_text: &'a str,
+    /// Above 0 picks the AI row by hand.
+    pub think_override: u32,
+}
+
+/// Queues one random named NPC invader near you.
+pub fn spawn_npc_invader(options: InvaderOptions) -> Result<String, String> {
+    let InvaderOptions { viewer, use_sender_name, ids_text, think_override } = options;
     let routine = create_npc_address()?;
     let creator = debug_creator()?;
     let located = cached()?;
@@ -4536,6 +4704,7 @@ pub fn spawn_npc_invader(viewer: &str, ids_text: &str, think_override: u32) -> R
         npc_id,
         think_id,
         invader: true,
+        label: keep_invader_note(use_sender_name.then_some(viewer)),
     };
     let mut slot = ENEMY_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
     match slot.as_mut() {
@@ -4564,7 +4733,7 @@ pub fn spawn_npc_invader(viewer: &str, ids_text: &str, think_override: u32) -> R
 
     let name = known_invader_name(npc_id).unwrap_or("NPC invader");
     let viewer = viewer.trim();
-    if viewer.is_empty() {
+    if viewer.is_empty() || !use_sender_name {
         Ok(format!("spawning {name} ({npc_id}, AI {think_id})"))
     } else {
         Ok(format!("spawning {name} ({npc_id}, AI {think_id}) as {viewer}"))
@@ -4639,14 +4808,17 @@ pub fn poll_enemy_queue() {
             match spawn_human_npc(queue, enemy) {
                 Ok(chr) => {
                     queue.started += 1;
-                    finish_invader(chr, enemy.npc_id);
+                    finish_invader(chr, enemy.npc_id, take_invader_note(enemy.label));
                     queue.checks.push(SpawnCheck {
                         chr,
                         frames: 0,
                         skip_frozen_delete: true,
                     });
                 }
-                Err(error) => crate::log::log(format!("invader {}: not spawned: {error}", enemy.npc_id)),
+                Err(error) => {
+                    take_invader_note(enemy.label);
+                    crate::log::log(format!("invader {}: not spawned: {error}", enemy.npc_id));
+                }
             }
             return;
         }
@@ -4857,9 +5029,10 @@ pub fn schemas_json() -> Value {
         {
             "id": "spawn_npc_invader",
             "name": "Spawn NPC Invader",
-            "description": "Spawns a random named NPC invader near you as a Dark Spirit, with its own gear (Havel, Heysel, Hodrick and the rest of the known set).",
+            "description": "Spawns a random named NPC invader near you as a Dark Spirit, with its own gear (Havel, Heysel, Hodrick and the rest of the known set). The game announces the invasion, with the sender's name if you want.",
             "arguments": [
                 { "name": "npcParamIds", "type": "string", "label": "NPC ids", "hint": "Optional. Comma-separated NpcParam ids. Empty picks a random known invader.", "defaultText": "" },
+                { "name": "useSenderName", "type": "bool", "label": "Name the sender in the invasion message", "hint": "On: the message names whoever triggered it. Off: it names the NPC. The name on lock-on is always the NPC's own.", "default": 1, "min": 0, "max": 1 },
                 { "name": "thinkParamId", "type": "int", "label": "AI row", "hint": "Optional. 0 picks the invader's own AI. Another NpcThinkParam id forces that AI.", "default": 0, "min": 0, "max": 99999999 }
             ]
         },
@@ -5172,7 +5345,7 @@ mod tests {
         weapon_infusion, weapon_level, WeaponTrait, with_no_damage_bit, without_bits,
         attunement_slots, magic_entry, pick_attunement, pyromancies_available, Firestarter, SpellRequirement,
         ended_prefix, choose_invader_ids, known_invader_name, parse_npc_param_ids, think_for_invader,
-        clear_entity_ids,
+        clear_entity_ids, name_units, MESSAGE_NAME_LENGTH,
     };
 
     #[test]
@@ -5192,6 +5365,16 @@ mod tests {
         assert_eq!(think_for_invader(27_700, 200, 100, &thinks), Some(100));
         assert_eq!(think_for_invader(27_700, 200, 0, &thinks), Some(200));
         assert_eq!(think_for_invader(27_700, 0, 0, &thinks), None);
+    }
+
+    #[test]
+    fn a_viewer_name_is_cut_to_fit_without_splitting_a_character() {
+        assert_eq!(name_units("Viewer", MESSAGE_NAME_LENGTH), "Viewer".encode_utf16().collect::<Vec<u16>>());
+        assert_eq!(name_units("a_very_long_twitch_name", 16).len(), 16);
+        assert_eq!(name_units("a_very_long_twitch_name", MESSAGE_NAME_LENGTH).len(), 23);
+        // An emoji takes two units. Fifteen letters leave room for one unit only, so it is dropped.
+        assert_eq!(name_units("abcdefghijklmno\u{1F525}", 16).len(), 15);
+        assert_eq!(name_units("line\nbreak", MESSAGE_NAME_LENGTH).len(), 9);
     }
 
     #[test]
