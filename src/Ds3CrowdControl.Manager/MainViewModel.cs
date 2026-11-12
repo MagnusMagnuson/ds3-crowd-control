@@ -298,8 +298,10 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("Random Armor", "random_armor"),
                 _catalog.EnsurePreset("Temporary Armor", "temporary_armor"),
                 _catalog.EnsurePreset("Bombardier", "bombardier"),
+                _catalog.EnsurePreset("Firestarter", "firestarter"),
                 _catalog.EnsurePreset("Shuffle Stats", "shuffle_stats"),
                 _catalog.EnsurePreset("Spawn Random Enemy", "spawn_random_enemy"),
+                _catalog.EnsurePreset("Spawn NPC Invader", "spawn_npc_invader"),
                 _catalog.EnsurePreset("Oversaturate", "oversaturate"),
                 _catalog.EnsurePreset("Blind", "blind"),
                 _catalog.EnsurePreset("Freeze", "freeze"),
@@ -521,6 +523,14 @@ public partial class MainViewModel : ObservableObject
         {
             AddLog($"Could not save manager settings: {exception.Message}");
         }
+    }
+
+    [RelayCommand]
+    private async Task LaunchGameAsync()
+    {
+        var (_, message) = await Task.Run(GameInjector.Launch);
+        AddLog(message);
+        Status = message;
     }
 
     [RelayCommand]

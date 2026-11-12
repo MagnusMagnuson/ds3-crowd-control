@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace Ds3CrowdControl.Core;
 
@@ -65,7 +66,7 @@ public sealed class EffectQueue
             return new EffectResult("", EffectStatus.Unavailable, UnsafeReason(_bridge.State));
         }
 
-        var args = ResolveArguments(preset);
+        var args = WithViewer(ResolveArguments(preset), source);
         using var entry = new Entry(preset.Name, source, cancellationToken);
         Add(entry);
         EffectResult result;
@@ -311,6 +312,16 @@ public sealed class EffectQueue
         }
 
         return JsonSerializer.SerializeToElement(merged);
+    }
+
+    /// <summary>Every effect gets the redeemer or Test name, so handlers can show it in-game.</summary>
+    public static JsonElement WithViewer(JsonElement args, string source)
+    {
+        var node = args.ValueKind == JsonValueKind.Object
+            ? JsonNode.Parse(args.GetRawText())!.AsObject()
+            : new JsonObject();
+        node["viewer"] = Who(source);
+        return JsonSerializer.SerializeToElement(node);
     }
 
     private sealed class Entry(string name, string source, CancellationToken callerToken) : IDisposable

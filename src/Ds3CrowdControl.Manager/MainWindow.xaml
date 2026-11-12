@@ -48,7 +48,10 @@
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel MaxWidth="640" HorizontalAlignment="Left" Width="640">
                         <TextBlock Text="Game" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
-                        <Button Content="Attach to Dark Souls III" Command="{Binding AttachCommand}" Padding="12,6" HorizontalAlignment="Left" Margin="0,0,0,16" />
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                            <Button Content="Launch Dark Souls III" Command="{Binding LaunchGameCommand}" Padding="12,6" Margin="0,0,8,0" />
+                            <Button Content="Attach to Dark Souls III" Command="{Binding AttachCommand}" Padding="12,6" />
+                        </StackPanel>
 
                         <TextBlock Text="Twitch" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
                         <TextBlock Text="{Binding TwitchStatus}" Margin="0,0,0,8" Foreground="#F3F3F3" />

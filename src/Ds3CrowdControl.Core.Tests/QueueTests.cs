@@ -86,6 +86,7 @@ public class CatalogTests
         Assert.Equal(50, halfHealth.Arguments["percent"].GetInt32());
         Assert.Contains(loaded.Presets, preset => preset.HandlerId == "set_health_random_percent");
         Assert.Contains(loaded.Presets, preset => preset.HandlerId == "spawn_random_enemy");
+        Assert.Contains(loaded.Presets, preset => preset.Name == "Spawn NPC Invader" && preset.HandlerId == "spawn_npc_invader");
         var shuffle = loaded.Presets.Single(preset => preset.Name == "Shuffle Stats" && preset.HandlerId == "shuffle_stats");
         Assert.Equal(0, shuffle.Arguments["seconds"].GetInt32());
         var freeze = loaded.Presets.Single(preset => preset.Name == "Freeze" && preset.HandlerId == "freeze");
@@ -94,9 +95,21 @@ public class CatalogTests
         Assert.Equal(30, pacifist.Arguments["seconds"].GetInt32());
         var bombardier = loaded.Presets.Single(preset => preset.Name == "Bombardier" && preset.HandlerId == "bombardier");
         Assert.Equal(60, bombardier.Arguments["seconds"].GetInt32());
+        var firestarter = loaded.Presets.Single(preset => preset.Name == "Firestarter" && preset.HandlerId == "firestarter");
+        Assert.Equal(300, firestarter.Arguments["seconds"].GetInt32());
         var souls = loaded.Presets.Single(preset => preset.HandlerId == "adjust_souls");
         Assert.Equal(-100, souls.Arguments["delta"].GetInt32());
         Assert.Equal(0, souls.Arguments["scaleWithLevel"].GetInt32());
+    }
+
+    [Fact]
+    public void Viewer_name_is_added_to_effect_args()
+    {
+        var args = JsonSerializer.SerializeToElement(new { seconds = 30 });
+        var withViewer = EffectQueue.WithViewer(args, "twitch:AshenOne");
+        Assert.Equal("AshenOne", withViewer.GetProperty("viewer").GetString());
+        Assert.Equal(30, withViewer.GetProperty("seconds").GetInt32());
+        Assert.Equal("Test", EffectQueue.WithViewer(args, "manual").GetProperty("viewer").GetString());
     }
 
     [Fact]

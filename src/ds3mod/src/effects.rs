@@ -100,6 +100,10 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(60);
             game::bombardier(seconds.clamp(5, 600) as i32)
         }
+        "firestarter" => {
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(300);
+            game::firestarter(seconds.clamp(5, 600) as i32)
+        }
         "shuffle_stats" => {
             let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(0);
             game::shuffle_stats(seconds.clamp(0, 600) as i32)
@@ -139,6 +143,12 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             let replace_oldest = args.get("replaceOldest").and_then(Value::as_i64).unwrap_or(1) != 0;
             let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(5).clamp(1, 16) as usize;
             game::spawn_random_enemy(amount.clamp(1, 10) as i32, whole_game, bosses, only_bosses, replace_oldest, limit)
+        }
+        "spawn_npc_invader" => {
+            let viewer = args.get("viewer").and_then(Value::as_str).unwrap_or("");
+            let ids = args.get("npcParamIds").and_then(Value::as_str).unwrap_or("");
+            let think = args.get("thinkParamId").and_then(Value::as_i64).unwrap_or(0);
+            game::spawn_npc_invader(viewer, ids, think.clamp(0, 99_999_999) as u32)
         }
         "dump_player_data" => {
             let soul_count = args.get("soulCount").and_then(Value::as_i64).unwrap_or(0);

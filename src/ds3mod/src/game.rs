@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use darksouls3::app_menu::NewMenuSystem;
 use darksouls3::param::{
-    EQUIP_PARAM_PROTECTOR_ST, EQUIP_PARAM_WEAPON_ST, NPC_PARAM_ST, NPC_THINK_PARAM_ST,
-    REINFORCE_PARAM_WEAPON_ST,
+    CHARACTER_INIT_PARAM, EQUIP_PARAM_PROTECTOR_ST, EQUIP_PARAM_WEAPON_ST, MAGIC_PARAM_ST, NPC_PARAM_ST,
+    NPC_THINK_PARAM_ST, REINFORCE_PARAM_WEAPON_ST,
 };
 use darksouls3::sprj::{
     CSRegulationManager, GameDataMan, ItemCategory, ItemId, MenuMan, PlayerGameData, PlayerInfo, PlayerIns,
@@ -57,6 +57,21 @@ const REMOVE_ITEM_PATTERN: &str =
 /// Debug creator entry used by the 1.15.2 character spawner. edx 1 creates and edx 2 deletes.
 const CREATE_NPC_PATTERN: &str =
     "48 83 EC ?? FF CA 74 ?? FF CA 74 ?? FF CA 75 ?? 48 8B 0D ?? ?? ?? ?? 48 85 C9";
+/// Free attunement slots: `(equip magic data, null)`. Reads only. It is the stat table plus
+/// ring bonuses minus the slot length of every attuned spell.
+const FREE_ATTUNE_SLOTS_PATTERN: &str =
+    "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B 5B 10 8B F0 33 C0 48 85 DB 74 ?? 48 8B 9B 18 03 00 00";
+/// The game's own factory for a character a map places: `(_, memory or 0, set entry, block
+/// number, map data, enemy index)`. When the map entry has a CharaInit id above 0 it builds
+/// a player-type NPC with gear, a face and the human AI. The debug creator cannot do that:
+/// it only ever builds enemy objects, and an enemy object with the player body is an
+/// invisible shell that just walks.
+const MAP_CHR_FACTORY_PATTERN: &str =
+    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 41 56 41 57 48 83 EC 40 8B BC 24 88 00 00 00 48 8B 9C 24 80 00 00 00 49 8B E8 4C 8B F2 4C 8B F9 44 8B C7 48 8B CB BA 02 00 00 00 41 8B F1 E8";
+/// Runs after the factory: `(_, chr, block number, map data, enemy index)`. It gives a
+/// player-type NPC its NPC row, puts it at the entry's position and finishes it.
+const MAP_CHR_PLACE_PATTERN: &str =
+    "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 83 EC 20 41 8B E8 44 8B 44 24 50 48 8B DA BA 02 00 00 00 49 8B C9 49 8B F1 E8";
 /// WorldChrMan field that points at the debug character creator.
 const DEBUG_CHR_CREATOR: usize = 0x3018;
 const CREATOR_THINK_ID: usize = 0x124;
@@ -94,6 +109,9 @@ struct Located {
     find_item: Result<usize, String>,
     remove_item: Result<usize, String>,
     create_npc: Result<usize, String>,
+    free_attune_slots: Result<usize, String>,
+    map_chr_factory: Result<usize, String>,
+    map_chr_place: Result<usize, String>,
 }
 
 #[derive(Clone, Copy)]
@@ -118,9 +136,12 @@ pub fn prepare() {
             find_item: find_unique(FIND_ITEM_PATTERN),
             remove_item: find_unique(REMOVE_ITEM_PATTERN),
             create_npc: find_unique(CREATE_NPC_PATTERN),
+            free_attune_slots: find_unique(FREE_ATTUNE_SLOTS_PATTERN),
+            map_chr_factory: find_unique(MAP_CHR_FACTORY_PATTERN),
+            map_chr_place: find_unique(MAP_CHR_PLACE_PATTERN),
         };
         crate::log::log(format!(
-            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={} spawn={}",
+            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={} spawn={} attune={} invader={}",
             located.game_man_slot.is_ok(),
             located.add_soul.is_ok(),
             located.set_text_effect.is_ok(),
@@ -128,6 +149,8 @@ pub fn prepare() {
             located.save_request.is_ok(),
             located.equip_item.is_ok() && located.find_item.is_ok() && located.remove_item.is_ok(),
             located.create_npc.is_ok(),
+            located.free_attune_slots.is_ok(),
+            located.map_chr_factory.is_ok() && located.map_chr_place.is_ok(),
         ));
         located
     });
@@ -1077,8 +1100,49 @@ pub fn poll_speed_changes() {
 
 /// Just above zero, so the animation update never sees a frame time of nothing.
 const FROZEN_SPEED: f32 = 0.001;
+/// Character byte the hit test rejects on. Bit 7 is the Invuln flag.
+const INVULN_FLAG_OFFSET: usize = 0x1A09;
+const INVULN_BIT: u8 = 0x80;
+/// First module in the container. Its state qword is what the hit test reads.
+const ACTION_MODULE_OFFSET: usize = 0;
+const ACTION_HIT_STATE_OFFSET: usize = 0x58;
+/// Bits 0 and 1 of that byte also make the hit test reject the player.
+const ACTION_NO_HIT_BITS: u8 = 0b0000_0011;
 
 static FREEZE_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+pub fn without_bits(value: u8, mask: u8) -> u8 {
+    value & !mask
+}
+
+fn clear_bits(address: usize, mask: u8) {
+    if address < 0x10_000 {
+        return;
+    }
+    unsafe {
+        let flag = address as *mut u8;
+        let current = flag.read();
+        let next = without_bits(current, mask);
+        if next != current {
+            flag.write(next);
+        }
+    }
+}
+
+/// A hit can raise the short "don't hit me again" flags. Their off switch waits on
+/// the animation clock, which Freeze has stopped, so turn them off directly.
+fn clear_stuck_hit_blocks(player: usize) {
+    clear_bits(player + INVULN_FLAG_OFFSET, INVULN_BIT);
+    let modules = unsafe { ((player + MODULES_OFFSET) as *const usize).read() };
+    if modules < 0x10_000 {
+        return;
+    }
+    let action = unsafe { (modules as *const usize).add(ACTION_MODULE_OFFSET).read() };
+    if action < 0x10_000 {
+        return;
+    }
+    clear_bits(action + ACTION_HIT_STATE_OFFSET, ACTION_NO_HIT_BITS);
+}
 
 pub fn freeze(seconds: i32) -> Result<String, String> {
     let player = unsafe { &mut *local_player()? };
@@ -1112,7 +1176,9 @@ pub fn poll_freeze() {
         let finished = now >= until || !alive || fake_death || load_screen_open();
         if !finished {
             if let Ok(player) = player {
-                apply_speed_for_animation(player as usize, FROZEN_SPEED, FROZEN_SPEED, now);
+                let player = player as usize;
+                apply_speed_for_animation(player, FROZEN_SPEED, FROZEN_SPEED, now);
+                clear_stuck_hit_blocks(player);
             }
             return;
         }
@@ -1416,18 +1482,21 @@ fn choose_weapon(options: &WeaponOptions, current: u32, stats: [u32; 4]) -> Resu
     let row = weapons
         .get(u64::from(variant))
         .ok_or_else(|| format!("weapon {variant} disappeared from the game data"))?;
-    let reinforce = regulation.get_param::<REINFORCE_PARAM_WEAPON_ST>();
-    let reinforce_type = u64::from(row.reinforce_type_id().max(0) as u16);
-    let max_level = (1..=MAX_WEAPON_LEVEL)
-        .take_while(|level| reinforce.get(reinforce_type + u64::from(*level)).is_some())
-        .count() as u32;
     let level = pick_level(
         options.level,
-        max_level,
+        max_weapon_level(regulation, row),
         weapon_level(current),
         random_index(MAX_WEAPON_LEVEL as usize + 1),
     );
     Ok((variant + level, candidates.len()))
+}
+
+fn max_weapon_level(regulation: &CSRegulationManager, row: &EQUIP_PARAM_WEAPON_ST) -> u32 {
+    let reinforce = regulation.get_param::<REINFORCE_PARAM_WEAPON_ST>();
+    let reinforce_type = u64::from(row.reinforce_type_id().max(0) as u16);
+    (1..=MAX_WEAPON_LEVEL)
+        .take_while(|level| reinforce.get(reinforce_type + u64::from(*level)).is_some())
+        .count() as u32
 }
 
 /// Calls the menu routine for `slot`. A negative `index` empties the slot.
@@ -1722,8 +1791,8 @@ pub fn random_armor(options: ArmorOptions) -> Result<String, String> {
     if player.super_chr_ins.modules.data.hp <= 0 {
         return Err("the local player is dead".to_string());
     }
-    if pending().bombardier.is_some() {
-        return Err(BOMBARDIER_ACTIVE.to_string());
+    if let Some(active) = pending().gear_event() {
+        return Err(active.to_string());
     }
     let roll = roll_armor(player, options.style, options.include_missing_dlc)?;
 
@@ -1763,17 +1832,29 @@ const OTHER_CHARACTER_WAITING: &str = "another character is still waiting to get
 struct PendingRestores {
     armor: Option<TemporaryArmor>,
     bombardier: Option<Bombardier>,
+    firestarter: Option<Firestarter>,
     stats: Option<ShuffledStats>,
 }
 
 impl PendingRestores {
     fn is_empty(&self) -> bool {
-        self.armor.is_none() && self.bombardier.is_none() && self.stats.is_none()
+        self.armor.is_none() && self.bombardier.is_none() && self.firestarter.is_none() && self.stats.is_none()
+    }
+
+    /// Bombardier and Firestarter both take the weapons and armor slots.
+    fn gear_event(&self) -> Option<&'static str> {
+        if self.bombardier.is_some() {
+            Some(BOMBARDIER_ACTIVE)
+        } else if self.firestarter.is_some() {
+            Some(FIRESTARTER_ACTIVE)
+        } else {
+            None
+        }
     }
 }
 
 static PENDING: Mutex<PendingRestores> =
-    Mutex::new(PendingRestores { armor: None, bombardier: None, stats: None });
+    Mutex::new(PendingRestores { armor: None, bombardier: None, firestarter: None, stats: None });
 
 fn pending() -> MutexGuard<'static, PendingRestores> {
     PENDING.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -1837,8 +1918,8 @@ pub fn temporary_armor(
     let until = unix_now() + seconds.max(0) as u64;
     let character = read_character().1;
     let mut slot = pending();
-    if slot.bombardier.is_some() {
-        return Err(BOMBARDIER_ACTIVE.to_string());
+    if let Some(active) = slot.gear_event() {
+        return Err(active.to_string());
     }
     if let Some(active) = slot.armor.as_mut() {
         if active.character != character {
@@ -2037,9 +2118,9 @@ fn set_stack(pgd: *mut PlayerGameData, count: u32) -> Result<(), String> {
 }
 
 /// Wears the set, and returns what each slot needs to get its own armor back.
-fn wear_bombardier_armor(player: &mut PlayerIns) -> Vec<ArmorSwap> {
+fn wear_armor_set(player: &mut PlayerIns, set: [u32; 4], event: &str) -> Vec<ArmorSwap> {
     let mut swaps = Vec::new();
-    for (slot, piece) in ARMOR_SLOTS.into_iter().zip(BOMBARDIER_ARMOR) {
+    for (slot, piece) in ARMOR_SLOTS.into_iter().zip(set) {
         let equipment = unsafe { &player.player_game_data.as_ref().equipment };
         let old_index = equipment.equipment_indexes[slot as usize];
         let old_id = u32::try_from(old_index)
@@ -2055,7 +2136,7 @@ fn wear_bombardier_armor(player: &mut PlayerIns) -> Vec<ArmorSwap> {
             .and_then(|item| give_and_equip(player, item, slot));
         match equipped {
             Ok(_) => swaps.push(ArmorSwap { slot, old_index, old_id, owned_before, piece }),
-            Err(error) => crate::log::log(format!("Bombardier: armor slot {slot} failed: {error}")),
+            Err(error) => crate::log::log(format!("{event}: armor slot {slot} failed: {error}")),
         }
     }
     swaps
@@ -2083,6 +2164,7 @@ pub fn bombardier(seconds: i32) -> Result<String, String> {
         save_pending(&slot);
         return Ok(format!("Bombardier extended to at least {seconds} more seconds"));
     }
+    let ended = end_other_gear_swaps(&mut slot, player, &character)?;
 
     let quick_items = (0..QUICK_ITEM_COUNT)
         .map(|quick_slot| quick_item_id(pgd, quick_slot))
@@ -2117,9 +2199,7 @@ pub fn bombardier(seconds: i32) -> Result<String, String> {
         call_equip(player, weapon_slot, -1)?;
         weapons.push(RemovedWeapon { slot: weapon_slot, index, weapon });
     }
-    // Temporary Armor already remembers the player's own armor, so a second swap on top
-    // of it could lose track of what goes back.
-    let armor = if slot.armor.is_some() { Vec::new() } else { wear_bombardier_armor(player) };
+    let armor = wear_armor_set(player, BOMBARDIER_ARMOR, "Bombardier");
     let removed = weapons.len();
     slot.bombardier = Some(Bombardier {
         until,
@@ -2140,7 +2220,8 @@ pub fn bombardier(seconds: i32) -> Result<String, String> {
     equip_quick_item(player, quick_slot, bomb_index, BLACK_FIREBOMB_SLOT_VALUE)?;
     write_i32(pgd, SELECTED_QUICK_SLOT_OFFSET, quick_slot as i32)?;
     Ok(format!(
-        "Bombardier for {seconds} seconds: {removed} weapons removed, quick slot {quick_slot} holds {} bombs",
+        "{}Bombardier for {seconds} seconds: {removed} weapons removed, quick slot {quick_slot} holds {} bombs",
+        ended_prefix(&ended),
         item_quantity(pgd, BLACK_FIREBOMB_SLOT_VALUE).unwrap_or(0),
     ))
 }
@@ -2294,6 +2375,556 @@ pub fn poll_bombardier() {
     }));
 }
 
+const PYROMANCY_FLAME: u32 = 13_400_000;
+/// The Fire Witch Set, in [ARMOR_SLOTS] order.
+const FIRESTARTER_ARMOR: [u32; 4] = [60_000_000, 60_001_000, 60_002_000, 60_003_000];
+const FIRESTARTER_ACTIVE: &str = "Firestarter is using the weapon and armor slots";
+/// Goods and MagicParam rows share these ids. Combustion and Dark Orb are cut content.
+/// Carthus Flame Arc is left out because it only buffs a weapon, and the flame cannot take buffs.
+const BASE_PYROMANCIES: [u32; 26] = [
+    2_400_000, 2_402_000, 2_403_000, 2_405_000, 2_407_000, 2_411_000, 2_420_000, 2_421_000,
+    2_422_000, 2_430_000, 2_431_000, 2_436_000, 2_440_000, 2_450_000, 2_451_000,
+    2_452_000, 2_453_000, 2_455_000, 2_456_000, 2_470_000, 2_562_000, 2_610_000, 2_620_000,
+    2_630_000, 2_640_000, 2_650_000,
+];
+const ASHES_OF_ARIANDEL_PYROMANCIES: [u32; 1] = [2_457_000];
+const RINGED_CITY_PYROMANCIES: [u32; 2] = [2_458_000, 2_660_000];
+/// PlayerGameData field that points at the attuned spells.
+const EQUIP_MAGIC_OFFSET: usize = 0x470;
+/// Each entry is the MagicParam id, then a cast count left over from older games.
+const MAGIC_ENTRIES_OFFSET: usize = 0x18;
+const MAGIC_ENTRY_COUNT: usize = 14;
+const MAGIC_SELECTED_OFFSET: usize = 0x88;
+/// What the game writes into a slot it empties: id -1, count 0.
+const EMPTY_MAGIC_ENTRY: u64 = 0xFFFF_FFFF;
+
+#[derive(Deserialize, Serialize)]
+struct SpellRequirement {
+    spell: u32,
+    intelligence: u8,
+    faith: u8,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Firestarter {
+    until: u64,
+    character: String,
+    weapons: Vec<RemovedWeapon>,
+    armor: Vec<ArmorSwap>,
+    flame: u32,
+    flame_index: i32,
+    /// Copies of `flame` before it was given, because only the extra copy goes at the end.
+    flames_before: u32,
+    spells: Vec<u32>,
+    spells_given: Vec<u32>,
+    /// None when the attuned spells could not be changed, so nothing is written back.
+    attuned_before: Option<Vec<u64>>,
+    selected_before: i32,
+    requirements: Vec<SpellRequirement>,
+    #[serde(skip)]
+    weapons_changed: bool,
+}
+
+pub fn pyromancies_available(ashes_installed: bool, ringed_city_installed: bool) -> Vec<u32> {
+    let mut spells = BASE_PYROMANCIES.to_vec();
+    if ashes_installed {
+        spells.extend(ASHES_OF_ARIANDEL_PYROMANCIES);
+    }
+    if ringed_city_installed {
+        spells.extend(RINGED_CITY_PYROMANCIES);
+    }
+    spells
+}
+
+/// The entry the game's own attune routine writes: a count of three per use in the
+/// param, or -1 when the param has none.
+pub fn magic_entry(spell: u32, max_quantity: i16) -> u64 {
+    let count = if max_quantity == -1 { -1 } else { i32::from(max_quantity) * 3 };
+    u64::from(spell) | (u64::from(count as u32) << 32)
+}
+
+/// Takes spells in order while their slot lengths fit, at most one per entry.
+pub fn pick_attunement(spells: &[(u32, u8)], free_slots: u32) -> Vec<u32> {
+    let mut left = free_slots;
+    let mut chosen = Vec::new();
+    for (spell, length) in spells {
+        if chosen.len() == MAGIC_ENTRY_COUNT {
+            break;
+        }
+        let length = u32::from(*length);
+        if length <= left {
+            left -= length;
+            chosen.push(*spell);
+        }
+    }
+    chosen
+}
+
+/// The game's attunement table, used if its own routine cannot be found. Ring bonuses
+/// are not counted here.
+pub fn attunement_slots(attunement: u32) -> u32 {
+    match attunement {
+        0..=9 => 0,
+        10..=13 => 1,
+        14..=17 => 2,
+        18..=23 => 3,
+        24..=29 => 4,
+        30..=39 => 5,
+        40..=49 => 6,
+        50..=59 => 7,
+        60..=79 => 8,
+        80..=98 => 9,
+        _ => 10,
+    }
+}
+
+fn count_owned(player: &PlayerIns, category: ItemCategory, param: u32) -> u32 {
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    equipment
+        .equip_inventory_data
+        .items_data
+        .items()
+        .filter(|entry| entry.item_id.category() as u32 == category as u32 && entry.item_id.param_id() == param)
+        .count() as u32
+}
+
+fn equipped_weapon(player: &PlayerIns, slot: u32) -> Option<(i32, u32)> {
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    let index = equipment.equipment_indexes[slot as usize];
+    u32::try_from(index)
+        .ok()
+        .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+        .map(|entry| (index, entry.item_id.param_id()))
+}
+
+fn random_flame() -> Result<u32, String> {
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the weapon list is unavailable: {error:?}"))?;
+    let row = regulation
+        .get_param::<EQUIP_PARAM_WEAPON_ST>()
+        .get(u64::from(PYROMANCY_FLAME))
+        .ok_or("the Pyromancy Flame is missing from the game data")?;
+    let max_level = max_weapon_level(regulation, row);
+    Ok(PYROMANCY_FLAME + random_index(max_level as usize + 1) as u32)
+}
+
+fn equip_magic(pgd: *mut PlayerGameData) -> Result<usize, String> {
+    if pgd.is_null() {
+        return Err("player data is missing".to_string());
+    }
+    let magic = read_usize_checked(pgd as usize + EQUIP_MAGIC_OFFSET)?;
+    if magic < 0x10_000 {
+        return Err("the attuned spells are missing".to_string());
+    }
+    Ok(magic)
+}
+
+fn read_attuned(magic: usize) -> Result<Vec<u64>, String> {
+    (0..MAGIC_ENTRY_COUNT)
+        .map(|entry| {
+            let mut bytes = [0u8; 8];
+            let address = magic + MAGIC_ENTRIES_OFFSET + entry * 8;
+            if copy_readable(address, &mut bytes) != 8 {
+                return Err(format!("attuned spell {entry} is not readable"));
+            }
+            Ok(u64::from_ne_bytes(bytes))
+        })
+        .collect()
+}
+
+fn write_attuned(magic: usize, entries: &[u64], selected: i32) -> Result<(), String> {
+    for (entry, value) in entries.iter().enumerate().take(MAGIC_ENTRY_COUNT) {
+        write_bytes_checked(magic + MAGIC_ENTRIES_OFFSET + entry * 8, &value.to_ne_bytes())?;
+    }
+    write_i32_checked(magic + MAGIC_SELECTED_OFFSET, selected)
+}
+
+fn free_attune_slots(player: &PlayerIns, magic: usize) -> u32 {
+    let routine = cached().ok().and_then(|located| located.free_attune_slots.as_ref().ok().copied());
+    match routine {
+        Some(address) => {
+            let free: extern "C" fn(usize, usize) -> i32 = unsafe { std::mem::transmute(address) };
+            free(magic, 0).max(0) as u32
+        }
+        None => attunement_slots(unsafe { player.player_game_data.as_ref() }.player_info.attunement),
+    }
+}
+
+/// Swaps the attuned spells for as many of `spells` as fit, in random order.
+fn attune_pyromancies(player: &PlayerIns, magic: usize, spells: &[u32]) -> Result<usize, String> {
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the spell list is unavailable: {error:?}"))?;
+    let params = regulation.get_param::<MAGIC_PARAM_ST>();
+    let mut candidates: Vec<(u32, u8, i16)> = spells
+        .iter()
+        .filter_map(|spell| params.get(u64::from(*spell)).map(|row| (*spell, row.slot_length(), row.max_quantity())))
+        .collect();
+    for last in (1..candidates.len()).rev() {
+        candidates.swap(last, random_index(last + 1));
+    }
+
+    write_attuned(magic, &[EMPTY_MAGIC_ENTRY; MAGIC_ENTRY_COUNT], 0)?;
+    let free = free_attune_slots(player, magic);
+    let lengths: Vec<(u32, u8)> = candidates.iter().map(|(spell, length, _)| (*spell, *length)).collect();
+    let chosen = pick_attunement(&lengths, free);
+    let mut entries = [EMPTY_MAGIC_ENTRY; MAGIC_ENTRY_COUNT];
+    for (entry, spell) in entries.iter_mut().zip(&chosen) {
+        let max_quantity = candidates.iter().find(|(id, _, _)| id == spell).map_or(-1, |(_, _, quantity)| *quantity);
+        *entry = magic_entry(*spell, max_quantity);
+    }
+    write_attuned(magic, &entries, 0)?;
+    Ok(chosen.len())
+}
+
+/// Zeroes the intelligence and faith requirements. Returns the values it replaced, or
+/// nothing when `remember` is off, which is how they are kept at zero after a restart.
+fn lift_requirements(spells: &[u32], remember: bool) -> Vec<SpellRequirement> {
+    let Ok(regulation) = (unsafe { CSRegulationManager::instance_mut() }) else {
+        return Vec::new();
+    };
+    let params = regulation.get_mut_param::<MAGIC_PARAM_ST>();
+    let mut lifted = Vec::new();
+    for spell in spells {
+        let Some(row) = params.get_mut(u64::from(*spell)) else {
+            continue;
+        };
+        if row.requirement_intellect() == 0 && row.requirement_faith() == 0 {
+            continue;
+        }
+        if remember {
+            lifted.push(SpellRequirement {
+                spell: *spell,
+                intelligence: row.requirement_intellect(),
+                faith: row.requirement_faith(),
+            });
+        }
+        row.set_requirement_intellect(0);
+        row.set_requirement_faith(0);
+    }
+    lifted
+}
+
+fn restore_requirements(requirements: &[SpellRequirement]) {
+    let Ok(regulation) = (unsafe { CSRegulationManager::instance_mut() }) else {
+        return;
+    };
+    let params = regulation.get_mut_param::<MAGIC_PARAM_ST>();
+    for requirement in requirements {
+        if let Some(row) = params.get_mut(u64::from(requirement.spell)) {
+            row.set_requirement_intellect(requirement.intelligence);
+            row.set_requirement_faith(requirement.faith);
+        }
+    }
+}
+
+/// Takes every real weapon out of the hands. Returns them so they can go back.
+fn take_weapons(player: &mut PlayerIns) -> Result<Vec<RemovedWeapon>, String> {
+    let mut weapons = Vec::new();
+    for weapon_slot in WEAPON_SLOTS {
+        let Some((index, weapon)) = equipped_weapon(player, weapon_slot) else {
+            continue;
+        };
+        if !is_removable_weapon(weapon) {
+            continue;
+        }
+        call_equip(player, weapon_slot, -1)?;
+        weapons.push(RemovedWeapon { slot: weapon_slot, index, weapon });
+    }
+    Ok(weapons)
+}
+
+fn put_weapons_back(player: &mut PlayerIns, weapons: &[RemovedWeapon], event: &str) {
+    for removed in weapons {
+        let result = match current_index(player, ItemCategory::Weapon, removed.weapon, removed.index) {
+            Some(index) => call_equip(player, removed.slot, index),
+            None => Err(format!("weapon {} is no longer owned", removed.weapon)),
+        };
+        if let Err(error) = result {
+            crate::log::log(format!("{event}: weapon slot {} restore failed: {error}", removed.slot));
+        }
+    }
+}
+
+/// Ends Temporary Armor, Bombardier and Firestarter right away, so a new Bombardier or
+/// Firestarter starts from the player's own gear. Returns the names of what was ended.
+fn end_other_gear_swaps(
+    slot: &mut PendingRestores,
+    player: &mut PlayerIns,
+    character: &str,
+) -> Result<Vec<&'static str>, String> {
+    let owners = [
+        slot.armor.as_ref().map(|active| &active.character),
+        slot.bombardier.as_ref().map(|active| &active.character),
+        slot.firestarter.as_ref().map(|active| &active.character),
+    ];
+    if owners.into_iter().flatten().any(|owner| owner != character) {
+        return Err(OTHER_CHARACTER_WAITING.to_string());
+    }
+    let mut ended = Vec::new();
+    if let Some(active) = slot.armor.take() {
+        for swap in &active.swaps {
+            if let Err(error) = restore_armor_slot(player, swap) {
+                crate::log::log(format!("temporary armor slot {} restore failed: {error}", swap.slot));
+            }
+        }
+        ended.push("Temporary Armor");
+    }
+    if let Some(active) = slot.bombardier.take() {
+        if let Err(error) = end_bombardier(player, &active) {
+            crate::log::log(format!("Bombardier restore failed: {error}"));
+        }
+        ended.push("Bombardier");
+    }
+    if let Some(active) = slot.firestarter.take() {
+        if let Err(error) = end_firestarter(player, &active) {
+            crate::log::log(format!("Firestarter restore failed: {error}"));
+        }
+        ended.push("Firestarter");
+    }
+    if !ended.is_empty() {
+        save_pending(slot);
+    }
+    Ok(ended)
+}
+
+pub fn ended_prefix(ended: &[&str]) -> String {
+    if ended.is_empty() {
+        String::new()
+    } else {
+        format!("ended {}, then ", ended.join(" and "))
+    }
+}
+
+pub fn firestarter(seconds: i32) -> Result<String, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let until = unix_now() + seconds as u64;
+    let character = read_character().1;
+    let mut slot = pending();
+    if let Some(active) = slot.firestarter.as_mut() {
+        if active.character != character {
+            return Err(OTHER_CHARACTER_WAITING.to_string());
+        }
+        active.until = active.until.max(until);
+        save_pending(&slot);
+        return Ok(format!("Firestarter extended to at least {seconds} more seconds"));
+    }
+    let ended = end_other_gear_swaps(&mut slot, player, &character)?;
+
+    let flame = random_flame()?;
+    let flame_item = ItemId::new(ItemCategory::Weapon, flame)
+        .map_err(|error| format!("the Pyromancy Flame id is invalid: {error:?}"))?;
+    let weapons = take_weapons(player)?;
+    let flames_before = count_owned(player, ItemCategory::Weapon, flame);
+    let flame_index = match give_and_equip(player, flame_item, RIGHT_HAND_SLOT) {
+        Ok(index) => index,
+        Err(error) => {
+            put_weapons_back(player, &weapons, "Firestarter");
+            return Err(error);
+        }
+    };
+    let armor = wear_armor_set(player, FIRESTARTER_ARMOR, "Firestarter");
+
+    let (ashes, ringed_city) = unsafe { darksouls3::cs::CSDlc::instance() }
+        .map(|dlc| (dlc.dlc1_installed, dlc.dlc2_installed))
+        .unwrap_or((false, false));
+    let spells = pyromancies_available(ashes, ringed_city);
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    let mut spells_given = Vec::new();
+    for spell in &spells {
+        if count_owned(player, ItemCategory::Goods, *spell) > 0 {
+            continue;
+        }
+        match ItemId::new(ItemCategory::Goods, *spell) {
+            Ok(item) => {
+                game_data.give_item_directly(item, 1);
+                spells_given.push(*spell);
+            }
+            Err(error) => crate::log::log(format!("Firestarter: spell {spell} has an invalid id: {error:?}")),
+        }
+    }
+    let requirements = lift_requirements(&spells, true);
+
+    let pgd = player.player_game_data.as_ptr();
+    let mut attuned_before = None;
+    let mut selected_before = 0;
+    let mut attuned = 0;
+    let saved = equip_magic(pgd).and_then(|magic| {
+        Ok((magic, read_attuned(magic)?, read_u32_checked(magic + MAGIC_SELECTED_OFFSET)? as i32))
+    });
+    match saved {
+        Ok((magic, before, selected)) => match attune_pyromancies(player, magic, &spells) {
+            Ok(count) => {
+                attuned = count;
+                attuned_before = Some(before);
+                selected_before = selected;
+            }
+            Err(error) => {
+                crate::log::log(format!("Firestarter: attuning failed: {error}"));
+                let _ = write_attuned(magic, &before, selected);
+            }
+        },
+        Err(error) => crate::log::log(format!("Firestarter: attuned spells unavailable: {error}")),
+    }
+
+    let removed = weapons.len();
+    let given = spells_given.len();
+    slot.firestarter = Some(Firestarter {
+        until,
+        character,
+        weapons,
+        armor,
+        flame,
+        flame_index,
+        flames_before,
+        spells,
+        spells_given,
+        attuned_before,
+        selected_before,
+        requirements,
+        weapons_changed: false,
+    });
+    save_pending(&slot);
+    Ok(format!(
+        "{}Firestarter for {seconds} seconds: Pyromancy Flame +{}, {removed} weapons removed, {given} pyromancies given, {attuned} attuned",
+        ended_prefix(&ended),
+        weapon_level(flame),
+    ))
+}
+
+/// Anything equipped from the menu comes straight off, and the flame goes back into the
+/// right hand if it left. The first time, a weapon is remembered so it is not lost at the end.
+fn keep_flame_only(active: &mut Firestarter) {
+    let Ok(player) = local_player() else {
+        return;
+    };
+    let player = unsafe { &mut *player };
+    for weapon_slot in WEAPON_SLOTS {
+        let Some((index, weapon)) = equipped_weapon(player, weapon_slot) else {
+            continue;
+        };
+        if weapon == active.flame || !is_removable_weapon(weapon) {
+            continue;
+        }
+        if let Err(error) = call_equip(player, weapon_slot, -1) {
+            crate::log::log(format!("Firestarter: could not clear slot {weapon_slot}: {error}"));
+            continue;
+        }
+        if !active.weapons.iter().any(|removed| removed.slot == weapon_slot) {
+            active.weapons.push(RemovedWeapon { slot: weapon_slot, index, weapon });
+            active.weapons_changed = true;
+        }
+    }
+    if equipped_weapon(player, RIGHT_HAND_SLOT).is_some_and(|(_, weapon)| weapon == active.flame) {
+        return;
+    }
+    let index = match current_index(player, ItemCategory::Weapon, active.flame, active.flame_index) {
+        Some(index) => call_equip(player, RIGHT_HAND_SLOT, index).map(|_| index),
+        None => ItemId::new(ItemCategory::Weapon, active.flame)
+            .map_err(|error| format!("{error:?}"))
+            .and_then(|item| give_and_equip(player, item, RIGHT_HAND_SLOT)),
+    };
+    match index {
+        Ok(index) if index != active.flame_index => {
+            active.flame_index = index;
+            active.weapons_changed = true;
+        }
+        Ok(_) => {}
+        Err(error) => crate::log::log(format!("Firestarter: could not equip the flame again: {error}")),
+    }
+}
+
+fn end_firestarter(player: &mut PlayerIns, active: &Firestarter) -> Result<(), String> {
+    // The spells go back to the player's own while the given ones are still owned.
+    if let Some(before) = &active.attuned_before {
+        let pgd = player.player_game_data.as_ptr();
+        match equip_magic(pgd) {
+            Ok(magic) => write_attuned(magic, before, active.selected_before)?,
+            Err(error) => crate::log::log(format!("Firestarter: attuned spells not restored: {error}")),
+        }
+    }
+    restore_requirements(&active.requirements);
+
+    for weapon_slot in WEAPON_SLOTS {
+        if equipped_weapon(player, weapon_slot).is_some_and(|(_, weapon)| weapon == active.flame) {
+            call_equip(player, weapon_slot, -1)?;
+        }
+    }
+    put_weapons_back(player, &active.weapons, "Firestarter");
+    for swap in &active.armor {
+        if let Err(error) = restore_armor_slot(player, swap) {
+            crate::log::log(format!("Firestarter: armor slot {} restore failed: {error}", swap.slot));
+        }
+    }
+
+    // After a crash before a save the counts are unchanged, so nothing is removed.
+    if count_owned(player, ItemCategory::Weapon, active.flame) > active.flames_before {
+        if let Some(index) = current_index(player, ItemCategory::Weapon, active.flame, active.flame_index) {
+            remove_inventory_entry(player, index)?;
+        }
+    }
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    for spell in &active.spells_given {
+        if count_owned(player, ItemCategory::Goods, *spell) == 0 {
+            continue;
+        }
+        if let Ok(item) = ItemId::new(ItemCategory::Goods, *spell) {
+            game_data.remove_item(item, 1);
+        }
+    }
+    Ok(())
+}
+
+pub fn poll_firestarter() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = pending();
+        let Some(active) = slot.firestarter.as_mut() else {
+            return;
+        };
+        // A pending run from before a restart must not touch another character.
+        if !load_screen_open() && unix_now() < active.until && read_character().1 == active.character {
+            keep_flame_only(active);
+            // The params reload with the game, so after a restart they are lifted again.
+            lift_requirements(&active.spells, false);
+        }
+        if std::mem::take(&mut active.weapons_changed) {
+            save_pending(&slot);
+        }
+        let Some(active) = slot.firestarter.as_ref() else {
+            return;
+        };
+        if unix_now() < active.until {
+            return;
+        }
+        let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        let player = local_player();
+        let alive = player
+            .as_ref()
+            .is_ok_and(|player| unsafe { &**player }.super_chr_ins.modules.data.hp > 0);
+        if !can_restore_armor(load_screen_open(), player.is_ok(), alive, fake_death) {
+            return;
+        }
+        let (loaded, character) = read_character();
+        let Ok(player) = player else {
+            return;
+        };
+        if !loaded || character != active.character {
+            return;
+        }
+        let Some(active) = slot.firestarter.take() else {
+            return;
+        };
+        if let Err(error) = end_firestarter(unsafe { &mut *player }, &active) {
+            crate::log::log(format!("Firestarter restore failed: {error}"));
+        }
+        save_pending(&slot);
+    }));
+}
+
 const GEAR_SNAPSHOT_FILE: &str = "gear-snapshots.json";
 /// Seconds between gear snapshots.
 pub const GEAR_SNAPSHOT_EVERY: u64 = 300;
@@ -2361,7 +2992,7 @@ fn equipped_item(player: &PlayerIns, slot: u32) -> u32 {
 fn gear_snapshot_allowed(player: &PlayerIns) -> bool {
     let restores = pending();
     restores.armor.is_none()
-        && restores.bombardier.is_none()
+        && restores.gear_event().is_none()
         && player.super_chr_ins.modules.data.hp > 0
         && !load_screen_open()
         && FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_none()
@@ -2436,10 +3067,10 @@ pub fn restore_gear(slot: usize) -> Result<String, String> {
     // One lock for both checks: taking it twice in one expression would deadlock.
     let swapping = {
         let restores = pending();
-        restores.armor.is_some() || restores.bombardier.is_some()
+        restores.armor.is_some() || restores.gear_event().is_some()
     };
     if swapping {
-        return Err("a temporary armor or Bombardier swap is still active".to_string());
+        return Err("a temporary armor, Bombardier or Firestarter swap is still active".to_string());
     }
     let snapshots = load_gear_snapshots();
     let snapshot = snapshots
@@ -2612,8 +3243,8 @@ pub fn random_weapon(options: WeaponOptions) -> Result<String, String> {
     if player.super_chr_ins.modules.data.hp <= 0 {
         return Err("the local player is dead".to_string());
     }
-    if pending().bombardier.is_some() {
-        return Err("Bombardier has taken the weapons away".to_string());
+    if let Some(active) = pending().gear_event() {
+        return Err(active.to_string());
     }
     let player_data = unsafe { player.player_game_data.as_ref() };
     let info = &player_data.player_info;
@@ -2985,6 +3616,52 @@ fn debug_creator() -> Result<usize, String> {
 struct EnemyChoice {
     npc_id: u32,
     think_id: u32,
+    /// A human NPC invader. It is built as a player-type character, not through the debug
+    /// creator, and its CharaInit row has the same id as its NPC row.
+    invader: bool,
+}
+
+/// Named human invaders. Each has an NPC row and a CharaInit row (gear, stats, face) with
+/// the same id.
+const BASE_INVADERS: [(u32, &str); 10] = [
+    (27_420, "Yellowfinger Heysel"),
+    (27_700, "Holy Knight Hodrick"),
+    (27_800, "Pale Shade of Londor"),
+    (27_920, "Lion Knight Albert"),
+    (28_040, "Daughter of Crystal Kriemhild"),
+    (28_700, "Havel the Rock"),
+    (29_200, "Knight Slayer Tsorig"),
+    (29_340, "Creighton of Mirrah"),
+    (29_440, "Alva, Seeker of the Spurned"),
+    (29_540, "Longfinger Kirk"),
+];
+const ASHES_OF_ARIANDEL_INVADERS: [(u32, &str); 1] = [(21_140, "Sir Vilhelm")];
+const RINGED_CITY_INVADERS: [(u32, &str); 1] = [(22_340, "Moaning Knight")];
+
+pub fn known_invader_name(id: u32) -> Option<&'static str> {
+    BASE_INVADERS
+        .iter()
+        .chain(ASHES_OF_ARIANDEL_INVADERS.iter())
+        .chain(RINGED_CITY_INVADERS.iter())
+        .find(|(npc_id, _)| *npc_id == id)
+        .map(|(_, name)| *name)
+}
+
+pub fn parse_npc_param_ids(text: &str) -> Vec<u32> {
+    text.split(|ch: char| ch == ',' || ch.is_whitespace())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+/// Built-in invaders when `requested` is empty, otherwise only those ids that exist in `present`.
+pub fn choose_invader_ids(requested: &[u32], present: &[u32]) -> Vec<u32> {
+    let pool: Vec<u32> = if requested.is_empty() {
+        present.to_vec()
+    } else {
+        requested.iter().copied().filter(|id| present.binary_search(id).is_ok()).collect()
+    };
+    pool
 }
 
 /// Boss models are c5000 to c5999.
@@ -3072,6 +3749,12 @@ const CHR_DATA_NAME: usize = 0x130;
 const CHR_DATA_HP_FIELD: usize = 0xD8;
 /// Empty on spawns whose model never loaded. They stay invisible and do nothing.
 const CHR_MODEL: usize = 0x48;
+/// TGA: character kind. 2 is Dark Spirit (red phantom look and death mist).
+const CHR_TYPE_OFFSET: usize = 0x70;
+const CHR_TYPE_DARK_SPIRIT: i32 = 2;
+/// TGA: team. 16 is Dark Spirit (hostile to the host).
+const CHR_TEAM_OFFSET: usize = 0x74;
+const CHR_TEAM_DARK_SPIRIT: u32 = 16;
 /// A spawn with no model by now is frozen.
 const SPAWN_CHECK_FRAMES: u32 = 150;
 /// While the list is full, the queue only looks again after this many frames.
@@ -3217,6 +3900,9 @@ pub fn spawn_state(present: bool, model: usize) -> SpawnState {
 struct SpawnCheck {
     chr: usize,
     frames: u32,
+    /// The model check below is for enemy objects. A player-type NPC keeps its body
+    /// elsewhere, so it is never treated as frozen.
+    skip_frozen_delete: bool,
 }
 
 fn poll_spawn_checks(queue: &mut EnemyQueue) {
@@ -3242,6 +3928,7 @@ fn poll_spawn_checks(queue: &mut EnemyQueue) {
         match state {
             SpawnState::Fine => {}
             SpawnState::Gone => failed += 1,
+            SpawnState::Frozen if check.skip_frozen_delete => {}
             SpawnState::Frozen => {
                 failed += 1;
                 frozen.push(check.chr);
@@ -3384,6 +4071,7 @@ pub fn spawn_random_enemy(
             Some(EnemyChoice {
                 npc_id,
                 think_id: candidates[random_index(candidates.len())],
+                invader: false,
             })
         })
         .collect();
@@ -3437,11 +4125,450 @@ fn start_enemy_spawn(queue: &mut EnemyQueue, enemy: EnemyChoice) -> Result<(), S
     let call: extern "C" fn(usize, u32) = unsafe { std::mem::transmute(queue.routine) };
     call(creator, CREATE_NPC_COMMAND);
     queue.started += 1;
-    queue.in_flight = Some(EnemyInFlight {
-        previous,
-        frames: 0,
-    });
+    queue.in_flight = Some(EnemyInFlight { previous, frames: 0 });
     Ok(())
+}
+
+fn invader_candidates(ashes: bool, ringed_city: bool) -> Vec<(u32, &'static str)> {
+    let mut list = BASE_INVADERS.to_vec();
+    if ashes {
+        list.extend(ASHES_OF_ARIANDEL_INVADERS);
+    }
+    if ringed_city {
+        list.extend(RINGED_CITY_INVADERS);
+    }
+    list
+}
+
+fn think_for_invader(
+    npc_id: u32,
+    ai_think_id: i32,
+    init_think_id: i32,
+    think_ids: &[u32],
+) -> Option<u32> {
+    // Human NPCs keep their fight AI on CharaInit, not on NpcParam.
+    for candidate in [init_think_id, ai_think_id] {
+        if let Ok(id) = u32::try_from(candidate) {
+            if id > 0 && think_ids.binary_search(&id).is_ok() {
+                return Some(id);
+            }
+        }
+    }
+    think_candidates(npc_id, think_ids).into_iter().next()
+}
+
+/// The fight AI row a human NPC's CharaInit row names, or 0. A missing row means the NPC
+/// cannot be built as a player-type character at all.
+fn invader_init_think(npc_id: u32) -> Option<i32> {
+    let regulation = unsafe { CSRegulationManager::instance() }.ok()?;
+    let inits = regulation.get_param::<CHARACTER_INIT_PARAM>();
+    inits.get(u64::from(npc_id)).map(|row| row.npc_player_think_id())
+}
+
+// Map data as the game keeps it in memory, and one enemy entry in it. The factory and the
+// player constructor read these fields; everything else comes from a real entry of the map.
+const MAP_DATA_COPY_SIZE: usize = 0x600;
+/// The map id at 0x4E8 is the last field the constructors read.
+const MAP_DATA_MIN_SIZE: usize = 0x4F0;
+/// All entries of the map: count plus one at +4, pointers from +0x10.
+const MAP_DATA_ENTRY_TABLE: usize = 0x80;
+const MAP_DATA_MODEL_TABLE: usize = 0x68;
+/// Enemy entries: count, index of the first one among all entries, pointer array.
+const MAP_DATA_ENEMY_COUNT: usize = 0x3C8;
+const MAP_DATA_ENEMY_FIRST: usize = 0x3CC;
+const MAP_DATA_ENEMY_ARRAY: usize = 0x3D0;
+const MAP_ENTRY_COPY_SIZE: usize = 0x100;
+const MAP_ENTRY_MIN_SIZE: usize = 0xC0;
+const MAP_ENTRY_NAME: usize = 0x00;
+const MAP_ENTRY_TYPE: usize = 0x08;
+const MAP_ENTRY_TYPE_ENEMY: u32 = 2;
+const MAP_ENTRY_MODEL_INDEX: usize = 0x10;
+const MAP_ENTRY_POSITION: usize = 0x20;
+const MAP_ENTRY_ROTATION: usize = 0x2C;
+/// Eight group words. All bits set shows the character from everywhere, like a debug spawn.
+const MAP_ENTRY_DRAW_GROUPS: usize = 0x4C;
+const MAP_ENTRY_ENTITY: usize = 0xB0;
+const MAP_ENTRY_ENEMY_DATA: usize = 0xB8;
+const ENTITY_COPY_SIZE: usize = 0x60;
+/// Event scripts find characters by these ids, so the invader must not inherit any. The
+/// entry's own id is first. Its group ids follow a block of one-byte settings, which must
+/// stay as they are: some of them decide whether the character is drawn at all.
+const ENTITY_GROUPS_FROM: usize = 0x18;
+/// Map ids have seven digits. Packed one-byte settings read as a number are either far
+/// smaller or use the top byte.
+const ENTITY_ID_RANGE: std::ops::Range<u32> = 1_000_000..0x0100_0000;
+const ENEMY_DATA_COPY_SIZE: usize = 0x80;
+const ENEMY_DATA_THINK: usize = 0x08;
+const ENEMY_DATA_NPC: usize = 0x0C;
+const ENEMY_DATA_TALK: usize = 0x10;
+const ENEMY_DATA_CHARA_INIT: usize = 0x18;
+const ENEMY_DATA_COLLISION: usize = 0x1C;
+/// Inside the creator routine: the jump to the create command.
+const CREATE_COMMAND_JUMP: usize = 0x8A;
+/// Inside the create command: where it loads the list of loaded map blocks.
+const CREATE_BLOCK_LIST_LOAD: usize = 0x114;
+const BLOCK_LIST: usize = 0x10;
+const BLOCK_LIST_CURRENT: usize = 0x20;
+const BLOCK_LIST_COUNT: usize = 0x18;
+const BLOCK_LIST_ENTRIES: usize = 0x20;
+const BLOCK_ENTRY_SIZE: usize = 0x70;
+const BLOCK_ENTRY_MAP_DATA: usize = 0x28;
+/// The creator keeps the map data of its last spawn here.
+const CREATOR_MAP_DATA: usize = 0x1A0;
+/// WorldChrMan: the set that holds spawned characters. Capacity, then the entries.
+const DEBUG_CHR_SET: usize = 0x68;
+/// WorldChrMan: world info, which counts the loaded blocks. Spawned characters use the
+/// block number two past that count.
+const WORLD_INFO: usize = 0x08;
+const WORLD_INFO_BLOCK_COUNT: usize = 0x18;
+const DEBUG_BLOCK_OFFSET: u32 = 2;
+/// Data module: the map data and entry index a character was built from.
+const CHR_DATA_MAP_DATA: usize = 0x10;
+const CHR_DATA_MAP_ENTRY: usize = 0x18;
+const PHYSICS_MODULE_OFFSET: usize = 0x68;
+const PHYSICS_ROTATION: usize = 0x70;
+const PHYSICS_POSITION: usize = 0x80;
+/// Character controller: the columns of its facing matrix. Forward is their negative.
+const CTRL_FORWARD: [usize; 3] = [0x128, 0x138, 0x148];
+
+fn put_u32(buffer: &mut [u8], offset: usize, value: u32) {
+    buffer[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_f32(buffer: &mut [u8], offset: usize, value: f32) {
+    buffer[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_usize(buffer: &mut [u8], offset: usize, value: usize) {
+    buffer[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn get_u32(buffer: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap())
+}
+
+fn get_usize(buffer: &[u8], offset: usize) -> usize {
+    usize::from_ne_bytes(buffer[offset..offset + 8].try_into().unwrap())
+}
+
+/// A zeroed block that is never freed. The game may keep pointers into the made-up map
+/// entry, and a few kilobytes per invader is nothing next to a dangling pointer.
+fn leaked(size: usize) -> &'static mut [u8] {
+    Box::leak(vec![0u8; size].into_boxed_slice())
+}
+
+fn read_f32_checked(address: usize) -> Result<f32, String> {
+    read_u32_checked(address).map(f32::from_bits)
+}
+
+/// An entity struct copied from a real enemy, with its id and group ids taken out.
+pub fn clear_entity_ids(entity: &mut [u8]) {
+    put_u32(entity, 0, u32::MAX);
+    for offset in (ENTITY_GROUPS_FROM..entity.len().saturating_sub(3)).step_by(4) {
+        if ENTITY_ID_RANGE.contains(&get_u32(entity, offset)) {
+            put_u32(entity, offset, u32::MAX);
+        }
+    }
+}
+
+/// The map data of the block the player is in, found the way the creator's own create
+/// command finds it.
+fn current_map_data(creator: usize) -> Result<usize, String> {
+    let from_blocks = || -> Result<usize, String> {
+        let create = jump_target(create_npc_address()? + CREATE_COMMAND_JUMP)?;
+        let site = create + CREATE_BLOCK_LIST_LOAD;
+        let mut bytes = [0u8; 3];
+        if copy_readable(site, &mut bytes) != bytes.len() || bytes != [0x48, 0x8B, 0x05] {
+            return Err("the create command does not load the block list where expected".to_string());
+        }
+        let owner = read_usize_checked(pattern::rip_target(site, 3, 7)?)?;
+        let list = read_usize_checked(owner + BLOCK_LIST)?;
+        let current = read_u32_checked(owner + BLOCK_LIST_CURRENT)? as i32;
+        let count = read_u32_checked(list + BLOCK_LIST_COUNT)? as i32;
+        if current < 0 || current >= count {
+            return Err("no current map block".to_string());
+        }
+        let entries = read_usize_checked(list + BLOCK_LIST_ENTRIES)?;
+        read_usize_checked(entries + current as usize * BLOCK_ENTRY_SIZE + BLOCK_ENTRY_MAP_DATA)
+    };
+    let map = match from_blocks() {
+        Ok(map) if map >= 0x10_000 => map,
+        _ => read_usize_checked(creator + CREATOR_MAP_DATA)?,
+    };
+    if map < 0x10_000 {
+        return Err("the current map data was not found".to_string());
+    }
+    Ok(map)
+}
+
+/// A real enemy entry of the map to copy the unknown fields from.
+fn template_map_entry(map: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+    let count = (get_u32(map, MAP_DATA_ENEMY_COUNT) as usize).min(MAX_CHRS_PER_BLOCK as usize);
+    let array = get_usize(map, MAP_DATA_ENEMY_ARRAY);
+    let models = get_usize(map, MAP_DATA_MODEL_TABLE);
+    let model_count = read_u32_checked(models + 4).unwrap_or(0) as usize;
+    for index in 0..count {
+        let Ok(entry_address) = read_usize_checked(array + index * 8) else {
+            continue;
+        };
+        let mut entry = vec![0u8; MAP_ENTRY_COPY_SIZE];
+        if entry_address < 0x10_000 || copy_readable(entry_address, &mut entry) < MAP_ENTRY_MIN_SIZE {
+            continue;
+        }
+        let model = get_u32(&entry, MAP_ENTRY_MODEL_INDEX) as usize;
+        if get_u32(&entry, MAP_ENTRY_TYPE) != MAP_ENTRY_TYPE_ENEMY
+            || model + 1 >= model_count
+            || read_usize_checked(models + 0x10 + model * 8).unwrap_or(0) < 0x10_000
+        {
+            continue;
+        }
+        let mut entity = vec![0u8; ENTITY_COPY_SIZE];
+        let mut enemy = vec![0u8; ENEMY_DATA_COPY_SIZE];
+        let entity_address = get_usize(&entry, MAP_ENTRY_ENTITY);
+        let enemy_address = get_usize(&entry, MAP_ENTRY_ENEMY_DATA);
+        if entity_address < 0x10_000
+            || enemy_address < 0x10_000
+            || copy_readable(entity_address, &mut entity) != entity.len()
+            || copy_readable(enemy_address, &mut enemy) != enemy.len()
+        {
+            continue;
+        }
+        return Ok((entry, entity, enemy));
+    }
+    Err("this map has no enemy entry to model the invader on".to_string())
+}
+
+/// Where the invader appears and which way it faces: a few meters ahead, looking back.
+fn invader_spawn_point(distance: f32) -> Result<([f32; 3], f32), String> {
+    let player = local_player()? as usize;
+    let physics = module_pointer(player, PHYSICS_MODULE_OFFSET)?;
+    let mut position = [0f32; 3];
+    for (axis, value) in position.iter_mut().enumerate() {
+        *value = read_f32_checked(physics + PHYSICS_POSITION + axis * 4)?;
+    }
+    let facing = read_f32_checked(physics + PHYSICS_ROTATION + 4)?;
+    let ctrl = read_usize_checked(player + CHR_CTRL_OFFSET)?;
+    let mut forward = [0f32; 3];
+    for (axis, offset) in CTRL_FORWARD.iter().enumerate() {
+        forward[axis] = -read_f32_checked(ctrl + offset)?;
+    }
+    let length = (forward[0] * forward[0] + forward[2] * forward[2]).sqrt();
+    if !length.is_finite() || !(0.5..=1.5).contains(&length) {
+        forward = [facing.sin(), 0.0, facing.cos()];
+    }
+    if position.iter().any(|value| !value.is_finite()) || !facing.is_finite() {
+        return Err("the player position is not readable".to_string());
+    }
+    Ok((
+        [
+            position[0] + forward[0] * distance,
+            position[1] + SPAWN_HEIGHT_METERS,
+            position[2] + forward[2] * distance,
+        ],
+        facing + std::f32::consts::PI,
+    ))
+}
+
+/// Builds a human NPC as a player-type character, the way a map does when it loads one.
+/// The game's factory reads a map entry, so it gets a made-up one: a copy of a real enemy
+/// entry of this map with the invader's rows, position and no event ids. The new character
+/// goes into the same set as debug spawns, so the limit, the checks and the game's delete
+/// routine (which also gives back the NPC's player data slot) all work on it.
+fn spawn_human_npc(queue: &EnemyQueue, enemy: EnemyChoice) -> Result<usize, String> {
+    let located = cached()?;
+    let factory = *located.map_chr_factory.as_ref().map_err(|error| error.clone())?;
+    let place = *located.map_chr_place.as_ref().map_err(|error| error.clone())?;
+    if invader_init_think(enemy.npc_id).is_none() {
+        return Err(format!("NPC {} has no CharaInit row", enemy.npc_id));
+    }
+    let world = unsafe { WorldChrMan::instance() }
+        .map_err(|error| format!("WorldChrMan is unavailable: {error:?}"))?
+        as *const WorldChrMan as usize;
+    let real_map = current_map_data(queue.creator)?;
+
+    let set = world + DEBUG_CHR_SET;
+    let capacity = read_u32_checked(set)? as usize;
+    let entries = read_usize_checked(set + 8)?;
+    if capacity == 0 || capacity > MAX_CHRS_PER_BLOCK as usize || entries < 0x10_000 {
+        return Err("the spawned character set is not usable".to_string());
+    }
+    let index = (0..capacity)
+        .find(|index| read_usize_checked(entries + index * CHR_SET_ENTRY_SIZE) == Ok(0))
+        .ok_or("no free slot for a spawned character")?;
+    let block = read_u32_checked(read_usize_checked(world + WORLD_INFO)? + WORLD_INFO_BLOCK_COUNT)?
+        + DEBUG_BLOCK_OFFSET;
+
+    let map = leaked(MAP_DATA_COPY_SIZE);
+    if copy_readable(real_map, map) < MAP_DATA_MIN_SIZE {
+        return Err("the current map data is not readable".to_string());
+    }
+    let (template, template_entity, template_enemy) = template_map_entry(map)?;
+    let distance = SPAWN_DISTANCE_METERS + (queue.started % SPAWN_DISTANCE_STEPS) as f32;
+    let (position, facing) = invader_spawn_point(distance)?;
+
+    let name: Vec<u16> = format!("c0000_{:04}", 9000 + index).encode_utf16().chain([0]).collect();
+    let name = Box::leak(name.into_boxed_slice());
+    let entity = leaked(ENTITY_COPY_SIZE);
+    entity.copy_from_slice(&template_entity);
+    clear_entity_ids(entity);
+    let data = leaked(ENEMY_DATA_COPY_SIZE);
+    data.copy_from_slice(&template_enemy);
+    put_u32(data, ENEMY_DATA_THINK, enemy.think_id);
+    put_u32(data, ENEMY_DATA_NPC, enemy.npc_id);
+    put_u32(data, ENEMY_DATA_TALK, 0);
+    put_u32(data, ENEMY_DATA_CHARA_INIT, enemy.npc_id);
+    put_u32(data, ENEMY_DATA_COLLISION, u32::MAX);
+    let entry = leaked(MAP_ENTRY_COPY_SIZE);
+    entry.copy_from_slice(&template);
+    put_usize(entry, MAP_ENTRY_NAME, name.as_ptr() as usize);
+    for (axis, value) in position.iter().enumerate() {
+        put_f32(entry, MAP_ENTRY_POSITION + axis * 4, *value);
+    }
+    for (axis, value) in [0.0, facing, 0.0].iter().enumerate() {
+        put_f32(entry, MAP_ENTRY_ROTATION + axis * 4, *value);
+    }
+    for word in 0..8 {
+        put_u32(entry, MAP_ENTRY_DRAW_GROUPS + word * 4, u32::MAX);
+    }
+    put_usize(entry, MAP_ENTRY_ENTITY, entity.as_ptr() as usize);
+    put_usize(entry, MAP_ENTRY_ENEMY_DATA, data.as_ptr() as usize);
+
+    // Every index leads to the one entry, so the set slot can double as the entry index.
+    let table = leaked(0x10 + capacity * 8);
+    put_u32(table, 4, capacity as u32 + 2);
+    for slot in 0..capacity {
+        put_usize(table, 0x10 + slot * 8, entry.as_ptr() as usize);
+    }
+    put_usize(map, MAP_DATA_ENTRY_TABLE, table.as_ptr() as usize);
+    put_u32(map, MAP_DATA_ENEMY_COUNT, capacity as u32);
+    put_u32(map, MAP_DATA_ENEMY_FIRST, 0);
+    put_usize(map, MAP_DATA_ENEMY_ARRAY, table.as_ptr() as usize + 0x10);
+
+    let unused = 0usize;
+    let build: extern "C" fn(usize, usize, usize, u32, usize, i32) -> usize =
+        unsafe { std::mem::transmute(factory) };
+    let chr = build(
+        &unused as *const usize as usize,
+        0,
+        entries + index * CHR_SET_ENTRY_SIZE,
+        block,
+        map.as_ptr() as usize,
+        index as i32,
+    );
+    if chr < 0x10_000 {
+        return Err("the game did not build the NPC (all 40 human NPC slots may be in use)".to_string());
+    }
+    let finish: extern "C" fn(usize, usize, u32, usize, i32) = unsafe { std::mem::transmute(place) };
+    finish(&unused as *const usize as usize, chr, block, map.as_ptr() as usize, index as i32);
+
+    // From here on it should look like any spawned character: on the real map, with no
+    // map entry behind it. Other code reads the map id through this pointer.
+    let chr_data = module_pointer(chr, DATA_MODULE_OFFSET)?;
+    write_bytes_checked(chr_data + CHR_DATA_MAP_DATA, &real_map.to_ne_bytes())?;
+    write_i32_checked(chr_data + CHR_DATA_MAP_ENTRY, -1)?;
+    Ok(chr)
+}
+
+/// Dark Spirit look and side. The gear, health and AI already came with the character.
+fn finish_invader(chr: usize, npc_id: u32) {
+    let kind = read_u32_checked(chr + CHR_TYPE_OFFSET).unwrap_or(0);
+    let team = read_u32_checked(chr + CHR_TEAM_OFFSET).unwrap_or(0);
+    if let Err(error) = write_i32_checked(chr + CHR_TYPE_OFFSET, CHR_TYPE_DARK_SPIRIT) {
+        crate::log::log(format!("invader {npc_id}: chr type not set: {error}"));
+    }
+    if let Err(error) = write_u32_checked(chr + CHR_TEAM_OFFSET, CHR_TEAM_DARK_SPIRIT) {
+        crate::log::log(format!("invader {npc_id}: team not set: {error}"));
+    }
+    crate::log::log(format!(
+        "invader {npc_id}: built at {chr:#x}, type {kind} -> {CHR_TYPE_DARK_SPIRIT}, team {team} -> {CHR_TEAM_DARK_SPIRIT}, hp {:?}",
+        chr_health(chr),
+    ));
+}
+
+/// Queues one random named NPC invader near you. `think_override` above 0 picks the AI row
+/// by hand. `viewer` is remembered for the banner and nameplate work still to come.
+pub fn spawn_npc_invader(viewer: &str, ids_text: &str, think_override: u32) -> Result<String, String> {
+    let routine = create_npc_address()?;
+    let creator = debug_creator()?;
+    let located = cached()?;
+    located.map_chr_factory.as_ref().map_err(|error| error.clone())?;
+    located.map_chr_place.as_ref().map_err(|error| error.clone())?;
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the NPC list is unavailable: {error:?}"))?;
+    let npcs = regulation.get_param::<NPC_PARAM_ST>();
+    let thinks = regulation.get_param::<NPC_THINK_PARAM_ST>();
+    let mut think_ids: Vec<u32> = thinks.iter().map(|(id, _)| id as u32).filter(|id| *id > 0).collect();
+    think_ids.sort_unstable();
+
+    let (ashes, ringed_city) = unsafe { darksouls3::cs::CSDlc::instance() }
+        .map(|dlc| (dlc.dlc1_installed, dlc.dlc2_installed))
+        .unwrap_or((false, false));
+    let known = invader_candidates(ashes, ringed_city);
+    let mut present: Vec<u32> = known
+        .iter()
+        .map(|(id, _)| *id)
+        .filter(|id| npcs.get(u64::from(*id)).is_some())
+        .collect();
+    present.sort_unstable();
+    let requested = parse_npc_param_ids(ids_text);
+    let choices = choose_invader_ids(&requested, &present);
+    if choices.is_empty() {
+        return Err(if requested.is_empty() {
+            "no NPC invaders were found in the game data".to_string()
+        } else {
+            "none of those NPC ids are available as invaders".to_string()
+        });
+    }
+
+    let npc_id = choices[random_index(choices.len())];
+    let row = npcs
+        .get(u64::from(npc_id))
+        .ok_or_else(|| format!("NPC {npc_id} disappeared from the game data"))?;
+    let init_think = invader_init_think(npc_id)
+        .ok_or_else(|| format!("NPC {npc_id} has no CharaInit row, so it cannot be built"))?;
+    let think_id = if think_override > 0 {
+        think_override
+    } else {
+        think_for_invader(npc_id, row.ai_think_id(), init_think, &think_ids)
+            .ok_or_else(|| format!("NPC {npc_id} has no usable AI"))?
+    };
+    let pick = EnemyChoice {
+        npc_id,
+        think_id,
+        invader: true,
+    };
+    let mut slot = ENEMY_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
+    match slot.as_mut() {
+        Some(queue) => {
+            queue.remaining.push(pick);
+            queue.pool.push(pick);
+            queue.replacements = 0;
+        }
+        None => {
+            *slot = Some(EnemyQueue {
+                creator,
+                routine,
+                remaining: vec![pick],
+                pool: vec![pick],
+                replace_oldest: true,
+                limit: 5,
+                full_frames: 0,
+                pause_frames: 0,
+                replacements: 0,
+                checks: Vec::new(),
+                in_flight: None,
+                started: 0,
+            });
+        }
+    }
+
+    let name = known_invader_name(npc_id).unwrap_or("NPC invader");
+    let viewer = viewer.trim();
+    if viewer.is_empty() {
+        Ok(format!("spawning {name} ({npc_id}, AI {think_id})"))
+    } else {
+        Ok(format!("spawning {name} ({npc_id}, AI {think_id}) as {viewer}"))
+    }
 }
 
 pub fn poll_enemy_queue() {
@@ -3456,16 +4583,26 @@ pub fn poll_enemy_queue() {
             return;
         }
         poll_spawn_checks(queue);
-        if let Some(flight) = queue.in_flight.as_mut() {
+        let finished = queue.in_flight.as_mut().and_then(|flight| {
             flight.frames += 1;
             let chr = read_usize_checked(queue.creator + CREATOR_RESULT).unwrap_or(0);
             if chr >= 0x10_000 && chr != flight.previous {
-                queue.checks.push(SpawnCheck {
-                    chr,
-                    frames: 0,
-                });
-                queue.in_flight = None;
-            } else if flight.frames >= SPAWN_WAIT_FRAMES {
+                Some(chr)
+            } else {
+                None
+            }
+        });
+        if let Some(chr) = finished {
+            queue.in_flight = None;
+            queue.checks.push(SpawnCheck {
+                chr,
+                frames: 0,
+                skip_frozen_delete: false,
+            });
+            return;
+        }
+        if let Some(flight) = queue.in_flight.as_mut() {
+            if flight.frames >= SPAWN_WAIT_FRAMES {
                 queue.in_flight = None;
                 replace_failed_spawn(queue);
             }
@@ -3496,6 +4633,21 @@ pub fn poll_enemy_queue() {
         let mut ready = [0u8; 1];
         if copy_readable(queue.creator + CREATOR_READY, &mut ready) != 1 || ready[0] == 0 {
             queue.remaining.push(enemy);
+            return;
+        }
+        if enemy.invader {
+            match spawn_human_npc(queue, enemy) {
+                Ok(chr) => {
+                    queue.started += 1;
+                    finish_invader(chr, enemy.npc_id);
+                    queue.checks.push(SpawnCheck {
+                        chr,
+                        frames: 0,
+                        skip_frozen_delete: true,
+                    });
+                }
+                Err(error) => crate::log::log(format!("invader {}: not spawned: {error}", enemy.npc_id)),
+            }
             return;
         }
         if let Err(error) = start_enemy_spawn(queue, enemy) {
@@ -3628,6 +4780,12 @@ pub fn schemas_json() -> Value {
             "arguments": [{ "name": "seconds", "type": "int", "default": 60, "min": 5, "max": 600 }]
         },
         {
+            "id": "firestarter",
+            "name": "Firestarter",
+            "description": "Takes away your weapons and gives you a Pyromancy Flame at a random level, the Fire Witch Set and every pyromancy. As many as your slots hold are attuned, without stat requirements. Everything goes back when the time is up.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 300, "min": 5, "max": 600 }]
+        },
+        {
             "id": "shuffle_stats",
             "name": "Shuffle Stats",
             "description": "Randomly swaps your nine stats with each other, so your level stays the same.",
@@ -3694,6 +4852,15 @@ pub fn schemas_json() -> Value {
                 { "name": "bosses", "type": "bool", "label": "Include bosses", "hint": "Bosses can spawn too. Many rely on map events, so some may act oddly.", "default": 1, "min": 0, "max": 1 },
                 { "name": "onlyBosses", "type": "bool", "label": "Only bosses", "hint": "Spawns nothing but bosses. Without Whole game, only bosses from the current map can appear.", "default": 0, "min": 0, "max": 1 },
                 { "name": "replaceOldest", "type": "bool", "label": "Replace oldest at limit", "hint": "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot.", "default": 1, "min": 0, "max": 1 }
+            ]
+        },
+        {
+            "id": "spawn_npc_invader",
+            "name": "Spawn NPC Invader",
+            "description": "Spawns a random named NPC invader near you as a Dark Spirit, with its own gear (Havel, Heysel, Hodrick and the rest of the known set).",
+            "arguments": [
+                { "name": "npcParamIds", "type": "string", "label": "NPC ids", "hint": "Optional. Comma-separated NpcParam ids. Empty picks a random known invader.", "defaultText": "" },
+                { "name": "thinkParamId", "type": "int", "label": "AI row", "hint": "Optional. 0 picks the invader's own AI. Another NpcThinkParam id forces that AI.", "default": 0, "min": 0, "max": 99999999 }
             ]
         },
         {
@@ -4002,8 +5169,97 @@ mod tests {
         pick_level,
         ai_choices, enemy_teams, has_fight_logic, is_spawnable_enemy, most_common_team, spawn_state,
         SpawnState, model_from_chr_name, think_candidates, usable_two_handed, wait_reason, weapon_available,
-        weapon_infusion, weapon_level, WeaponTrait, with_no_damage_bit,
+        weapon_infusion, weapon_level, WeaponTrait, with_no_damage_bit, without_bits,
+        attunement_slots, magic_entry, pick_attunement, pyromancies_available, Firestarter, SpellRequirement,
+        ended_prefix, choose_invader_ids, known_invader_name, parse_npc_param_ids, think_for_invader,
+        clear_entity_ids,
     };
+
+    #[test]
+    fn npc_id_list_uses_the_built_in_invaders_when_empty() {
+        let present = [27_420, 27_700, 29_540];
+        assert_eq!(choose_invader_ids(&[], &present), present);
+        assert_eq!(choose_invader_ids(&[27_700, 1], &present), vec![27_700]);
+        assert!(choose_invader_ids(&[1, 2], &present).is_empty());
+        assert_eq!(parse_npc_param_ids("27420, 27700\n29540"), vec![27_420, 27_700, 29_540]);
+        assert_eq!(known_invader_name(27_700), Some("Holy Knight Hodrick"));
+        assert_eq!(known_invader_name(1), None);
+    }
+
+    #[test]
+    fn invader_ai_prefers_charainit_think_then_npc_param() {
+        let thinks = [100u32, 200, 300];
+        assert_eq!(think_for_invader(27_700, 200, 100, &thinks), Some(100));
+        assert_eq!(think_for_invader(27_700, 200, 0, &thinks), Some(200));
+        assert_eq!(think_for_invader(27_700, 0, 0, &thinks), None);
+    }
+
+    #[test]
+    fn an_invader_inherits_no_event_ids_but_keeps_the_flags() {
+        let mut entity = vec![0u8; 0x30];
+        entity[0..4].copy_from_slice(&3_000_800u32.to_ne_bytes());
+        entity[4..8].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0]);
+        entity[0x10..0x14].copy_from_slice(&[1, 1, 0, 1]);
+        entity[0x1C..0x20].copy_from_slice(&3_005_810u32.to_ne_bytes());
+        entity[0x20..0x24].copy_from_slice(&u32::MAX.to_ne_bytes());
+        entity[0x24..0x28].copy_from_slice(&42u32.to_ne_bytes());
+        clear_entity_ids(&mut entity);
+        assert_eq!(entity[0..4], u32::MAX.to_ne_bytes());
+        assert_eq!(entity[4..8], [0xFF, 0xFF, 0xFF, 0]);
+        assert_eq!(entity[0x10..0x14], [1, 1, 0, 1]);
+        assert_eq!(entity[0x1C..0x20], u32::MAX.to_ne_bytes());
+        assert_eq!(entity[0x20..0x24], u32::MAX.to_ne_bytes());
+        assert_eq!(entity[0x24..0x28], 42u32.to_ne_bytes());
+    }
+
+    #[test]
+    fn ended_swaps_are_named_in_the_result() {
+        assert_eq!(ended_prefix(&[]), "");
+        assert_eq!(ended_prefix(&["Temporary Armor", "Bombardier"]), "ended Temporary Armor and Bombardier, then ");
+    }
+
+    #[test]
+    fn attunement_takes_spells_while_their_slots_fit() {
+        let spells = [(1, 1), (2, 2), (3, 1), (4, 1)];
+        assert_eq!(pick_attunement(&spells, 3), vec![1, 2]);
+        assert_eq!(pick_attunement(&spells, 4), vec![1, 2, 3]);
+        assert_eq!(pick_attunement(&[(1, 2), (2, 1)], 1), vec![2]);
+        assert!(pick_attunement(&spells, 0).is_empty());
+        let many: Vec<(u32, u8)> = (0..20).map(|spell| (spell, 1)).collect();
+        assert_eq!(pick_attunement(&many, 30).len(), 14);
+    }
+
+    #[test]
+    fn magic_entries_match_the_games_attune_routine() {
+        assert_eq!(magic_entry(2_400_000, 4), 0x0000_000C_0024_9F00);
+        assert_eq!(magic_entry(2_400_000, -1), 0xFFFF_FFFF_0024_9F00);
+    }
+
+    #[test]
+    fn attunement_slots_follow_the_games_table() {
+        assert_eq!(attunement_slots(9), 0);
+        assert_eq!(attunement_slots(10), 1);
+        assert_eq!(attunement_slots(24), 4);
+        assert_eq!(attunement_slots(80), 9);
+        assert_eq!(attunement_slots(99), 10);
+    }
+
+    #[test]
+    fn dlc_pyromancies_need_their_dlc() {
+        assert_eq!(pyromancies_available(false, false).len(), 26);
+        assert!(!pyromancies_available(true, true).contains(&2_435_000));
+        assert!(pyromancies_available(true, false).contains(&2_457_000));
+        assert!(!pyromancies_available(true, false).contains(&2_660_000));
+        assert_eq!(pyromancies_available(true, true).len(), 29);
+    }
+
+    #[test]
+    fn freeze_clears_only_the_hit_block_bits() {
+        assert_eq!(without_bits(0xFF, 0x80), 0x7F);
+        assert_eq!(without_bits(0xFF, 0b0000_0011), 0xFC);
+        assert_eq!(without_bits(0x05, 0b0000_0011), 0x04);
+        assert_eq!(without_bits(0x04, 0b0000_0011), 0x04);
+    }
 
     #[test]
     fn no_damage_bit_leaves_the_other_flags_alone() {
@@ -4193,6 +5449,21 @@ mod tests {
                 selection_settled: true,
                 weapons_changed: false,
             }),
+            firestarter: Some(Firestarter {
+                until: 250,
+                character: "Ash".to_string(),
+                weapons: vec![RemovedWeapon { slot: 1, index: 2, weapon: 3_000_000 }],
+                armor: Vec::new(),
+                flame: 13_400_007,
+                flame_index: 40,
+                flames_before: 0,
+                spells: vec![2_400_000],
+                spells_given: vec![2_400_000],
+                attuned_before: Some(vec![0xFFFF_FFFF; 14]),
+                selected_before: 3,
+                requirements: vec![SpellRequirement { spell: 2_400_000, intelligence: 6, faith: 6 }],
+                weapons_changed: false,
+            }),
             stats: Some(ShuffledStats {
                 until: 300,
                 character: "Ash".to_string(),
@@ -4209,6 +5480,10 @@ mod tests {
         let bombardier = loaded.bombardier.unwrap();
         assert_eq!((bombardier.weapons[0].weapon, bombardier.quick_item), (3_000_000, 0x4000_0097));
         assert_eq!(bombardier.armor[0].piece, 79_001_000);
+        let firestarter = loaded.firestarter.unwrap();
+        assert_eq!((firestarter.flame, firestarter.selected_before), (13_400_007, 3));
+        assert_eq!(firestarter.attuned_before.unwrap().len(), 14);
+        assert_eq!(firestarter.requirements[0].intelligence, 6);
         assert_eq!(loaded.stats.unwrap().original[3], 15);
         assert!(PendingRestores::default().is_empty());
     }

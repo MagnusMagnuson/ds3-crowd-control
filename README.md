@@ -59,8 +59,10 @@ Each event can be fired with **Test** on the Presets page, or by Twitch once its
 | Random Armor | Gives and equips a random piece in every armor slot. |
 | Temporary Armor | A random outfit for a while, then your own armor comes back. |
 | Bombardier | Takes your weapons away, dresses you in the Mirrah Chain Set and gives you endless Black Firebombs, then puts everything back. |
+| Firestarter | Takes your weapons away and gives you a Pyromancy Flame, the Fire Witch Set and every pyromancy, then puts everything back. |
 | Shuffle Stats | Swaps your stats around without changing your level. By default it stays that way; set a time to get your stats back. |
 | Spawn Random Enemy | Spawns enemies near you, from this area or the whole game, with an option for bosses. |
+| Spawn NPC Invader | A named NPC invader such as Havel, Hodrick or Kirk appears near you as a Dark Spirit, with its own gear. |
 | Blind | Fades to black for a few seconds. |
 | Oversaturate | Pushes the colours far too high for a while. |
 | Freeze | Freezes you in place for a few seconds. The camera still moves. |

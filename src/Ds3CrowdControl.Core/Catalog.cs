@@ -217,6 +217,13 @@ public static class BuiltinHandlers
         },
         new HandlerSchema
         {
+            Id = "firestarter",
+            Name = "Firestarter",
+            Description = "Takes away your weapons and gives you a Pyromancy Flame at a random level, the Fire Witch Set and every pyromancy. As many as your slots hold are attuned, without stat requirements. Everything goes back when the time is up.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 300, Min = 5, Max = 600 }]
+        },
+        new HandlerSchema
+        {
             Id = "shuffle_stats",
             Name = "Shuffle Stats",
             Description = "Randomly swaps your nine stats with each other, so your level stays the same.",
@@ -299,6 +306,24 @@ public static class BuiltinHandlers
         },
         new HandlerSchema
         {
+            Id = "spawn_npc_invader",
+            Name = "Spawn NPC Invader",
+            Description = "Spawns a random named NPC invader near you as a Dark Spirit, with its own gear (Havel, Heysel, Hodrick and the rest of the known set).",
+            Arguments =
+            [
+                new EffectArgumentSchema
+                {
+                    Name = "npcParamIds",
+                    Type = "string",
+                    DefaultText = "",
+                    Label = "NPC ids",
+                    Hint = "Optional. Comma-separated NpcParam ids. Empty picks a random known invader."
+                },
+                new EffectArgumentSchema { Name = "thinkParamId", Type = "int", Default = 0, Min = 0, Max = 99999999, Label = "AI row", Hint = "Optional. 0 picks the invader's own AI. Another NpcThinkParam id forces that AI." }
+            ]
+        },
+        new HandlerSchema
+        {
             Id = "dump_player_data",
             Name = "Dump player data",
             Description = "Writes the local player data block to a file, including the reported soul count.",
@@ -350,6 +375,7 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Random Armor", "random_armor", catalog));
         catalog.Presets.Add(Preset("Temporary Armor", "temporary_armor", catalog));
         catalog.Presets.Add(Preset("Bombardier", "bombardier", catalog));
+        catalog.Presets.Add(Preset("Firestarter", "firestarter", catalog));
         catalog.Presets.Add(Preset("Shuffle Stats", "shuffle_stats", catalog));
         catalog.Presets.Add(Preset("Oversaturate", "oversaturate", catalog));
         catalog.Presets.Add(Preset("Blind", "blind", catalog));
@@ -359,6 +385,7 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Set health to 50%", "set_health_percent", catalog));
         catalog.Presets.Add(Preset("Set health to random %", "set_health_random_percent", catalog));
         catalog.Presets.Add(Preset("Spawn Random Enemy", "spawn_random_enemy", catalog));
+        catalog.Presets.Add(Preset("Spawn NPC Invader", "spawn_npc_invader", catalog));
         catalog.Presets.Add(Preset("Dump player data", "dump_player_data", catalog));
         catalog.Presets.Add(Preset("Watch item button", "watch_item_button", catalog));
         return catalog;

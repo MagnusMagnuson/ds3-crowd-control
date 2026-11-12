@@ -8,6 +8,31 @@ namespace Ds3CrowdControl.Manager;
 
 public static class GameInjector
 {
+    public const uint SteamAppId = 374320;
+
+    /// <summary>Starts Dark Souls III through Steam. If it is already running, Steam focuses it.</summary>
+    public static (bool Ok, string Message) Launch()
+    {
+        if (FindDarkSouls() is { } running)
+        {
+            running.Dispose();
+            return (true, "Dark Souls III is already running");
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo($"steam://rungameid/{SteamAppId}")
+            {
+                UseShellExecute = true,
+            });
+            return (true, "launching Dark Souls III through Steam");
+        }
+        catch (Exception exception) when (exception is Win32Exception or InvalidOperationException)
+        {
+            return (false, $"Dark Souls III could not be launched: {exception.Message}");
+        }
+    }
+
     public static (bool Ok, string Message) Inject(string dllPath)
     {
         if (!Environment.Is64BitProcess)
