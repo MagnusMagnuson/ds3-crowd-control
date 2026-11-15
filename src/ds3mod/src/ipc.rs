@@ -46,8 +46,14 @@ pub fn connect_and_serve() -> Result<Io, String> {
     let (outbound_tx, outbound_rx) = crossbeam_channel::unbounded::<String>();
     OUTBOUND_SOCKET.get_or_init(|| Mutex::new(None));
     SESSION_SECRET.get_or_init(|| Mutex::new(String::new()));
-    std::thread::spawn(move || write_loop(outbound_rx));
-    std::thread::spawn(move || reconnect_loop(command_tx));
+    std::thread::spawn(move || {
+        crate::perf::name_thread("mod: sending to the manager");
+        write_loop(outbound_rx)
+    });
+    std::thread::spawn(move || {
+        crate::perf::name_thread("mod: listening to the manager");
+        reconnect_loop(command_tx)
+    });
     Ok(Io {
         commands: command_rx,
         outbound: outbound_tx,

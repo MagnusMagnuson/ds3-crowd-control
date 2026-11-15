@@ -87,6 +87,8 @@ public class CatalogTests
         Assert.Contains(loaded.Presets, preset => preset.HandlerId == "set_health_random_percent");
         Assert.Contains(loaded.Presets, preset => preset.HandlerId == "spawn_random_enemy");
         Assert.Contains(loaded.Presets, preset => preset.Name == "Spawn NPC Invader" && preset.HandlerId == "spawn_npc_invader");
+        var ally = loaded.Presets.Single(preset => preset.Name == "Spawn NPC Ally" && preset.HandlerId == "spawn_npc_ally");
+        Assert.Equal(63020, ally.Arguments["arrivalAnimation"].GetInt32());
         var shuffle = loaded.Presets.Single(preset => preset.Name == "Shuffle Stats" && preset.HandlerId == "shuffle_stats");
         Assert.Equal(0, shuffle.Arguments["seconds"].GetInt32());
         var freeze = loaded.Presets.Single(preset => preset.Name == "Freeze" && preset.HandlerId == "freeze");

@@ -54,6 +54,7 @@ Each event can be fired with **Test** on the Presets page, or by Twitch once its
 | 1 HP | Sets HP to 1. |
 | 1 Hit Run | Holds HP at 1 for a while, so any hit kills. |
 | Invincible | No hit damage for a while. |
+| Give Ember | Gives you Embers, which you use to become embered. |
 | Set health to 50%, Set health to random % | Sets HP to a share of the maximum. |
 | Random Weapon | Gives and equips a random weapon in the right hand. |
 | Random Armor | Gives and equips a random piece in every armor slot. |
@@ -63,11 +64,14 @@ Each event can be fired with **Test** on the Presets page, or by Twitch once its
 | Shuffle Stats | Swaps your stats around without changing your level. By default it stays that way; set a time to get your stats back. |
 | Spawn Random Enemy | Spawns enemies near you, from this area or the whole game, with an option for bosses. |
 | Spawn NPC Invader | A named NPC invader such as Havel, Hodrick or Kirk appears near you as a Dark Spirit, with its own gear. The game announces the invasion, naming the viewer who sent it if you want. |
+| Spawn NPC Ally | A named NPC is summoned near you as a white phantom that fights on your side. The game announces the summon, naming the viewer who sent it if you want. |
 | Blind | Fades to black for a few seconds. |
 | Oversaturate | Pushes the colours far too high for a while. |
 | Freeze | Freezes you in place for a few seconds. The camera still moves. |
 | Invert Controls | Flips the controller sticks for a while. |
 | Pacifist | No attacking, blocking or using items for a while. Use selected item still works. Needs a controller. |
+
+**Show developer tools** on the General page also adds testing effects to the Presets page. They never show on the Events page, so they cannot become Twitch rewards: Toggle invincibility, Toggle invisibility (enemies neither see nor hear you), Dump phantoms, Dump player data, Watch item button, and the performance tools. **Toggle performance measuring** starts timing every frame and every part of the mod; **Performance report** then shows frame times, the mod's share of each slow frame and how busy the game's threads are, with the full report in `ds3mod.log`. Measuring is off until you switch it on.
 
 Use selected item presses X, which is the use-item button on the game's default controls. If the controls were changed, turn on **Show developer tools**, run **Watch item button** and press the use-item button once, and the mod learns the new button.
 

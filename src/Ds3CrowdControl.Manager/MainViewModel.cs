@@ -211,7 +211,7 @@ public partial class EventToggle : ObservableObject
 public partial class MainViewModel : ObservableObject
 {
     /// <summary>Tools for working on the mod, shown on the Presets page only when asked for.</summary>
-    private static readonly HashSet<string> DiagnosticHandlers = ["dump_player_data", "watch_item_button"];
+    private static readonly HashSet<string> DiagnosticHandlers = ["dump_player_data", "dump_phantoms", "toggle_invincible", "toggle_invisible", "watch_item_button", "toggle_performance", "performance_report"];
 
     private readonly SynchronizationContext _ui;
     private readonly Catalog _catalog;
@@ -302,6 +302,7 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("Shuffle Stats", "shuffle_stats"),
                 _catalog.EnsurePreset("Spawn Random Enemy", "spawn_random_enemy"),
                 _catalog.EnsurePreset("Spawn NPC Invader", "spawn_npc_invader"),
+                _catalog.EnsurePreset("Spawn NPC Ally", "spawn_npc_ally"),
                 _catalog.EnsurePreset("Oversaturate", "oversaturate"),
                 _catalog.EnsurePreset("Blind", "blind"),
                 _catalog.EnsurePreset("Freeze", "freeze"),
@@ -309,6 +310,12 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("Pacifist", "pacifist"),
                 _catalog.EnsurePreset("Set health to 50%", "set_health_percent"),
                 _catalog.EnsurePreset("Set health to random %", "set_health_random_percent"),
+                _catalog.EnsurePreset("Give Ember", "give_ember"),
+                _catalog.EnsurePreset("Toggle invincibility", "toggle_invincible"),
+                _catalog.EnsurePreset("Toggle invisibility", "toggle_invisible"),
+                _catalog.EnsurePreset("Toggle performance measuring", "toggle_performance"),
+                _catalog.EnsurePreset("Performance report", "performance_report"),
+                _catalog.EnsurePreset("Dump phantoms", "dump_phantoms"),
                 _catalog.EnsurePreset("Watch item button", "watch_item_button")
             }.Where(preset => preset is not null).Cast<EffectPreset>().ToList();
             if (!handlersChanged && added.Count == 0 && removed.Count == 0)

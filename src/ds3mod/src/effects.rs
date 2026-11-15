@@ -144,23 +144,36 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(5).clamp(1, 16) as usize;
             game::spawn_random_enemy(amount.clamp(1, 10) as i32, whole_game, bosses, only_bosses, replace_oldest, limit)
         }
-        "spawn_npc_invader" => {
+        "spawn_npc_invader" | "spawn_npc_ally" => {
+            let friendly = handler == "spawn_npc_ally";
             let viewer = args.get("viewer").and_then(Value::as_str).unwrap_or("");
             let ids = args.get("npcParamIds").and_then(Value::as_str).unwrap_or("");
-            let number = |name: &str, max: i64| {
-                args.get(name).and_then(Value::as_i64).unwrap_or(0).clamp(0, max) as u32
+            let number = |name: &str, fallback: i64, max: i64| {
+                args.get(name).and_then(Value::as_i64).unwrap_or(fallback).clamp(0, max) as u32
             };
             game::spawn_npc_invader(game::InvaderOptions {
                 viewer,
                 use_sender_name: args.get("useSenderName").and_then(Value::as_i64).unwrap_or(1) != 0,
                 ids_text: ids,
-                think_override: number("thinkParamId", 99_999_999),
+                think_override: number("thinkParamId", 0, 99_999_999),
+                arrival_delay: number("arrivalDelay", 4, 30),
+                arrival_animation: number("arrivalAnimation", if friendly { 63_020 } else { 63_010 }, 99_999) as i32,
+                friendly,
             })
         }
         "dump_player_data" => {
             let soul_count = args.get("soulCount").and_then(Value::as_i64).unwrap_or(0);
             game::dump_player_data(soul_count)
         }
+        "give_ember" => {
+            let amount = args.get("amount").and_then(Value::as_i64).unwrap_or(1);
+            game::give_ember(amount.clamp(1, 99) as u32)
+        }
+        "toggle_invincible" => game::toggle_invincible(),
+        "toggle_invisible" => game::toggle_invisible(),
+        "dump_phantoms" => game::dump_phantoms(),
+        "toggle_performance" => crate::perf::toggle(),
+        "performance_report" => crate::perf::report(),
         "watch_item_button" => game::start_button_watch(),
         _ => return Outcome::Unavailable(format!("unknown handler {handler}")),
     };

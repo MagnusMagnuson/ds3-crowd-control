@@ -395,37 +395,7 @@ fn read_usize(address: usize) -> Result<usize, String> {
 }
 
 fn copy_readable(address: usize, destination: &mut [u8]) -> usize {
-    use windows::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-    if destination.is_empty() || address < 0x10_000 {
-        return 0;
-    }
-    let mut info = MEMORY_BASIC_INFORMATION::default();
-    let queried = unsafe {
-        VirtualQuery(
-            Some(address as *const _),
-            &mut info,
-            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-        )
-    };
-    if queried == 0 || info.State != MEM_COMMIT || info.Protect.0 & 0x100 != 0 {
-        return 0;
-    }
-    let protection = info.Protect.0 & 0xFF;
-    if !matches!(protection, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80) {
-        return 0;
-    }
-    let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
-    let count = destination.len().min(region_end.saturating_sub(address));
-    if count > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                address as *const u8,
-                destination.as_mut_ptr(),
-                count,
-            )
-        };
-    }
-    count
+    crate::game::copy_readable(address, destination)
 }
 
 fn changed_bits(before: &[u8], after: &[u8]) -> Vec<usize> {
@@ -638,7 +608,14 @@ unsafe extern "system" fn hooked_xinput_get_state(index: u32, state: *mut XInput
     if result != 0 || state.is_null() {
         return result;
     }
+    // Only the mod's own part is timed: reading the controller is the game's work.
     let state = unsafe { &mut *state };
+    crate::perf::time(&crate::perf::XINPUT_HOOK, || adjust_controller_state(index, state));
+    result
+}
+
+/// What the mod does to a controller reading before the game sees it.
+fn adjust_controller_state(index: u32, state: &mut XInputState) {
     let physical = state.gamepad.buttons;
     LAST_CONTROLLER.store(index, Ordering::Release);
     LAST_BUTTONS.store(physical as u32, Ordering::Release);
@@ -664,7 +641,6 @@ unsafe extern "system" fn hooked_xinput_get_state(index: u32, state: *mut XInput
     if clock_ms() < BLOCK_UNTIL_MS.load(Ordering::Acquire) {
         blank_player_input(&mut state.gamepad);
     }
-    result
 }
 
 fn inject_button(buttons: u16, button: u16) -> u16 {

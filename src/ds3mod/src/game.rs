@@ -84,6 +84,28 @@ const SUMMON_MESSAGE_CALL: usize = 21;
 /// Builds an empty name object for that routine: a tag, a wide string and a flag.
 const NAME_OBJECT_PATTERN: &str =
     "48 89 4C 24 08 57 48 83 EC 30 48 C7 44 24 28 FE FF FF FF 48 89 5C 24 50 48 8B F9 C7 44 24 20 00 00 00 00 48 8D 05 ?? ?? ?? ?? 48 89 01 48 8D 59 08 48 89 5C 24 48 48 8B CB E8 ?? ?? ?? ?? 90 C6 43 28 01";
+/// The game's "name of this character" routine: `(name object to fill, chr, decorated)`.
+/// Lock-on, the health bar and messages all ask it. For an NPC it reads the name from the
+/// text files through the NPC row, so a per-invader name is only possible by answering in
+/// its place. It is plain code, the same on disk as in memory, not one of the encrypted
+/// routines the game guards.
+const CHR_NAME_PATTERN: &str =
+    "48 8B C4 55 57 41 56 48 8D 68 98 48 81 EC 50 01 00 00 48 C7 44 24 48 FE FF FF FF 48 89 58 18 48 89 70 20 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 40 41 0F B6 F0 48 8B DA 48 8B F9";
+/// The game's routine for a real player joining as a phantom. Three calls inside it are
+/// used on spawned NPCs: set the phantom type and refresh what follows from it (a fallback
+/// when the NPC routine below is not found), get the session's list of phantoms, and add
+/// a character to that list, which puts it in the list on the left of the screen.
+const SUMMON_NPC_PATTERN: &str =
+    "40 53 55 56 57 41 56 48 83 EC 70 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 44 24 60 41 8B 30 48 8B E9 48 8B 0D ?? ?? ?? ?? 45 0F B6 F1 49 8B F8 48 8B DA";
+const SUMMON_NPC_SET_TYPE_CALL: usize = 0x77;
+const SUMMON_NPC_SESSION_CALL: usize = 0x9E;
+const SUMMON_NPC_JOIN_CALL: usize = 0xEC;
+/// The game's routine that turns an NPC built like a player into a phantom. Sign summons
+/// and scripted invasions both go through it: `(_, chr handle, phantom type, invade type)`
+/// gives back the character. Besides the type and the team it marks the NPC's player data
+/// as a phantom's, which nothing else does.
+const PHANTOM_NPC_PATTERN: &str =
+    "44 89 44 24 18 89 54 24 10 56 48 83 EC 40 48 8B 0D ?? ?? ?? ?? 41 0F B6 F1 48 85 C9 75 2A";
 /// WorldChrMan field that points at the debug character creator.
 const DEBUG_CHR_CREATOR: usize = 0x3018;
 const CREATOR_THINK_ID: usize = 0x124;
@@ -126,6 +148,18 @@ struct Located {
     map_chr_place: Result<usize, String>,
     summon_message: Result<SummonMessage, String>,
     name_object: Result<usize, String>,
+    summon_npc: Result<SummonNpc, String>,
+    phantom_npc: Result<usize, String>,
+}
+
+#[derive(Clone, Copy)]
+struct SummonNpc {
+    /// `(chr, phantom type)`
+    set_type: usize,
+    /// `() -> session`
+    session: usize,
+    /// `(session, chr handle, phantom type, stage, -1, -1, 0)`
+    join: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -161,9 +195,11 @@ pub fn prepare() {
             map_chr_place: find_unique(MAP_CHR_PLACE_PATTERN),
             summon_message: locate_summon_message(),
             name_object: find_unique(NAME_OBJECT_PATTERN),
+            summon_npc: locate_summon_npc(),
+            phantom_npc: find_unique(PHANTOM_NPC_PATTERN),
         };
         crate::log::log(format!(
-            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={} spawn={} attune={} invader={} invasion_message={}",
+            "patterns resolved: session={} souls={} text_effect={} fade={} save={} equip={} spawn={} attune={} invader={} invasion_message={} summon={} phantom={}",
             located.game_man_slot.is_ok(),
             located.add_soul.is_ok(),
             located.set_text_effect.is_ok(),
@@ -174,9 +210,16 @@ pub fn prepare() {
             located.free_attune_slots.is_ok(),
             located.map_chr_factory.is_ok() && located.map_chr_place.is_ok(),
             located.summon_message.is_ok() && located.name_object.is_ok(),
+            located.summon_npc.is_ok(),
+            located.phantom_npc.is_ok(),
         ));
         located
     });
+    install_chr_name_hook();
+    // Searching the game's code takes 25-50 ms each time. Done here, at attach, the first
+    // ally or invader does not freeze the game for that long.
+    install_locally_simulated_hook();
+    ai_target_list_slot();
 }
 
 #[derive(Clone, Debug)]
@@ -591,6 +634,22 @@ fn save_living_player() {
     request_save();
 }
 
+fn locate_summon_npc() -> Result<SummonNpc, String> {
+    let site = find_unique(SUMMON_NPC_PATTERN)?;
+    let call = |offset: usize| -> Result<usize, String> {
+        let mut opcode = [0u8; 1];
+        if copy_readable(site + offset, &mut opcode) != 1 || opcode[0] != 0xE8 {
+            return Err(format!("the summon routine has no call at {offset:#x}"));
+        }
+        pattern::rip_target(site + offset, 1, 5)
+    };
+    Ok(SummonNpc {
+        set_type: call(SUMMON_NPC_SET_TYPE_CALL)?,
+        session: call(SUMMON_NPC_SESSION_CALL)?,
+        join: call(SUMMON_NPC_JOIN_CALL)?,
+    })
+}
+
 fn locate_summon_message() -> Result<SummonMessage, String> {
     let site = find_unique(SUMMON_MESSAGE_SITE_PATTERN)?;
     Ok(SummonMessage {
@@ -773,10 +832,43 @@ fn write_i32_checked(addr: usize, value: i32) -> Result<(), String> {
     write_bytes_checked(addr, &value.to_ne_bytes())
 }
 
+/// `NtWriteVirtualMemory(process, address, buffer, size, written) -> status`.
+type NtWriteVirtualMemory = unsafe extern "system" fn(isize, *mut std::ffi::c_void, *const std::ffi::c_void, usize, *mut usize) -> i32;
+
+/// Windows' own write routine, which fails on memory that is not writable (read-only,
+/// missing) instead of crashing. Unlike WriteProcessMemory it never makes read-only memory
+/// writable, and unlike asking about the region first it does not walk every page of it.
+fn nt_write_virtual_memory() -> Option<NtWriteVirtualMemory> {
+    static FUNCTION: OnceLock<usize> = OnceLock::new();
+    let address = *FUNCTION.get_or_init(|| unsafe {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        GetModuleHandleW(windows::core::w!("ntdll.dll"))
+            .ok()
+            .and_then(|module| GetProcAddress(module, windows::core::s!("NtWriteVirtualMemory")))
+            .map(|function| function as usize)
+            .unwrap_or(0)
+    });
+    (address != 0).then(|| unsafe { std::mem::transmute::<usize, NtWriteVirtualMemory>(address) })
+}
+
 fn write_bytes_checked(addr: usize, bytes: &[u8]) -> Result<(), String> {
     use windows::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     if addr < 0x10_000 {
         return Err(format!("address {addr:#X} is not writable"));
+    }
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if let Some(write) = nt_write_virtual_memory() {
+        /// The handle Windows uses for "this process".
+        const THIS_PROCESS: isize = -1;
+        let mut written = 0usize;
+        let status = unsafe { write(THIS_PROCESS, addr as *mut _, bytes.as_ptr().cast(), bytes.len(), &mut written) };
+        return if status == 0 && written == bytes.len() {
+            Ok(())
+        } else {
+            Err(format!("address {addr:#X} is not writable"))
+        };
     }
     let mut info = MEMORY_BASIC_INFORMATION::default();
     let written = unsafe {
@@ -1329,8 +1421,67 @@ pub fn invincible(seconds: i32) -> Result<String, String> {
     Ok(format!("invincible for {remaining} seconds"))
 }
 
+/// A testing switch: no hit damage until it is switched off again. Unlike the timed
+/// effect it survives deaths, rests and warps.
+static ALWAYS_INVINCIBLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn toggle_invincible() -> Result<String, String> {
+    use std::sync::atomic::Ordering;
+    let on = !ALWAYS_INVINCIBLE.fetch_xor(true, Ordering::AcqRel);
+    if !on {
+        // A timed Invincible that is still running keeps the protection for its own time.
+        let timed = INVINCIBILITY.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        if !timed {
+            if let Ok(player) = local_player() {
+                let _ = set_no_damage(unsafe { &mut *player }, false);
+            }
+        }
+    }
+    Ok(if on { "invincibility is on until you switch it off" } else { "invincibility is off" }.to_string())
+}
+
+/// Where enemy AI reads the game's own "hide the player" debug switch. The byte after it
+/// is the matching "player makes no sound" switch.
+const PLAYER_HIDE_PATTERN: &str = "80 3D ?? ?? ?? ?? 00 0F 94 C0 84 C0 74 0E 44 8B C3 48 8B D6 48 8B CF";
+
+/// A testing switch: enemies neither see nor hear the player until it is switched off.
+pub fn toggle_invisible() -> Result<String, String> {
+    static HIDE: OnceLock<Result<usize, String>> = OnceLock::new();
+    let hide = HIDE
+        .get_or_init(|| find_unique(PLAYER_HIDE_PATTERN).and_then(|site| pattern::rip_target(site, 2, 7)))
+        .clone()?;
+    let mut now = [0u8; 1];
+    if copy_readable(hide, &mut now) != 1 {
+        return Err("the hide switch cannot be read".to_string());
+    }
+    let on = now[0] == 0;
+    write_bytes_checked(hide, &[on as u8, on as u8])?;
+    Ok(if on { "enemies ignore you until you switch it off" } else { "enemies notice you again" }.to_string())
+}
+
+/// Ember, the item that restores the Lord of Cinder form and with it summoning.
+const EMBER: u32 = 0x1F4;
+/// The game holds at most this many of one item.
+const MAX_ITEM_GIFT: u32 = 99;
+
+pub fn give_ember(amount: u32) -> Result<String, String> {
+    local_player()?;
+    let item = ItemId::new(ItemCategory::Goods, EMBER).map_err(|error| format!("the Ember id is invalid: {error:?}"))?;
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    let amount = amount.clamp(1, MAX_ITEM_GIFT);
+    game_data.give_item_directly(item, amount);
+    Ok(if amount == 1 { "gave 1 Ember".to_string() } else { format!("gave {amount} Embers") })
+}
+
 pub fn poll_invincibility() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
+        if ALWAYS_INVINCIBLE.load(std::sync::atomic::Ordering::Acquire) {
+            if let Ok(player) = local_player() {
+                let _ = set_no_damage(unsafe { &mut *player }, true);
+            }
+            return;
+        }
         let mut slot = INVINCIBILITY.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(state) = slot.as_mut() else {
             return;
@@ -1899,19 +2050,59 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// A file save the game should not wait for.
+enum FileJob {
+    /// Write the text beside the file first, then swap it in, so a crash halfway cannot
+    /// lose the old file.
+    Replace { what: &'static str, path: std::path::PathBuf, text: String },
+    Remove { what: &'static str, path: std::path::PathBuf },
+}
+
+static FILE_JOBS: OnceLock<crossbeam_channel::Sender<FileJob>> = OnceLock::new();
+
+/// Hands a save to a thread of its own, which does them one after another in the order
+/// they come. Writing a file can take a few milliseconds, which the game would feel as a
+/// hitch if its own thread did it.
+fn save_in_background(job: FileJob) {
+    let sender = FILE_JOBS.get_or_init(|| {
+        let (sender, receiver) = crossbeam_channel::unbounded::<FileJob>();
+        std::thread::spawn(move || {
+            crate::perf::name_thread("mod: saving files");
+            for job in receiver {
+                if let Err((what, error)) = run_file_job(job) {
+                    crate::log::log(format!("{what} could not be saved: {error}"));
+                }
+            }
+        });
+        sender
+    });
+    let _ = sender.send(job);
+}
+
+fn run_file_job(job: FileJob) -> Result<(), (&'static str, String)> {
+    match job {
+        FileJob::Replace { what, path, text } => {
+            let partial = path.with_extension("tmp");
+            std::fs::write(&partial, text).map_err(|error| (what, error.to_string()))?;
+            std::fs::rename(&partial, &path).map_err(|error| (what, error.to_string()))
+        }
+        FileJob::Remove { what, path } => match std::fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err((what, error.to_string())),
+            _ => Ok(()),
+        },
+    }
+}
+
 fn write_pending(restores: &PendingRestores) -> Result<(), String> {
+    const WHAT: &str = "the list of gear to put back";
     let path = crate::log::app_dir()?.join(PENDING_RESTORES_FILE);
     if restores.is_empty() {
-        return match std::fs::remove_file(&path) {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
-            _ => Ok(()),
-        };
+        save_in_background(FileJob::Remove { what: WHAT, path });
+        return Ok(());
     }
     let text = serde_json::to_string_pretty(restores).map_err(|error| error.to_string())?;
-    // Written beside the real file first, so a crash mid-write cannot lose the old one.
-    let partial = path.with_extension("tmp");
-    std::fs::write(&partial, text).map_err(|error| error.to_string())?;
-    std::fs::rename(&partial, &path).map_err(|error| error.to_string())
+    save_in_background(FileJob::Replace { what: WHAT, path, text });
+    Ok(())
 }
 
 fn save_pending(restores: &PendingRestores) {
@@ -3006,9 +3197,8 @@ fn load_gear_snapshots() -> GearSnapshots {
 fn save_gear_snapshots(snapshots: &GearSnapshots) -> Result<(), String> {
     let path = gear_snapshot_path()?;
     let text = serde_json::to_string_pretty(snapshots).map_err(|error| error.to_string())?;
-    let partial = path.with_extension("tmp");
-    std::fs::write(&partial, text).map_err(|error| error.to_string())?;
-    std::fs::rename(&partial, &path).map_err(|error| error.to_string())
+    save_in_background(FileJob::Replace { what: "gear snapshot", path, text });
+    Ok(())
 }
 
 fn equipped_item(player: &PlayerIns, slot: u32) -> u32 {
@@ -3403,6 +3593,116 @@ pub fn dump_player_data(soul_count: i64) -> Result<String, String> {
     Ok(format!("wrote {}", path.display()))
 }
 
+/// WorldChrMan: two more character sets next to the spawned one. Capacity, then entries.
+const OTHER_CHR_SETS: [usize; 2] = [0x38, 0x50];
+
+fn chr_set_members(set: usize) -> Vec<usize> {
+    let capacity = read_u32_checked(set).unwrap_or(0) as usize;
+    let entries = read_usize_checked(set + 8).unwrap_or(0);
+    if capacity == 0 || capacity > MAX_CHRS_PER_BLOCK as usize || entries < 0x10_000 {
+        return Vec::new();
+    }
+    (0..capacity)
+        .filter_map(|index| read_usize_checked(entries + index * CHR_SET_ENTRY_SIZE).ok())
+        .filter(|chr| *chr >= 0x10_000)
+        .collect()
+}
+
+fn dump_region(text: &mut String, name: &str, address: usize, size: usize) {
+    let mut bytes = vec![0u8; size];
+    let got = if address >= 0x10_000 { copy_readable(address, &mut bytes) } else { 0 };
+    text.push_str(&format!("REGION {name} {address:#x} {got:#x}\n"));
+    for (index, chunk) in bytes[..got].chunks(16).enumerate() {
+        text.push_str(&format!("{:04X} ", index * 16));
+        for byte in chunk {
+            text.push_str(&format!("{byte:02X} "));
+        }
+        text.push('\n');
+    }
+}
+
+/// Writes the state of every player-type character in the area to a file: the player,
+/// real NPC phantoms the game placed, and the ones this mod spawned. For comparing a
+/// working summon with ours.
+pub fn dump_phantoms() -> Result<String, String> {
+    let player = local_player()? as usize;
+    let player_class = read_usize_checked(player)?;
+    let world = unsafe { WorldChrMan::instance() }
+        .map_err(|error| format!("WorldChrMan is unavailable: {error:?}"))?;
+    let mut found: Vec<(String, usize)> = Vec::new();
+    let slots = world.world_block_chr.as_ptr() as usize;
+    let slot_size = std::mem::size_of_val(&world.world_block_chr) / world.world_block_chr.len();
+    for index in 0..world.world_block_chr.len() {
+        let block = slots + index * slot_size;
+        let capacity = read_u32_checked(block + BLOCK_CHR_SET_CAPACITY).unwrap_or(0) as usize;
+        let entries = read_usize_checked(block + BLOCK_CHR_SET_ENTRIES).unwrap_or(0);
+        if capacity == 0 || capacity > MAX_CHRS_PER_BLOCK as usize || entries < 0x10_000 {
+            continue;
+        }
+        for entry in 0..capacity {
+            let chr = read_usize_checked(entries + entry * CHR_SET_ENTRY_SIZE).unwrap_or(0);
+            if chr >= 0x10_000 {
+                found.push((format!("block{index}[{entry}]"), chr));
+            }
+        }
+    }
+    let world = world as *const WorldChrMan as usize;
+    for chr in chr_set_members(world + DEBUG_CHR_SET) {
+        found.push(("spawned".to_string(), chr));
+    }
+    for (index, offset) in OTHER_CHR_SETS.iter().enumerate() {
+        for chr in chr_set_members(world + offset) {
+            found.push((format!("set{index}"), chr));
+        }
+    }
+    found.push(("player".to_string(), player));
+    found.retain(|(_, chr)| read_usize_checked(*chr) == Ok(player_class));
+    found.sort_by_key(|(_, chr)| *chr);
+    found.dedup_by_key(|(_, chr)| *chr);
+
+    let mut text = String::new();
+    for (origin, chr) in &found {
+        let chr = *chr;
+        let pointer = |offset: usize| read_usize_checked(chr + offset).unwrap_or(0);
+        let ctrl = pointer(CHR_CTRL_OFFSET);
+        let modules = pointer(MODULES_OFFSET);
+        let module = |offset: usize| read_usize_checked(modules + offset).unwrap_or(0);
+        let player_data = pointer(PLAYER_GAME_DATA);
+        text.push_str(&format!(
+            "CHR {chr:#x} origin={origin} name={:?} npc={} type={} team={} hp={:?}\n",
+            chr_name(chr),
+            read_u32_checked(chr + 0x68).unwrap_or(0),
+            read_u32_checked(chr + CHR_TYPE_OFFSET).unwrap_or(0),
+            read_u32_checked(chr + CHR_TEAM_OFFSET).unwrap_or(0),
+            chr_health(chr),
+        ));
+        dump_region(&mut text, "chr_head", chr, 0x200);
+        dump_region(&mut text, "chr_flags", chr + 0x1A00, 0x180);
+        dump_region(&mut text, "chr_tail", chr + 0x1EC0, 0x2E0);
+        text.push_str(&format!("NOTE {}\n", team_report(chr)));
+        text.push_str(&format!("NOTE {}\n", ai_target_list(chr, false)));
+        dump_region(&mut text, "ctrl", ctrl, 0x200);
+        dump_region(&mut text, "ctrl_sub48", read_usize_checked(ctrl + 0x48).unwrap_or(0), 0x140);
+        dump_region(&mut text, "modules", modules, 0x90);
+        dump_region(&mut text, "data_module", module(DATA_MODULE_OFFSET), 0x140);
+        dump_region(&mut text, "event_module", module(EVENT_MODULE_OFFSET), 0x80);
+        dump_region(&mut text, "physics_module", module(PHYSICS_MODULE_OFFSET), 0x100);
+        dump_region(&mut text, "player_data", player_data, 0x140);
+        dump_region(&mut text, "ai", pointer(0x1FA8), 0x200);
+        dump_region(&mut text, "ai2", pointer(0x1FB0), 0x100);
+        dump_region(&mut text, "npc_lookup", pointer(NPC_ROW_LOOKUP), 0x10);
+    }
+    let dir = crate::log::app_dir()?;
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("phantom-dump-{stamp}.txt"));
+    std::fs::write(&path, text).map_err(|error| error.to_string())?;
+    Ok(format!("recorded {} player-type characters in {}", found.len(), path.display()))
+}
+
 pub fn is_empty_item(item_id: i32) -> bool {
     item_id <= 0
 }
@@ -3542,11 +3842,15 @@ fn read_usize_checked(addr: usize) -> Result<usize, String> {
     Ok(unsafe { (addr as *const usize).read() })
 }
 
-fn copy_readable(addr: usize, dest: &mut [u8]) -> usize {
+pub(crate) fn copy_readable(addr: usize, dest: &mut [u8]) -> usize {
     use windows::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
     if dest.is_empty() || addr < 0x10_000 || addr > isize::MAX as usize - dest.len() {
         return 0;
     }
+    if read_into(addr, dest) {
+        return dest.len();
+    }
+    // Only part of it may be readable: ask about the region and copy what is there.
     let mut info = MEMORY_BASIC_INFORMATION::default();
     let written = unsafe {
         VirtualQuery(
@@ -3574,27 +3878,49 @@ fn copy_readable(addr: usize, dest: &mut [u8]) -> usize {
     count
 }
 
-fn readable_qword(addr: usize) -> bool {
-    use windows::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-    if addr < 0x10_000 || addr > isize::MAX as usize - 8 {
+/// Copies from the game's memory, or fails without crashing when the address is not
+/// readable. Asking Windows about the memory region first (VirtualQuery) is what the mod
+/// did before, but Windows answers it by walking every page of the region, and in the
+/// game's large heaps that took up to half a millisecond per read. A read through
+/// ReadProcessMemory fails the same way on a bad address and costs a few microseconds.
+fn read_into(addr: usize, dest: &mut [u8]) -> bool {
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    if dest.is_empty() || addr < 0x10_000 || addr > isize::MAX as usize - dest.len() {
         return false;
     }
-    let mut info = MEMORY_BASIC_INFORMATION::default();
-    let written = unsafe {
-        VirtualQuery(
-            Some(addr as *const _),
-            &mut info,
-            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-        )
+    let mut read = 0usize;
+    let copied = unsafe {
+        ReadProcessMemory(GetCurrentProcess(), addr as *const _, dest.as_mut_ptr().cast(), dest.len(), Some(&mut read))
     };
-    if written == 0 || info.State != MEM_COMMIT {
-        return false;
+    copied.is_ok() && read == dest.len()
+}
+
+/// What one VirtualQuery and one ReadProcessMemory on the player cost here, in microseconds,
+/// for the performance report.
+pub fn memory_check_cost() -> Option<(f64, f64)> {
+    use windows::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION};
+    const ROUNDS: u32 = 64;
+    let player = local_player().ok()? as usize;
+    let start = Instant::now();
+    for _ in 0..ROUNDS {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        unsafe { VirtualQuery(Some(player as *const _), &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        std::hint::black_box(info.RegionSize);
     }
-    let protect = info.Protect.0 & 0xFF;
-    let readable = matches!(protect, 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80);
-    let guarded = (info.Protect.0 & 0x100) != 0;
-    let region_end = (info.BaseAddress as usize).saturating_add(info.RegionSize);
-    readable && !guarded && addr + 8 <= region_end
+    let query = start.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS);
+    let start = Instant::now();
+    for _ in 0..ROUNDS {
+        let mut bytes = [0u8; 8];
+        std::hint::black_box(read_into(player, &mut bytes));
+    }
+    let read = start.elapsed().as_secs_f64() * 1e6 / f64::from(ROUNDS);
+    Some((query, read))
+}
+
+fn readable_qword(addr: usize) -> bool {
+    let mut bytes = [0u8; 8];
+    read_into(addr, &mut bytes)
 }
 
 fn patterns_resolve() -> bool {
@@ -3652,6 +3978,8 @@ struct EnemyChoice {
     invader: bool,
     /// Key of an invader's note: what to announce when it arrives. 0 for none.
     label: u32,
+    /// A human NPC that arrives as a white phantom on the player's side.
+    friendly: bool,
 }
 
 /// Named human invaders. Each has an NPC row and a CharaInit row (gear, stats, face) with
@@ -3785,9 +4113,11 @@ const CHR_MODEL: usize = 0x48;
 /// TGA: character kind. 2 is Dark Spirit (red phantom look and death mist).
 const CHR_TYPE_OFFSET: usize = 0x70;
 const CHR_TYPE_DARK_SPIRIT: i32 = 2;
+const CHR_TYPE_WHITE_PHANTOM: i32 = 1;
 /// TGA: team. 16 is Dark Spirit (hostile to the host).
 const CHR_TEAM_OFFSET: usize = 0x74;
 const CHR_TEAM_DARK_SPIRIT: u32 = 16;
+const CHR_TEAM_WHITE_PHANTOM: u32 = 2;
 /// A spawn with no model by now is frozen.
 const SPAWN_CHECK_FRAMES: u32 = 150;
 /// While the list is full, the queue only looks again after this many frames.
@@ -4018,6 +4348,7 @@ fn delete_spawns(chrs: &[usize], requested: &mut Vec<usize>) -> Result<(), Strin
     let world = world as *const WorldChrMan as usize;
     let call: extern "C" fn(usize, usize) = unsafe { std::mem::transmute(delete) };
     for chr in chrs.iter().copied() {
+        forget_invader_name(chr);
         if !requested.contains(&chr) {
             call(world, chr);
             requested.push(chr);
@@ -4105,6 +4436,7 @@ pub fn spawn_random_enemy(
                 npc_id,
                 think_id: candidates[random_index(candidates.len())],
                 invader: false,
+                friendly: false,
                 label: 0,
             })
         })
@@ -4197,6 +4529,156 @@ fn invader_init_think(npc_id: u32) -> Option<i32> {
     let regulation = unsafe { CSRegulationManager::instance() }.ok()?;
     let inits = regulation.get_param::<CHARACTER_INIT_PARAM>();
     inits.get(u64::from(npc_id)).map(|row| row.npc_player_think_id())
+}
+
+/// An invader that is a dark spirit in the game's own data, used as the model for the look.
+const DARK_SPIRIT_LOOK_FROM: u32 = 29_440;
+
+/// The two CharaInit fields that decide what kind of phantom an NPC is built as and how it
+/// is drawn: white for a summon, red for an invader, and so on.
+fn npc_look(npc_id: u32) -> Option<(u8, u8)> {
+    let regulation = unsafe { CSRegulationManager::instance() }.ok()?;
+    let row = regulation.get_param::<CHARACTER_INIT_PARAM>().get(u64::from(npc_id))?;
+    Some((row.npc_player_type(), row.npc_player_draw_type()))
+}
+
+fn set_npc_look(npc_id: u32, look: (u8, u8)) {
+    let Ok(regulation) = (unsafe { CSRegulationManager::instance_mut() }) else {
+        return;
+    };
+    if let Some(row) = regulation.get_mut_param::<CHARACTER_INIT_PARAM>().get_mut(u64::from(npc_id)) {
+        row.set_npc_player_type(look.0);
+        row.set_npc_player_draw_type(look.1);
+    }
+}
+
+/// Some of the named NPCs are set up as summons or neutral characters, so they would arrive
+/// with a white glow. For the moment it is built, the NPC's row gets the look of a real
+/// dark spirit. Returns the row's own look to put back, or none if nothing was changed.
+fn borrow_dark_spirit_look(npc_id: u32) -> Option<(u8, u8)> {
+    let own = npc_look(npc_id)?;
+    let dark_spirit = npc_look(DARK_SPIRIT_LOOK_FROM)?;
+    if own == dark_spirit {
+        return None;
+    }
+    crate::log::log(format!(
+        "invader {npc_id}: look {own:?} -> {dark_spirit:?} (taken from {DARK_SPIRIT_LOOK_FROM})"
+    ));
+    set_npc_look(npc_id, dark_spirit);
+    Some(own)
+}
+
+/// The NPC row fields that decide which side a human NPC is on and how it is drawn as a
+/// phantom: team, phantom look, draw type and NPC type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NpcSide {
+    team: u8,
+    phantom: i32,
+    draw: u8,
+    kind: u8,
+}
+
+fn npc_side(npc_id: u32) -> Option<NpcSide> {
+    let regulation = unsafe { CSRegulationManager::instance() }.ok()?;
+    let row = regulation.get_param::<NPC_PARAM_ST>().get(u64::from(npc_id))?;
+    Some(NpcSide {
+        team: row.team_type(),
+        phantom: row.phantom_param_id(),
+        draw: row.draw_type(),
+        kind: row.npc_type(),
+    })
+}
+
+fn set_npc_side(npc_id: u32, side: NpcSide) {
+    let Ok(regulation) = (unsafe { CSRegulationManager::instance_mut() }) else {
+        return;
+    };
+    if let Some(row) = regulation.get_mut_param::<NPC_PARAM_ST>().get_mut(u64::from(npc_id)) {
+        row.set_team_type(side.team);
+        row.set_phantom_param_id(side.phantom);
+        row.set_draw_type(side.draw);
+        row.set_npc_type(side.kind);
+    }
+}
+
+/// The side of a white phantom summon, as the game's own summonable NPCs have it.
+const WHITE_PHANTOM_SIDE: NpcSide = NpcSide { team: CHR_TEAM_WHITE_PHANTOM as u8, phantom: 80, draw: 0, kind: 0 };
+/// What the game's own invaders have, in case the model row is missing.
+const DARK_SPIRIT_SIDE: NpcSide = NpcSide { team: CHR_TEAM_DARK_SPIRIT as u8, phantom: 81, draw: 0, kind: 0 };
+/// PlayerIns: its NPC row lookup, an id followed by a pointer to the row.
+const NPC_ROW_LOOKUP: usize = 0x2038;
+const NPC_ROW_LOOKUP_ROW: usize = 0x08;
+
+/// Every human NPC (one with a CharaInit row of the same id) and the side the game's data
+/// gives it. Read once, before the mod changes any row, so it stays the game's own view.
+fn natural_sides() -> &'static [(u32, NpcSide)] {
+    static SIDES: OnceLock<Vec<(u32, NpcSide)>> = OnceLock::new();
+    SIDES.get_or_init(|| {
+        let Ok(regulation) = (unsafe { CSRegulationManager::instance() }) else {
+            return Vec::new();
+        };
+        let npcs = regulation.get_param::<NPC_PARAM_ST>();
+        regulation
+            .get_param::<CHARACTER_INIT_PARAM>()
+            .iter()
+            .filter_map(|(id, _)| {
+                let row = npcs.get(id)?;
+                let side = NpcSide {
+                    team: row.team_type(),
+                    phantom: row.phantom_param_id(),
+                    draw: row.draw_type(),
+                    kind: row.npc_type(),
+                };
+                Some((id as u32, side))
+            })
+            .collect()
+    })
+}
+
+/// The NPCs the game itself sets up as white phantom summons. They come with the right
+/// side and with an AI that follows the host and fights enemies.
+pub fn is_summon_side(team: u8, phantom: i32) -> bool {
+    u32::from(team) == CHR_TEAM_WHITE_PHANTOM && phantom == WHITE_PHANTOM_SIDE.phantom
+}
+
+fn wanted_side(friendly: bool) -> NpcSide {
+    if friendly {
+        WHITE_PHANTOM_SIDE
+    } else {
+        npc_side(DARK_SPIRIT_LOOK_FROM).unwrap_or(DARK_SPIRIT_SIDE)
+    }
+}
+
+/// The named NPCs are a mix of invaders, summons and neutral characters in the game's data,
+/// and the glow follows the NPC row: red for a dark spirit, white for a summon. Writing
+/// onto the finished character changes who it fights but not how it is drawn, and the
+/// game reads the phantom look from the row again after the character is built. So the
+/// row itself gets the wanted side and keeps it until the game is closed, or until the
+/// same NPC is sent for the other side. Nothing is written to disk.
+fn set_side_in_npc_row(npc_id: u32, side: NpcSide) {
+    let Some(own) = npc_side(npc_id) else {
+        return;
+    };
+    if own != side {
+        crate::log::log(format!("npc {npc_id}: side {own:?} -> {side:?}"));
+        set_npc_side(npc_id, side);
+    }
+}
+
+/// Gives the character its own copy of its NPC row, taken while the row holds the wanted
+/// side. Then a friend and a foe built from the same NPC can stand next to each other, as
+/// far as the game reads the row through the character.
+fn give_own_npc_row(chr: usize) -> Result<(), String> {
+    let lookup = read_usize_checked(chr + NPC_ROW_LOOKUP)?;
+    if lookup < 0x10_000 {
+        return Err("the character has no NPC row lookup".to_string());
+    }
+    let row = read_usize_checked(lookup + NPC_ROW_LOOKUP_ROW)?;
+    let copy = leaked(std::mem::size_of::<NPC_PARAM_ST>());
+    if row < 0x10_000 || copy_readable(row, copy) != copy.len() {
+        return Err("the NPC row is not readable".to_string());
+    }
+    write_bytes_checked(lookup + NPC_ROW_LOOKUP_ROW, &(copy.as_ptr() as usize).to_ne_bytes())
 }
 
 // Map data as the game keeps it in memory, and one enemy entry in it. The factory and the
@@ -4481,6 +4963,14 @@ fn spawn_human_npc(queue: &EnemyQueue, enemy: EnemyChoice) -> Result<usize, Stri
     let unused = 0usize;
     let build: extern "C" fn(usize, usize, usize, u32, usize, i32) -> usize =
         unsafe { std::mem::transmute(factory) };
+    let own_look = borrow_dark_spirit_look(enemy.npc_id);
+    // A real summon already has its side in the game's data. Only invaders need one given.
+    if !enemy.friendly {
+        set_side_in_npc_row(enemy.npc_id, wanted_side(false));
+    } else if let Some((_, side)) = natural_sides().iter().find(|(id, _)| *id == enemy.npc_id) {
+        // In case the same NPC was sent as an invader earlier in this session.
+        set_side_in_npc_row(enemy.npc_id, *side);
+    }
     let chr = build(
         &unused as *const usize as usize,
         0,
@@ -4489,6 +4979,9 @@ fn spawn_human_npc(queue: &EnemyQueue, enemy: EnemyChoice) -> Result<usize, Stri
         map.as_ptr() as usize,
         index as i32,
     );
+    if let Some(look) = own_look {
+        set_npc_look(enemy.npc_id, look);
+    }
     if chr < 0x10_000 {
         return Err("the game did not build the NPC (all 40 human NPC slots may be in use)".to_string());
     }
@@ -4500,6 +4993,9 @@ fn spawn_human_npc(queue: &EnemyQueue, enemy: EnemyChoice) -> Result<usize, Stri
     let chr_data = module_pointer(chr, DATA_MODULE_OFFSET)?;
     write_bytes_checked(chr_data + CHR_DATA_MAP_DATA, &real_map.to_ne_bytes())?;
     write_i32_checked(chr_data + CHR_DATA_MAP_ENTRY, -1)?;
+    if let Err(error) = give_own_npc_row(chr) {
+        crate::log::log(format!("npc {}: shares its NPC row: {error}", enemy.npc_id));
+    }
     Ok(chr)
 }
 
@@ -4509,18 +5005,54 @@ struct InvaderNote {
     key: u32,
     /// The sender's name, or none to use the NPC's own.
     name: Option<String>,
+    /// How long after the invasion message the invader appears.
+    delay: Duration,
+    /// The animation it appears with, or 0 for none.
+    animation: i32,
+    /// When the message was shown. None until its turn comes.
+    announced: Option<Instant>,
 }
 
 static INVADER_NOTES: Mutex<Vec<InvaderNote>> = Mutex::new(Vec::new());
 
-fn keep_invader_note(name: Option<&str>) -> u32 {
+fn keep_invader_note(name: Option<&str>, delay: Duration, animation: i32) -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(1);
     let key = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
     let name = name.map(str::trim).filter(|name| !name.is_empty()).map(str::to_string);
     let mut notes = INVADER_NOTES.lock().unwrap_or_else(|poison| poison.into_inner());
-    notes.push(InvaderNote { key, name });
+    notes.push(InvaderNote {
+        key,
+        name,
+        delay,
+        animation,
+        announced: None,
+    });
     key
+}
+
+/// Announces an invader when its turn comes, then says whether its wait is over. Like a
+/// real invasion: first the message, a moment later the invader.
+fn invader_arrival_due(enemy: EnemyChoice) -> bool {
+    let mut notes = INVADER_NOTES.lock().unwrap_or_else(|poison| poison.into_inner());
+    let Some(note) = notes.iter_mut().find(|note| note.key == enemy.label) else {
+        return true;
+    };
+    match note.announced {
+        Some(announced) => announced.elapsed() >= note.delay,
+        None => {
+            let shown = note
+                .name
+                .as_deref()
+                .or_else(|| known_invader_name(enemy.npc_id))
+                .unwrap_or("Phantom");
+            if let Err(error) = show_arrival_message(shown, enemy.friendly) {
+                crate::log::log(format!("npc {}: arrival message not shown: {error}", enemy.npc_id));
+            }
+            note.announced = Some(Instant::now());
+            note.delay.is_zero()
+        }
+    }
 }
 
 fn take_invader_note(key: u32) -> Option<InvaderNote> {
@@ -4534,6 +5066,8 @@ fn take_invader_note(key: u32) -> Option<InvaderNote> {
 /// they give "Invaded by dark spirit NAME!".
 const ARRIVAL_MESSAGE_ROW: u32 = 0xCA;
 const INVADE_TYPE_DARK_SPIRIT: u32 = 3;
+/// The invade type of a summoned white phantom: "Phantom NAME has been summoned".
+const INVADE_TYPE_WHITE_PHANTOM: u32 = 1;
 /// Which of the routine's ways of putting the name in. The arrival lines use the first.
 const ARRIVAL_NAME_SLOT: u32 = 1;
 /// Name object: fixed text or null, then the wide string (text or pointer, length,
@@ -4565,23 +5099,10 @@ pub fn name_units(name: &str, limit: usize) -> Vec<u16> {
     units
 }
 
-/// Shows the game's own arrival line, such as "Invaded by dark spirit NAME". The routine
-/// takes a name object and frees its text with the string's allocator, so longer text is
-/// allocated with that same allocator.
-fn show_invasion_message(name: &str) -> Result<(), String> {
-    let located = cached()?;
-    let message = *located.summon_message.as_ref().map_err(|error| error.clone())?;
-    let make = *located.name_object.as_ref().map_err(|error| error.clone())?;
-    let owner = read_usize_checked(message.owner_slot)?;
-    if owner < 0x10_000 {
-        return Err("the message owner is not ready".to_string());
-    }
-    let units = name_units(name, MESSAGE_NAME_LENGTH);
-    if units.is_empty() {
-        return Err("no name to show".to_string());
-    }
-    let mut object = [0u64; NAME_OBJECT_SIZE / 8];
-    let base = object.as_mut_ptr() as usize;
+/// Turns the memory at `base` into a name object holding `units`. Whoever receives it frees
+/// longer text with the string's own allocator, so that allocator provides it.
+fn fill_name_object(base: usize, units: &[u16]) -> Result<(), String> {
+    let make = *cached()?.name_object.as_ref().map_err(|error| error.clone())?;
     let make_object: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(make) };
     make_object(base);
     let capacity = unsafe { ((base + NAME_CAPACITY) as *const usize).read() };
@@ -4613,49 +5134,565 @@ fn show_invasion_message(name: &str) -> Result<(), String> {
         ((base + NAME_LENGTH) as *mut usize).write(units.len());
         ((base + NAME_FIXED_TEXT) as *mut usize).write(0);
     }
-    let show: extern "C" fn(usize, u32, u32, u32, usize, u32) = unsafe { std::mem::transmute(message.show) };
-    show(owner, ARRIVAL_MESSAGE_ROW, INVADE_TYPE_DARK_SPIRIT, ARRIVAL_NAME_SLOT, base, 0);
     Ok(())
 }
 
-/// Dark Spirit look and side, and the invasion message. The gear, health and AI already
-/// came with the character. The name shown on lock-on is the NPC's own: the game reads it
-/// from its text files through the NPC row, so only the message can carry a sender's name.
-fn finish_invader(chr: usize, npc_id: u32, note: Option<InvaderNote>) {
-    let kind = read_u32_checked(chr + CHR_TYPE_OFFSET).unwrap_or(0);
+/// Shows the game's own arrival line, such as "Invaded by dark spirit NAME". The routine
+/// frees the name object it is given.
+fn show_arrival_message(name: &str, friendly: bool) -> Result<(), String> {
+    let message = *cached()?.summon_message.as_ref().map_err(|error| error.clone())?;
+    let owner = read_usize_checked(message.owner_slot)?;
+    if owner < 0x10_000 {
+        return Err("the message owner is not ready".to_string());
+    }
+    let units = name_units(name, MESSAGE_NAME_LENGTH);
+    if units.is_empty() {
+        return Err("no name to show".to_string());
+    }
+    let mut object = [0u64; NAME_OBJECT_SIZE / 8];
+    let base = object.as_mut_ptr() as usize;
+    fill_name_object(base, &units)?;
+    let show: extern "C" fn(usize, u32, u32, u32, usize, u32) = unsafe { std::mem::transmute(message.show) };
+    let invade_type = if friendly { INVADE_TYPE_WHITE_PHANTOM } else { INVADE_TYPE_DARK_SPIRIT };
+    show(owner, ARRIVAL_MESSAGE_ROW, invade_type, ARRIVAL_NAME_SLOT, base, 0);
+    Ok(())
+}
+
+/// PlayerIns: its player data.
+const PLAYER_GAME_DATA: usize = 0x1FA0;
+/// The game's check for whether a character is simulated on this machine:
+/// `(WorldChrMan, character id) -> bool`. When a hit lands, the game sorts attacker and
+/// victim into "simulated here" or "simulated by another player" and only applies the damage
+/// for some pairs. Characters a map places are in the registry this check reads. Spawned
+/// ones are left out of it on purpose, so they count as another player's: their hits only
+/// land on the local player, and two of them cannot hurt each other.
+const LOCALLY_SIMULATED_PATTERN: &str =
+    "48 83 EC 28 48 8B 89 30 06 00 00 48 85 C9 74 0A E8 ?? ?? ?? ?? 48 83 C4 28 C3 32 C0 48 83 C4 28 C3";
+/// ChrIns: the id that check is asked with (list number and index).
+const CHR_SYNC_ID: usize = 0x78;
+/// The game's own check, to ask first. 0 while not hooked.
+static LOCALLY_SIMULATED_ORIGINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[allow(clippy::declare_interior_mutable_const)]
+const NO_LOCAL_NPC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// Ids of the spawned characters that count, rewritten every frame. The hook runs on the
+/// game's threads, so this is plain atomics and no lock.
+static LOCAL_NPC_IDS: [std::sync::atomic::AtomicU32; 48] = [NO_LOCAL_NPC; 48];
+
+extern "C" fn locally_simulated_hook(world: usize, id: u32) -> u8 {
+    use std::sync::atomic::Ordering;
+    let original: extern "C" fn(usize, u32) -> u8 =
+        unsafe { std::mem::transmute(LOCALLY_SIMULATED_ORIGINAL.load(Ordering::Acquire)) };
+    let answer = original(world, id);
+    if answer != 0 {
+        return answer;
+    }
+    // Only the mod's own part is timed: the original is the game's work.
+    let id = id & 0xFFFF;
+    let ours = crate::perf::time(&crate::perf::SIMULATED_HOOK, || {
+        id != 0xFFFF && LOCAL_NPC_IDS.iter().any(|slot| slot.load(Ordering::Relaxed) == id)
+    });
+    u8::from(ours)
+}
+
+fn install_locally_simulated_hook() {
+    use std::sync::atomic::Ordering;
+    if LOCALLY_SIMULATED_ORIGINAL.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let result = find_unique(LOCALLY_SIMULATED_PATTERN).and_then(|target| unsafe {
+        let detour = retour::RawDetour::new(target as *const (), locally_simulated_hook as *const ())
+            .map_err(|error| error.to_string())?;
+        LOCALLY_SIMULATED_ORIGINAL.store(detour.trampoline() as *const () as usize, Ordering::Release);
+        detour.enable().map_err(|error| error.to_string())?;
+        std::mem::forget(detour);
+        Ok(())
+    });
+    match result {
+        Ok(()) => crate::log::log("spawned NPCs: simulated-here check hooked"),
+        Err(error) => {
+            LOCALLY_SIMULATED_ORIGINAL.store(0, Ordering::Release);
+            crate::log::log(format!("spawned NPCs: simulated-here check not hooked: {error}"));
+        }
+    }
+}
+
+/// Rewrites the list of spawned characters that count as simulated here: the human NPCs.
+/// Spawned enemies stay as the game sees them.
+fn refresh_local_npcs() {
+    use std::sync::atomic::Ordering;
+    if LOCALLY_SIMULATED_ORIGINAL.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let player_class = local_player().ok().and_then(|player| read_usize_checked(player as usize).ok());
+    let mut ids = spawned_chrs()
+        .into_iter()
+        .filter(|chr| player_class.is_some() && read_usize_checked(*chr).ok() == player_class)
+        .filter_map(|chr| read_u32_checked(chr + CHR_SYNC_ID).ok())
+        .map(|id| id & 0xFFFF);
+    for slot in LOCAL_NPC_IDS.iter() {
+        slot.store(ids.next().unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
+}
+
+/// The game's routine for the team a character counts as right now: `(chr) -> team`. It
+/// starts from the team on the character and lets a phantom's NPC row, some special
+/// effects and a list of things attached to the character override it. Hits and the AI's
+/// search for targets both go by this value, not by the plain team.
+const EFFECTIVE_TEAM_PATTERN: &str = "40 57 48 83 EC 40 48 C7 44 24 28 FE FF FF FF 48 89 5C 24 58 48 89 74 24 60 48 8B F9 C7 44 24 20 00 00 00 00 8B 59 74 48 83 B9 C8 11 00 00 00";
+/// ChrIns: the head of the list of things attached to the character.
+const CHR_ATTACHED_HEAD: usize = 0x1AE8;
+
+/// The team the game counts a character as, its plain team, and what is attached to it
+/// (kind, type word and the eight bytes after them for each entry). For the log.
+fn team_report(chr: usize) -> String {
+    let effective = find_unique(EFFECTIVE_TEAM_PATTERN).map(|routine| {
+        let routine: extern "C" fn(usize) -> i32 = unsafe { std::mem::transmute(routine) };
+        routine(chr)
+    });
+    let mut attached = Vec::new();
+    let mut node = read_usize_checked(chr + CHR_ATTACHED_HEAD).unwrap_or(0);
+    while node >= 0x10_000 && attached.len() < 24 {
+        let mut bytes = [0u8; 0x20];
+        if copy_readable(node, &mut bytes) != bytes.len() {
+            break;
+        }
+        let kind = u32::from_ne_bytes(bytes[8..12].try_into().unwrap());
+        let word = u16::from_ne_bytes(bytes[12..14].try_into().unwrap());
+        let rest = u64::from_ne_bytes(bytes[24..32].try_into().unwrap());
+        attached.push(format!("{kind:X}/{word:X}/{rest:X}"));
+        node = usize::from_ne_bytes(bytes[16..24].try_into().unwrap());
+    }
+    format!(
+        "team counted {effective:?} plain {:?} type {:?} attached [{}]",
+        read_u32_checked(chr + CHR_TEAM_OFFSET),
+        read_u32_checked(chr + CHR_TYPE_OFFSET),
+        attached.join(" "),
+    )
+}
+
+/// Where a character takes itself off the AI's list of possible targets when it goes
+/// away. The instruction at +10 loads the object that holds the list: a plain vector of
+/// character pointers (begin, end, end of storage). Every AI walks it each frame to find
+/// enemies and friends. Whoever is not on it is only ever fought back after a hit.
+const AI_TARGET_LIST_PATTERN: &str =
+    "40 53 48 83 EC 20 48 8B 59 08 48 8B 0D ?? ?? ?? ?? 48 85 C9 75 26 4C 8D 0D";
+
+/// Where the pointer to the object with the AI's target list lives. 0 until looked up.
+static AI_TARGET_LIST_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Spawned NPCs to keep on the AI's target list, by character address.
+static AI_LISTED_NPCS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// How often a spawned NPC had to be put back, for a log line now and then.
+static AI_LIST_ADDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Keeps the spawned NPCs on the AI's target list. The game only lists characters a map
+/// placed and drops ours again, so this checks every frame.
+pub fn poll_ai_target_list() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut listed = AI_LISTED_NPCS.lock().unwrap_or_else(|poison| poison.into_inner());
+        if listed.is_empty() {
+            return;
+        }
+        if load_screen_open() {
+            listed.clear();
+            return;
+        }
+        let present = spawned_chrs();
+        listed.retain(|chr| present.contains(chr));
+        // One read of the whole list, so the usual frame where nothing is missing is cheap.
+        let slot = AI_TARGET_LIST_SLOT.load(std::sync::atomic::Ordering::Relaxed);
+        let mut entries = Vec::new();
+        if slot > 1 {
+            if let Ok(holder) = read_usize_checked(slot) {
+                let mut bounds = [0u8; 16];
+                if holder >= 0x10_000 && copy_readable(holder, &mut bounds) == bounds.len() {
+                    let begin = usize::from_ne_bytes(bounds[..8].try_into().unwrap());
+                    let end = usize::from_ne_bytes(bounds[8..].try_into().unwrap());
+                    if begin >= 0x10_000 && end >= begin && end - begin <= 8 * 4096 {
+                        let mut bytes = vec![0u8; end - begin];
+                        if copy_readable(begin, &mut bytes) == bytes.len() {
+                            entries = bytes.chunks_exact(8).map(|entry| usize::from_ne_bytes(entry.try_into().unwrap())).collect();
+                        }
+                    }
+                }
+            }
+        }
+        if !entries.is_empty() && listed.iter().all(|chr| entries.contains(chr)) {
+            return;
+        }
+        let leaving = DELETE_REQUESTED.lock().unwrap_or_else(|poison| poison.into_inner()).clone();
+        for chr in listed.iter().copied() {
+            if entries.contains(&chr) || leaving.contains(&chr) || chr_health(chr).is_none_or(|hp| hp <= 0) {
+                continue;
+            }
+            let report = ai_target_list(chr, true);
+            if report.contains("added yes") {
+                let adds = AI_LIST_ADDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if adds < 6 || adds % 600 == 0 {
+                    crate::log::log(format!("AI target list: put {chr:#x} back ({adds} so far): {report}"));
+                }
+            }
+        }
+    }));
+}
+
+/// Says whether a character is on the AI's list of possible targets, and with `add` puts
+/// it there when it is missing, in a larger list if the old one is full. The game takes
+/// it off again by itself when the character goes away.
+/// Where the pointer to the object with the AI's target list lives, or 1 if it was not
+/// found. Searched for once.
+fn ai_target_list_slot() -> usize {
+    use std::sync::atomic::Ordering;
+    let mut slot = AI_TARGET_LIST_SLOT.load(Ordering::Relaxed);
+    if slot == 0 {
+        slot = find_unique(AI_TARGET_LIST_PATTERN)
+            .and_then(|site| pattern::rip_target(site + 10, 3, 7))
+            .unwrap_or(1);
+        AI_TARGET_LIST_SLOT.store(slot, Ordering::Relaxed);
+    }
+    slot
+}
+
+fn ai_target_list(chr: usize, add: bool) -> String {
+    let slot = ai_target_list_slot();
+    let holder = match read_usize_checked(slot) {
+        Ok(holder) if slot > 1 && holder >= 0x10_000 => holder,
+        other => return format!("AI target list not found: {other:?}"),
+    };
+    let (Ok(begin), Ok(end), Ok(limit)) =
+        (read_usize_checked(holder), read_usize_checked(holder + 8), read_usize_checked(holder + 0x10))
+    else {
+        return "AI target list not readable".to_string();
+    };
+    if begin < 0x10_000 || end < begin || limit < end || (end - begin) % 8 != 0 || end - begin > 8 * 4096 {
+        return format!("AI target list looks wrong: {begin:#x} {end:#x} {limit:#x}");
+    }
+    let count = (end - begin) / 8;
+    let listed = (0..count).any(|index| read_usize_checked(begin + index * 8) == Ok(chr));
+    let player = local_player().map(|player| player as usize).unwrap_or(0);
+    let player_listed = (0..count).any(|index| read_usize_checked(begin + index * 8) == Ok(player));
+    let mut added = "no";
+    let grow_start = Instant::now();
+    if !listed && add {
+        let (begin, end, limit) = if end + 8 > limit {
+            // Full: move the list to storage of twice the size from the list's own allocator.
+            // The old storage is left alone, a few hundred bytes at most.
+            let size = end - begin;
+            let moved = read_usize_checked(holder + 0x18)
+                .and_then(|allocator| Ok((allocator, read_usize_checked(read_usize_checked(allocator)? + ALLOCATOR_ALLOCATE)?)))
+                .ok()
+                .filter(|(allocator, allocate)| *allocator >= 0x10_000 && executable_address(*allocate))
+                .map(|(allocator, allocate)| {
+                    let allocate: extern "C" fn(usize, usize, usize) -> usize = unsafe { std::mem::transmute(allocate) };
+                    allocate(allocator, (size * 2).max(0x80), 8)
+                })
+                .filter(|storage| *storage >= 0x10_000);
+            match moved {
+                Some(storage) => {
+                    let mut entries = vec![0u8; size];
+                    let copied = copy_readable(begin, &mut entries) == size
+                        && write_bytes_checked(storage, &entries).is_ok()
+                        && write_bytes_checked(holder + 0x10, &(storage + (size * 2).max(0x80)).to_ne_bytes()).is_ok()
+                        && write_bytes_checked(holder + 8, &(storage + size).to_ne_bytes()).is_ok()
+                        && write_bytes_checked(holder, &storage.to_ne_bytes()).is_ok();
+                    if copied { (storage, storage + size, storage + (size * 2).max(0x80)) } else { (begin, end, limit) }
+                }
+                None => (begin, end, limit),
+            }
+        } else {
+            (begin, end, limit)
+        };
+        let _ = begin;
+        added = if end + 8 > limit {
+            "no room"
+        } else if write_bytes_checked(end, &chr.to_ne_bytes()).is_ok()
+            && write_bytes_checked(holder + 8, &(end + 8).to_ne_bytes()).is_ok()
+        {
+            "yes"
+        } else {
+            "write failed"
+        };
+        crate::perf::add(&crate::perf::AI_LIST_GROW, grow_start.elapsed());
+    }
+    format!(
+        "AI target list: {count} entries, room for {}, listed {listed}, player listed {player_listed}, added {added}",
+        (limit - begin) / 8
+    )
+}
+
+/// A spawned NPC that gets a last step once its model and equipment have loaded.
+struct LateNpcSetup {
+    chr: usize,
+    npc_id: u32,
+    /// The phantom type, invade type and team to hand the game's phantom routine again.
+    phantom: Option<(i32, u8, u32)>,
+    frames: u32,
+}
+
+static LATE_NPC_SETUP: Mutex<Vec<LateNpcSetup>> = Mutex::new(Vec::new());
+/// The model and its physics body are there well within this many frames.
+const LATE_NPC_SETUP_FRAMES: u32 = 240;
+
+/// Hands a built NPC to the game's own phantom routine. The routine works the team out
+/// again, so the wanted team is put back afterwards. False if the game did not take it.
+fn make_npc_phantom(chr: usize, npc_id: u32, kind: i32, invade_type: u8, team: u32) -> bool {
+    let Some(routine) = cached().ok().and_then(|located| located.phantom_npc.as_ref().ok().copied()) else {
+        crate::log::log(format!("npc {npc_id}: the game's phantom routine was not found"));
+        return false;
+    };
+    let handle = read_u32_checked(chr + 0x08).unwrap_or(u32::MAX);
+    if handle == 0 || handle == u32::MAX {
+        crate::log::log(format!("npc {npc_id}: no handle for the game's phantom routine"));
+        return false;
+    }
+    let routine: extern "C" fn(usize, u32, i32, u8) -> usize = unsafe { std::mem::transmute(routine) };
+    let taken = crate::perf::time(&crate::perf::PHANTOM_ROUTINE, || routine(0, handle, kind, invade_type)) == chr;
+    if taken && read_u32_checked(chr + CHR_TEAM_OFFSET) != Ok(team) {
+        let _ = write_u32_checked(chr + CHR_TEAM_OFFSET, team);
+    }
+    if !taken {
+        crate::log::log(format!("npc {npc_id}: the game's phantom routine did not take handle {handle:#x}"));
+    }
+    taken
+}
+
+/// The per-frame upkeep for spawned allies and invaders.
+pub fn poll_spawned_npcs() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        crate::perf::time(&crate::perf::LATE_NPC_SETUP, poll_late_npc_setup);
+        crate::perf::time(&crate::perf::SIMULATED_LIST, refresh_local_npcs);
+    }));
+}
+
+/// Runs the last step for spawned NPCs whose model and equipment have had time to load.
+fn poll_late_npc_setup() {
+    let mut waiting = LATE_NPC_SETUP.lock().unwrap_or_else(|poison| poison.into_inner());
+    if waiting.is_empty() {
+        return;
+    }
+    if load_screen_open() || unsafe { WorldChrMan::instance() }.is_err() {
+        waiting.clear();
+        return;
+    }
+    for setup in waiting.iter_mut() {
+        setup.frames += 1;
+    }
+    let due: Vec<LateNpcSetup> = {
+        let (due, later): (Vec<_>, Vec<_>) =
+            waiting.drain(..).partition(|setup| setup.frames >= LATE_NPC_SETUP_FRAMES);
+        *waiting = later;
+        due
+    };
+    drop(waiting);
+    let present = spawned_chrs();
+    for setup in due.into_iter().filter(|setup| present.contains(&setup.chr)) {
+        let LateNpcSetup { chr, npc_id, phantom, .. } = setup;
+        // Once more now that the model and the equipment are loaded: the game only ever
+        // runs this on an NPC that has been standing in the map for a while.
+        if let Some((kind, invade_type, team)) = phantom {
+            make_npc_phantom(chr, npc_id, kind, invade_type, team);
+        }
+        // Map characters are on the list every AI picks its targets from. Spawned ones are
+        // not, so without this, allies and invaders only fight what hits them first.
+        crate::log::log(format!("npc {npc_id}: {}", ai_target_list(chr, true)));
+        let mut listed = AI_LISTED_NPCS.lock().unwrap_or_else(|poison| poison.into_inner());
+        if !listed.contains(&chr) {
+            listed.push(chr);
+        }
+    }
+}
+
+/// Invaders that carry a sender's name instead of their own, by character address.
+static INVADER_NAMES: Mutex<Vec<(usize, Vec<u16>)>> = Mutex::new(Vec::new());
+/// The game's own name routine, to call for every other character. 0 while not hooked.
+static CHR_NAME_ORIGINAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn forget_invader_name(chr: usize) {
+    let mut names = INVADER_NAMES.lock().unwrap_or_else(|poison| poison.into_inner());
+    names.retain(|(named, _)| *named != chr);
+}
+
+/// A death, a bonfire rest or a warp reloads the area and removes every spawned character,
+/// so all names go with them. Runs every frame; it only looks at the game while names exist.
+fn forget_invader_names_on_reload() {
+    let mut names = INVADER_NAMES.lock().unwrap_or_else(|poison| poison.into_inner());
+    if !names.is_empty() && (load_screen_open() || unsafe { WorldChrMan::instance() }.is_err()) {
+        names.clear();
+    }
+}
+
+/// The name to show for `chr`, if it is one of our named invaders and still exists. A
+/// deleted invader's address can be reused by another character, so a name is dropped
+/// when its invader is deleted, when the area reloads, when a new spawn takes the address,
+/// and here if the character is simply gone.
+fn invader_name(chr: usize) -> Option<Vec<u16>> {
+    let mut names = INVADER_NAMES.lock().unwrap_or_else(|poison| poison.into_inner());
+    if names.is_empty() {
+        return None;
+    }
+    let index = names.iter().position(|(named, _)| *named == chr)?;
+    if !spawned_chrs().contains(&chr) {
+        names.remove(index);
+        return None;
+    }
+    Some(names[index].1.clone())
+}
+
+/// Stands in for the game's name routine. Our named invaders get the sender's name, and
+/// every other character goes to the original.
+extern "C" fn chr_name_hook(out: usize, chr: usize, decorated: u8) -> usize {
+    use std::sync::atomic::Ordering;
+    let original: extern "C" fn(usize, usize, u8) -> usize =
+        unsafe { std::mem::transmute(CHR_NAME_ORIGINAL.load(Ordering::Acquire)) };
+    // Only the mod's own part is timed: the original is the game's work.
+    let named = crate::perf::time(&crate::perf::NAME_HOOK, || {
+        chr >= 0x10_000
+            && out >= 0x10_000
+            && matches!(
+                catch_unwind(AssertUnwindSafe(|| {
+                    invader_name(chr).is_some_and(|units| fill_name_object(out, &units).is_ok())
+                })),
+                Ok(true)
+            )
+    });
+    if named {
+        return out;
+    }
+    original(out, chr, decorated)
+}
+
+fn install_chr_name_hook() {
+    use std::sync::atomic::Ordering;
+    if CHR_NAME_ORIGINAL.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let result = find_unique(CHR_NAME_PATTERN).and_then(|target| unsafe {
+        let detour = retour::RawDetour::new(target as *const (), chr_name_hook as *const ())
+            .map_err(|error| error.to_string())?;
+        // The original must be known before the first redirected call arrives.
+        CHR_NAME_ORIGINAL.store(detour.trampoline() as *const () as usize, Ordering::Release);
+        detour.enable().map_err(|error| error.to_string())?;
+        // Stays in place for as long as the game runs.
+        std::mem::forget(detour);
+        Ok(())
+    });
+    match result {
+        Ok(()) => crate::log::log("invader names: name routine hooked"),
+        Err(error) => {
+            CHR_NAME_ORIGINAL.store(0, Ordering::Release);
+            crate::log::log(format!("invader names: not available, invaders keep their own name: {error}"));
+        }
+    }
+}
+
+/// Phantom type and side, the sender's name if wanted, and the arrival animation. The gear,
+/// health and AI already came with the character, and the message went out before.
+fn finish_invader(chr: usize, npc_id: u32, note: Option<InvaderNote>, friendly: bool) {
+    let kind = read_u32_checked(chr + CHR_TYPE_OFFSET).unwrap_or(0) as i32;
     let team = read_u32_checked(chr + CHR_TEAM_OFFSET).unwrap_or(0);
-    if let Err(error) = write_i32_checked(chr + CHR_TYPE_OFFSET, CHR_TYPE_DARK_SPIRIT) {
-        crate::log::log(format!("invader {npc_id}: chr type not set: {error}"));
+    // An invader is a dark spirit on the invaders' side. An ally is a white phantom and keeps
+    // the side the game gives its summon NPCs.
+    let (new_kind, new_team) =
+        if friendly { (CHR_TYPE_WHITE_PHANTOM, team) } else { (CHR_TYPE_DARK_SPIRIT, CHR_TEAM_DARK_SPIRIT) };
+    // The game's own routine sets the type and the team and marks the player data as a
+    // phantom's, the way sign summons and scripted invasions do.
+    let made = make_npc_phantom(chr, npc_id, new_kind, 0, new_team);
+    let summon = cached().ok().and_then(|located| located.summon_npc.as_ref().ok().copied());
+    if !made && new_kind != kind {
+        match summon {
+            // The game's own setter also refreshes what follows from the type.
+            Some(summon) => {
+                let set_type: extern "C" fn(usize, i32) = unsafe { std::mem::transmute(summon.set_type) };
+                set_type(chr, new_kind);
+            }
+            None => {
+                if let Err(error) = write_i32_checked(chr + CHR_TYPE_OFFSET, new_kind) {
+                    crate::log::log(format!("npc {npc_id}: chr type not set: {error}"));
+                }
+            }
+        }
     }
-    if let Err(error) = write_u32_checked(chr + CHR_TEAM_OFFSET, CHR_TEAM_DARK_SPIRIT) {
-        crate::log::log(format!("invader {npc_id}: team not set: {error}"));
+    // The session's phantom list puts the NPC in the list on the left of the screen. An
+    // ally joins the way a summoned NPC does, an invader as already arrived, like the
+    // game's scripted invaders. Neither makes the game show a message of its own.
+    match summon {
+        Some(summon) => {
+            let session: extern "C" fn() -> usize = unsafe { std::mem::transmute(summon.session) };
+            let join: extern "C" fn(usize, u32, i32, u32, i32, i32, i32) = unsafe { std::mem::transmute(summon.join) };
+            let list = session();
+            let handle = read_u32_checked(chr + 0x08).unwrap_or(0);
+            if list >= 0x10_000 && handle != 0 {
+                let stage = if friendly { 1 } else { 2 };
+                join(list, handle, new_kind, stage, -1, if friendly { -1 } else { 0 }, 0);
+            } else {
+                crate::log::log(format!("npc {npc_id}: no session to join"));
+            }
+        }
+        None => crate::log::log(format!("npc {npc_id}: the summon routine was not found")),
     }
-    let shown = note
-        .as_ref()
-        .and_then(|note| note.name.as_deref())
-        .or_else(|| known_invader_name(npc_id))
-        .unwrap_or("Dark Spirit");
-    if let Err(error) = show_invasion_message(shown) {
-        crate::log::log(format!("invader {npc_id}: invasion message not shown: {error}"));
+    if read_u32_checked(chr + CHR_TEAM_OFFSET) != Ok(new_team) {
+        if let Err(error) = write_u32_checked(chr + CHR_TEAM_OFFSET, new_team) {
+            crate::log::log(format!("npc {npc_id}: team not set: {error}"));
+        }
+    }
+    // Without this the game counts spawned characters as another player's, and their hits
+    // only land on the local player.
+    install_locally_simulated_hook();
+    refresh_local_npcs();
+    LATE_NPC_SETUP
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push(LateNpcSetup { chr, npc_id, phantom: made.then_some((new_kind, 0, new_team)), frames: 0 });
+    let sender = note.as_ref().and_then(|note| note.name.as_deref());
+    if let Some(name) = sender {
+        let units = name_units(name, MESSAGE_NAME_LENGTH);
+        if !units.is_empty() && CHR_NAME_ORIGINAL.load(std::sync::atomic::Ordering::Acquire) != 0 {
+            let mut names = INVADER_NAMES.lock().unwrap_or_else(|poison| poison.into_inner());
+            names.retain(|(named, _)| *named != chr);
+            names.push((chr, units));
+        }
+    }
+    let animation = note.as_ref().map(|note| note.animation).unwrap_or(0);
+    if animation > 0 {
+        let played = module_pointer(chr, EVENT_MODULE_OFFSET)
+            .and_then(|event| write_i32_checked(event + IDLE_ANIM_OFFSET, animation));
+        if let Err(error) = played {
+            crate::log::log(format!("invader {npc_id}: arrival animation not played: {error}"));
+        }
     }
     crate::log::log(format!(
-        "invader {npc_id}: built at {chr:#x}, type {kind} -> {CHR_TYPE_DARK_SPIRIT}, team {team} -> {CHR_TEAM_DARK_SPIRIT}, hp {:?}, announced as {shown:?}",
+        "{} {npc_id}: built at {chr:#x}, type {kind} -> {new_kind}, team {team} -> {new_team}, hp {:?}, name {:?}, animation {animation}",
+        if friendly { "ally" } else { "invader" },
         chr_health(chr),
+        sender.or_else(|| known_invader_name(npc_id)),
     ));
 }
 
 pub struct InvaderOptions<'a> {
-    /// Whoever sent it. Named in the invasion message when `use_sender_name` is on.
+    /// Whoever sent it. Shown on the invader and in the message when `use_sender_name` is on.
     pub viewer: &'a str,
     pub use_sender_name: bool,
     pub ids_text: &'a str,
     /// Above 0 picks the AI row by hand.
     pub think_override: u32,
+    /// Seconds between the invasion message and the invader appearing.
+    pub arrival_delay: u32,
+    /// The animation the invader appears with, or 0 for none.
+    pub arrival_animation: i32,
+    /// Arrives as a white phantom on the player's side instead of a dark spirit.
+    pub friendly: bool,
 }
 
 /// Queues one random named NPC invader near you.
 pub fn spawn_npc_invader(options: InvaderOptions) -> Result<String, String> {
-    let InvaderOptions { viewer, use_sender_name, ids_text, think_override } = options;
+    let InvaderOptions {
+        viewer,
+        use_sender_name,
+        ids_text,
+        think_override,
+        arrival_delay,
+        arrival_animation,
+        friendly,
+    } = options;
     let routine = create_npc_address()?;
     let creator = debug_creator()?;
     let located = cached()?;
@@ -4671,18 +5708,32 @@ pub fn spawn_npc_invader(options: InvaderOptions) -> Result<String, String> {
     let (ashes, ringed_city) = unsafe { darksouls3::cs::CSDlc::instance() }
         .map(|dlc| (dlc.dlc1_installed, dlc.dlc2_installed))
         .unwrap_or((false, false));
-    let known = invader_candidates(ashes, ringed_city);
-    let mut present: Vec<u32> = known
-        .iter()
-        .map(|(id, _)| *id)
-        .filter(|id| npcs.get(u64::from(*id)).is_some())
-        .collect();
+    let sides = natural_sides();
+    let mut present: Vec<u32> = if friendly {
+        sides
+            .iter()
+            .filter(|(_, side)| is_summon_side(side.team, side.phantom))
+            .map(|(id, _)| *id)
+            .collect()
+    } else {
+        invader_candidates(ashes, ringed_city)
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| npcs.get(u64::from(*id)).is_some())
+            .collect()
+    };
     present.sort_unstable();
+    if friendly {
+        static LISTED: std::sync::Once = std::sync::Once::new();
+        LISTED.call_once(|| crate::log::log(format!("ally: the game's summon NPCs are {present:?}")));
+    }
     let requested = parse_npc_param_ids(ids_text);
     let choices = choose_invader_ids(&requested, &present);
     if choices.is_empty() {
         return Err(if requested.is_empty() {
-            "no NPC invaders were found in the game data".to_string()
+            "no such NPCs were found in the game data".to_string()
+        } else if friendly {
+            "none of those NPC ids are summons in the game data".to_string()
         } else {
             "none of those NPC ids are available as invaders".to_string()
         });
@@ -4704,7 +5755,12 @@ pub fn spawn_npc_invader(options: InvaderOptions) -> Result<String, String> {
         npc_id,
         think_id,
         invader: true,
-        label: keep_invader_note(use_sender_name.then_some(viewer)),
+        label: keep_invader_note(
+            use_sender_name.then_some(viewer),
+            Duration::from_secs(u64::from(arrival_delay)),
+            arrival_animation,
+        ),
+        friendly,
     };
     let mut slot = ENEMY_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
     match slot.as_mut() {
@@ -4742,6 +5798,7 @@ pub fn spawn_npc_invader(options: InvaderOptions) -> Result<String, String> {
 
 pub fn poll_enemy_queue() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
+        forget_invader_names_on_reload();
         let mut slot = ENEMY_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
         let Some(queue) = slot.as_mut() else {
             return;
@@ -4749,6 +5806,8 @@ pub fn poll_enemy_queue() {
         // The world goes away before the load screen shows, and the creator needs it.
         if load_screen_open() || unsafe { WorldChrMan::instance() }.is_err() {
             slot.take();
+            // Invaders that were still waiting are gone with the queue.
+            INVADER_NOTES.lock().unwrap_or_else(|poison| poison.into_inner()).clear();
             return;
         }
         poll_spawn_checks(queue);
@@ -4763,6 +5822,8 @@ pub fn poll_enemy_queue() {
         });
         if let Some(chr) = finished {
             queue.in_flight = None;
+            // A new enemy can land on the address of an invader that is gone.
+            forget_invader_name(chr);
             queue.checks.push(SpawnCheck {
                 chr,
                 frames: 0,
@@ -4804,11 +5865,16 @@ pub fn poll_enemy_queue() {
             queue.remaining.push(enemy);
             return;
         }
+        if enemy.invader && !invader_arrival_due(enemy) {
+            queue.remaining.push(enemy);
+            return;
+        }
         if enemy.invader {
-            match spawn_human_npc(queue, enemy) {
+            match crate::perf::time(&crate::perf::NPC_BUILD, || spawn_human_npc(queue, enemy)) {
                 Ok(chr) => {
                     queue.started += 1;
-                    finish_invader(chr, enemy.npc_id, take_invader_note(enemy.label));
+                    let note = take_invader_note(enemy.label);
+                    crate::perf::time(&crate::perf::NPC_FINISH, || finish_invader(chr, enemy.npc_id, note, enemy.friendly));
                     queue.checks.push(SpawnCheck {
                         chr,
                         frames: 0,
@@ -5027,12 +6093,26 @@ pub fn schemas_json() -> Value {
             ]
         },
         {
+            "id": "spawn_npc_ally",
+            "name": "Spawn NPC Ally",
+            "description": "Summons one of the game's own summonable NPCs near you as a white phantom that fights on your side. The game announces the summon, with the sender's name if you want.",
+            "arguments": [
+                { "name": "npcParamIds", "type": "string", "label": "NPC ids", "hint": "Optional. Comma-separated NpcParam ids of summon NPCs. Empty picks a random one.", "defaultText": "" },
+                { "name": "useSenderName", "type": "bool", "label": "Show the sender's name on the phantom", "hint": "On: the summon message and the name on lock-on show whoever triggered it. Off: both show the NPC's own name.", "default": 1, "min": 0, "max": 1 },
+                { "name": "arrivalDelay", "type": "int", "label": "Seconds between message and arrival", "hint": "The summon message shows first, and the phantom appears this many seconds later.", "default": 4, "min": 0, "max": 30 },
+                { "name": "arrivalAnimation", "type": "int", "label": "Arrival animation", "hint": "The animation the phantom appears with. 63020 is the gold-sign summon pose, 63010 the hunched stand-up of an invader, 63000 a stand-up from a crouch. 0 for none.", "default": 63020, "min": 0, "max": 99999 },
+                { "name": "thinkParamId", "type": "int", "label": "AI row", "hint": "Optional. 0 picks the NPC's own AI. Another NpcThinkParam id forces that AI.", "default": 0, "min": 0, "max": 99999999 }
+            ]
+        },
+        {
             "id": "spawn_npc_invader",
             "name": "Spawn NPC Invader",
             "description": "Spawns a random named NPC invader near you as a Dark Spirit, with its own gear (Havel, Heysel, Hodrick and the rest of the known set). The game announces the invasion, with the sender's name if you want.",
             "arguments": [
                 { "name": "npcParamIds", "type": "string", "label": "NPC ids", "hint": "Optional. Comma-separated NpcParam ids. Empty picks a random known invader.", "defaultText": "" },
-                { "name": "useSenderName", "type": "bool", "label": "Name the sender in the invasion message", "hint": "On: the message names whoever triggered it. Off: it names the NPC. The name on lock-on is always the NPC's own.", "default": 1, "min": 0, "max": 1 },
+                { "name": "useSenderName", "type": "bool", "label": "Show the sender's name on the invader", "hint": "On: the invasion message and the name on lock-on show whoever triggered it. Off: both show the NPC's own name.", "default": 1, "min": 0, "max": 1 },
+                { "name": "arrivalDelay", "type": "int", "label": "Seconds between message and arrival", "hint": "The invasion message shows first, and the invader appears this many seconds later.", "default": 4, "min": 0, "max": 30 },
+                { "name": "arrivalAnimation", "type": "int", "label": "Arrival animation", "hint": "The animation the invader appears with. 63010 is the hunched stand-up of an invader, 63020 the gold-sign summon pose, 63000 a stand-up from a crouch. 0 for none.", "default": 63010, "min": 0, "max": 99999 },
                 { "name": "thinkParamId", "type": "int", "label": "AI row", "hint": "Optional. 0 picks the invader's own AI. Another NpcThinkParam id forces that AI.", "default": 0, "min": 0, "max": 99999999 }
             ]
         },
@@ -5041,6 +6121,42 @@ pub fn schemas_json() -> Value {
             "name": "Dump player data",
             "description": "Writes the local player data block to a file, including the reported soul count.",
             "arguments": [{ "name": "soulCount", "type": "int", "default": 0, "min": 0, "max": 999999999 }]
+        },
+        {
+            "id": "give_ember",
+            "name": "Give Ember",
+            "description": "Gives you Embers. Use one to become embered, which is needed to summon phantoms.",
+            "arguments": [{ "name": "amount", "type": "int", "default": 1, "min": 1, "max": 99 }]
+        },
+        {
+            "id": "toggle_invincible",
+            "name": "Toggle invincibility",
+            "description": "For testing: no hit damage until you trigger it again. It stays on through deaths, rests and warps.",
+            "arguments": []
+        },
+        {
+            "id": "toggle_invisible",
+            "name": "Toggle invisibility",
+            "description": "For testing: enemies neither see nor hear you until you trigger it again.",
+            "arguments": []
+        },
+        {
+            "id": "dump_phantoms",
+            "name": "Dump phantoms",
+            "description": "Writes the state of every player-type character in the area to a file: you, real NPC phantoms and spawned ones.",
+            "arguments": []
+        },
+        {
+            "id": "toggle_performance",
+            "name": "Toggle performance measuring",
+            "description": "For testing: starts measuring how smoothly the game runs and how much time the mod takes. Trigger it again to stop; that also writes a last report.",
+            "arguments": []
+        },
+        {
+            "id": "performance_report",
+            "name": "Performance report",
+            "description": "While performance measuring is on: shows how smoothly the game ran since the last report, how much time the mod used, whether the mod was busy in any slow frame, and how busy the game's threads were. The full report goes to ds3mod.log.",
+            "arguments": []
         },
         {
             "id": "watch_item_button",
@@ -5345,7 +6461,7 @@ mod tests {
         weapon_infusion, weapon_level, WeaponTrait, with_no_damage_bit, without_bits,
         attunement_slots, magic_entry, pick_attunement, pyromancies_available, Firestarter, SpellRequirement,
         ended_prefix, choose_invader_ids, known_invader_name, parse_npc_param_ids, think_for_invader,
-        clear_entity_ids, name_units, MESSAGE_NAME_LENGTH,
+        clear_entity_ids, is_summon_side, name_units, MESSAGE_NAME_LENGTH,
     };
 
     #[test]
@@ -5375,6 +6491,14 @@ mod tests {
         // An emoji takes two units. Fifteen letters leave room for one unit only, so it is dropped.
         assert_eq!(name_units("abcdefghijklmno\u{1F525}", 16).len(), 15);
         assert_eq!(name_units("line\nbreak", MESSAGE_NAME_LENGTH).len(), 9);
+    }
+
+    #[test]
+    fn only_white_phantom_rows_count_as_summons() {
+        assert!(is_summon_side(2, 80));
+        assert!(!is_summon_side(16, 81));
+        assert!(!is_summon_side(2, -1));
+        assert!(!is_summon_side(26, 80));
     }
 
     #[test]

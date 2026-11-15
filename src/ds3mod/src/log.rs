@@ -1,9 +1,11 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::OnceLock;
 
-static LOG: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// Lines go to a thread of their own that writes them to the file, so the game never
+/// waits for the disk (or a virus scanner looking at the file) while the mod logs.
+static LINES: OnceLock<crossbeam_channel::Sender<String>> = OnceLock::new();
 
 pub fn init() {
     let Ok(dir) = app_dir() else {
@@ -11,9 +13,20 @@ pub fn init() {
     };
     let _ = fs::create_dir_all(&dir);
     let path = dir.join("ds3mod.log");
-    if let Ok(file) = OpenOptions::new().create(true).append(true).open(path) {
-        *LOG.lock().expect("log mutex") = Some(file);
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let (sender, receiver) = crossbeam_channel::unbounded::<String>();
+    if LINES.set(sender).is_err() {
+        return;
     }
+    std::thread::spawn(move || {
+        crate::perf::name_thread("mod: writing the log");
+        for line in receiver {
+            let _ = file.write_all(line.as_bytes());
+            let _ = file.flush();
+        }
+    });
 }
 
 pub fn app_dir() -> Result<PathBuf, String> {
@@ -27,12 +40,11 @@ pub fn log(message: impl AsRef<str>) {
         chrono_stamp(),
         message.as_ref().replace(['\r', '\n'], " ")
     );
-    if let Ok(mut slot) = LOG.lock() {
-        if let Some(file) = slot.as_mut() {
-            let _ = file.write_all(line.as_bytes());
-            let _ = file.flush();
-        }
+    let start = std::time::Instant::now();
+    if let Some(lines) = LINES.get() {
+        let _ = lines.send(line);
     }
+    crate::perf::add(&crate::perf::LOG, start.elapsed());
 }
 
 fn chrono_stamp() -> String {

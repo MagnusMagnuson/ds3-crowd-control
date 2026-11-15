@@ -95,7 +95,7 @@
                         <TextBlock Text="Only tick this if the game crashed. The dump is a copy of the game's memory from the last crash in the past 7 days, and can contain your Windows user name and things like your Steam account name." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
 
                         <CheckBox Content="Show developer tools" IsChecked="{Binding ShowDevTools}"
-                                  ToolTip="Adds Dump player data and Watch item button to the Presets page." />
+                                  ToolTip="Adds the testing effects to the Presets page: Toggle invincibility, Toggle invisibility, Toggle performance measuring, Performance report, Dump phantoms, Dump player data and Watch item button." />
                         <CheckBox Content="Focus game for item test" IsChecked="{Binding FocusGameForItemTest}" Margin="0,8,0,0"
                                   Visibility="{Binding ShowDevTools, Converter={StaticResource BoolToVisibility}}"
                                   ToolTip="When enabled, testing Use selected item brings Dark Souls III to the foreground so it polls the synthetic controller press." />

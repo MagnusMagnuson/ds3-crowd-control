@@ -306,6 +306,20 @@ public static class BuiltinHandlers
         },
         new HandlerSchema
         {
+            Id = "spawn_npc_ally",
+            Name = "Spawn NPC Ally",
+            Description = "Summons one of the game's own summonable NPCs near you as a white phantom that fights on your side. The game announces the summon, with the sender's name if you want.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "npcParamIds", Type = "string", DefaultText = "", Label = "NPC ids", Hint = "Optional. Comma-separated NpcParam ids of summon NPCs. Empty picks a random one." },
+                new EffectArgumentSchema { Name = "useSenderName", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Show the sender's name on the phantom", Hint = "On: the summon message and the name on lock-on show whoever triggered it. Off: both show the NPC's own name." },
+                new EffectArgumentSchema { Name = "arrivalDelay", Type = "int", Default = 4, Min = 0, Max = 30, Label = "Seconds between message and arrival", Hint = "The summon message shows first, and the phantom appears this many seconds later." },
+                new EffectArgumentSchema { Name = "arrivalAnimation", Type = "int", Default = 63020, Min = 0, Max = 99999, Label = "Arrival animation", Hint = "The animation the phantom appears with. 63020 is the gold-sign summon pose, 63010 the hunched stand-up of an invader, 63000 a stand-up from a crouch. 0 for none." },
+                new EffectArgumentSchema { Name = "thinkParamId", Type = "int", Default = 0, Min = 0, Max = 99999999, Label = "AI row", Hint = "Optional. 0 picks the NPC's own AI. Another NpcThinkParam id forces that AI." }
+            ]
+        },
+        new HandlerSchema
+        {
             Id = "spawn_npc_invader",
             Name = "Spawn NPC Invader",
             Description = "Spawns a random named NPC invader near you as a Dark Spirit, with its own gear (Havel, Heysel, Hodrick and the rest of the known set). The game announces the invasion, with the sender's name if you want.",
@@ -319,7 +333,9 @@ public static class BuiltinHandlers
                     Label = "NPC ids",
                     Hint = "Optional. Comma-separated NpcParam ids. Empty picks a random known invader."
                 },
-                new EffectArgumentSchema { Name = "useSenderName", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Name the sender in the invasion message", Hint = "On: the message names whoever triggered it. Off: it names the NPC. The name on lock-on is always the NPC's own." },
+                new EffectArgumentSchema { Name = "useSenderName", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Show the sender's name on the invader", Hint = "On: the invasion message and the name on lock-on show whoever triggered it. Off: both show the NPC's own name." },
+                new EffectArgumentSchema { Name = "arrivalDelay", Type = "int", Default = 4, Min = 0, Max = 30, Label = "Seconds between message and arrival", Hint = "The invasion message shows first, and the invader appears this many seconds later." },
+                new EffectArgumentSchema { Name = "arrivalAnimation", Type = "int", Default = 63010, Min = 0, Max = 99999, Label = "Arrival animation", Hint = "The animation the invader appears with. 63010 is the hunched stand-up of an invader, 63020 the gold-sign summon pose, 63000 a stand-up from a crouch. 0 for none." },
                 new EffectArgumentSchema { Name = "thinkParamId", Type = "int", Default = 0, Min = 0, Max = 99999999, Label = "AI row", Hint = "Optional. 0 picks the invader's own AI. Another NpcThinkParam id forces that AI." }
             ]
         },
@@ -329,6 +345,48 @@ public static class BuiltinHandlers
             Name = "Dump player data",
             Description = "Writes the local player data block to a file, including the reported soul count.",
             Arguments = [new EffectArgumentSchema { Name = "soulCount", Type = "int", Default = 0, Min = 0, Max = 999_999_999 }]
+        },
+        new HandlerSchema
+        {
+            Id = "give_ember",
+            Name = "Give Ember",
+            Description = "Gives you Embers. Use one to become embered, which is needed to summon phantoms.",
+            Arguments = [new EffectArgumentSchema { Name = "amount", Type = "int", Default = 1, Min = 1, Max = 99 }]
+        },
+        new HandlerSchema
+        {
+            Id = "toggle_invincible",
+            Name = "Toggle invincibility",
+            Description = "For testing: no hit damage until you trigger it again. It stays on through deaths, rests and warps.",
+            Arguments = []
+        },
+        new HandlerSchema
+        {
+            Id = "toggle_invisible",
+            Name = "Toggle invisibility",
+            Description = "For testing: enemies neither see nor hear you until you trigger it again.",
+            Arguments = []
+        },
+        new HandlerSchema
+        {
+            Id = "dump_phantoms",
+            Name = "Dump phantoms",
+            Description = "Writes the state of every player-type character in the area to a file: you, real NPC phantoms and spawned ones.",
+            Arguments = []
+        },
+        new HandlerSchema
+        {
+            Id = "toggle_performance",
+            Name = "Toggle performance measuring",
+            Description = "For testing: starts measuring how smoothly the game runs and how much time the mod takes. Trigger it again to stop; that also writes a last report.",
+            Arguments = []
+        },
+        new HandlerSchema
+        {
+            Id = "performance_report",
+            Name = "Performance report",
+            Description = "While performance measuring is on: shows how smoothly the game ran since the last report, how much time the mod used, whether the mod was busy in any slow frame, and how busy the game's threads were. The full report goes to ds3mod.log.",
+            Arguments = []
         },
         new HandlerSchema
         {
@@ -387,7 +445,14 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Set health to random %", "set_health_random_percent", catalog));
         catalog.Presets.Add(Preset("Spawn Random Enemy", "spawn_random_enemy", catalog));
         catalog.Presets.Add(Preset("Spawn NPC Invader", "spawn_npc_invader", catalog));
+        catalog.Presets.Add(Preset("Spawn NPC Ally", "spawn_npc_ally", catalog));
         catalog.Presets.Add(Preset("Dump player data", "dump_player_data", catalog));
+        catalog.Presets.Add(Preset("Give Ember", "give_ember", catalog));
+        catalog.Presets.Add(Preset("Toggle invincibility", "toggle_invincible", catalog));
+        catalog.Presets.Add(Preset("Toggle invisibility", "toggle_invisible", catalog));
+        catalog.Presets.Add(Preset("Dump phantoms", "dump_phantoms", catalog));
+        catalog.Presets.Add(Preset("Toggle performance measuring", "toggle_performance", catalog));
+        catalog.Presets.Add(Preset("Performance report", "performance_report", catalog));
         catalog.Presets.Add(Preset("Watch item button", "watch_item_button", catalog));
         return catalog;
     }

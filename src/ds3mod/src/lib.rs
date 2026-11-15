@@ -1,3 +1,6 @@
+// The effect list in game.rs is one large json! call.
+#![recursion_limit = "256"]
+
 mod armor_ids;
 mod effects;
 mod game;
@@ -5,6 +8,7 @@ mod input;
 mod ipc;
 mod log;
 mod pattern;
+mod perf;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -57,6 +61,7 @@ unsafe extern "system" fn worker_thread(_: *mut std::ffi::c_void) -> u32 {
 }
 
 fn run() {
+    perf::name_thread("mod: start-up, then idle");
     game::prepare();
     game::load_pending_restores();
     input::prepare();
@@ -85,6 +90,7 @@ fn run() {
 
     match SprjTaskImp::wait_for_instance(Duration::from_secs(120)) {
         Ok(tasks) => {
+            use perf::time;
             let handle = tasks.run_recurring(
                 |_data: &usize| {
                     on_frame();
@@ -94,47 +100,47 @@ fn run() {
             std::mem::forget(handle);
             let handle = tasks.run_recurring(
                 |_data: &usize| {
-                    input::sample_current(input::Phase::AfterPadStep);
+                    time(&perf::INPUT, || input::sample_current(input::Phase::AfterPadStep));
                 },
                 SprjTaskGroupIndex::ObjResUpdate,
             );
             std::mem::forget(handle);
             let handle = tasks.run_recurring(
                 |_data: &usize| {
-                    input::sample_current(input::Phase::ChrInsPrepare);
+                    time(&perf::INPUT, || input::sample_current(input::Phase::ChrInsPrepare));
                 },
                 SprjTaskGroupIndex::ChrIns_Prepare,
             );
             std::mem::forget(handle);
             let handle = tasks.run_recurring(
                 |_data: &usize| {
-                    input::sample_current(input::Phase::ChrInsPreBehavior);
-                    game::poll_stamina_lock();
-                    game::poll_speed_changes();
-                    game::poll_freeze();
+                    time(&perf::INPUT, || input::sample_current(input::Phase::ChrInsPreBehavior));
+                    time(&perf::STAMINA, game::poll_stamina_lock);
+                    time(&perf::SPEED, game::poll_speed_changes);
+                    time(&perf::FREEZE, game::poll_freeze);
                 },
                 SprjTaskGroupIndex::ChrIns_PreBehavior,
             );
             std::mem::forget(handle);
             let handle = tasks.run_recurring(
                 |_data: &usize| {
-                    game::poll_speed_changes();
-                    game::poll_freeze();
+                    time(&perf::SPEED, game::poll_speed_changes);
+                    time(&perf::FREEZE, game::poll_freeze);
                 },
                 SprjTaskGroupIndex::ChrIns_BehaviorSafe,
             );
             std::mem::forget(handle);
             let handle = tasks.run_recurring(
                 |_data: &usize| {
-                    game::poll_speed_changes();
-                    game::poll_freeze();
+                    time(&perf::SPEED, game::poll_speed_changes);
+                    time(&perf::FREEZE, game::poll_freeze);
                 },
                 SprjTaskGroupIndex::ChrIns_PrePhysicsSafe,
             );
             std::mem::forget(handle);
             let handle = tasks.run_recurring(
                 |_data: &usize| {
-                    game::poll_oversaturation();
+                    time(&perf::OVERSATURATION, game::poll_oversaturation);
                 },
                 SprjTaskGroupIndex::DrawBegin,
             );
@@ -153,34 +159,40 @@ fn run() {
 }
 
 fn on_frame() {
-    input::frame_begin();
-    game::poll_fake_death();
-    game::poll_blind();
-    game::poll_enemy_queue();
-    game::poll_temporary_armor();
-    game::poll_bombardier();
-    game::poll_firestarter();
-    game::poll_gear_snapshots();
-    game::poll_shuffled_stats();
-    game::poll_one_hit_run();
-    game::poll_invincibility();
-    game::poll_speed_changes();
-    game::poll_freeze();
-    game::poll_stamina_lock();
-    game::poll_button_watch();
-    static HELLO_CONNECTION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    use perf::time;
+    perf::frame_begin();
+    time(&perf::INPUT, input::frame_begin);
+    time(&perf::FAKE_DEATH, game::poll_fake_death);
+    time(&perf::BLIND, game::poll_blind);
+    time(&perf::ENEMIES, game::poll_enemy_queue);
+    game::poll_spawned_npcs();
+    time(&perf::AI_TARGET_LIST, game::poll_ai_target_list);
+    time(&perf::TEMPORARY_ARMOR, game::poll_temporary_armor);
+    time(&perf::BOMBARDIER, game::poll_bombardier);
+    time(&perf::FIRESTARTER, game::poll_firestarter);
+    time(&perf::GEAR, game::poll_gear_snapshots);
+    time(&perf::STATS, game::poll_shuffled_stats);
+    time(&perf::ONE_HIT, game::poll_one_hit_run);
+    time(&perf::INVINCIBLE, game::poll_invincibility);
+    time(&perf::SPEED, game::poll_speed_changes);
+    time(&perf::FREEZE, game::poll_freeze);
+    time(&perf::STAMINA, game::poll_stamina_lock);
+    time(&perf::BUTTON_WATCH, game::poll_button_watch);
     let Some(outbound) = OUTBOUND.get() else {
         return;
     };
-    let connection = ipc::connection_count();
-    if HELLO_CONNECTION.swap(connection, std::sync::atomic::Ordering::Relaxed) != connection {
-        let _ = outbound.send(ipc::hello_line());
-    }
-    let frame = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if frame % 30 == 0 {
-        let _ = outbound.send(ipc::state_line());
-    }
+    time(&perf::MANAGER, || {
+        static HELLO_CONNECTION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        static FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let connection = ipc::connection_count();
+        if HELLO_CONNECTION.swap(connection, std::sync::atomic::Ordering::Relaxed) != connection {
+            let _ = outbound.send(ipc::hello_line());
+        }
+        let frame = FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if frame % 30 == 0 {
+            let _ = outbound.send(ipc::state_line());
+        }
+    });
     let Some(commands) = COMMANDS.get() else {
         return;
     };
@@ -194,7 +206,7 @@ fn on_frame() {
             handler,
             args,
         } = command;
-        let outcome = effects::dispatch(&handler, &args);
+        let outcome = perf::time_start(&handler, || effects::dispatch(&handler, &args));
         let _ = outbound.send(ipc::result_line(&request_id, &outcome));
     }
 }
