@@ -221,6 +221,7 @@ pub fn prepare() {
     install_locally_simulated_hook();
     ai_target_list_slot();
     let _ = npc_name_routine();
+    let _ = phantom_recount();
 }
 
 #[derive(Clone, Debug)]
@@ -3657,11 +3658,37 @@ pub fn dump_phantoms() -> Result<String, String> {
         }
     }
     found.push(("player".to_string(), player));
-    found.retain(|(_, chr)| read_usize_checked(*chr) == Ok(player_class));
     found.sort_by_key(|(_, chr)| *chr);
     found.dedup_by_key(|(_, chr)| *chr);
+    // Regular enemies too, the ones near the player, closest first: what they see and who
+    // they are after, next to the phantoms.
+    let position = |chr: usize| -> Option<[f32; 3]> {
+        let physics = module_pointer(chr, PHYSICS_MODULE_OFFSET).ok()?;
+        let mut bytes = [0u8; 12];
+        (copy_readable(physics + PHYSICS_POSITION, &mut bytes) == 12).then(|| {
+            [0, 1, 2].map(|axis| f32::from_ne_bytes(bytes[axis * 4..axis * 4 + 4].try_into().unwrap()))
+        })
+    };
+    let here = position(player);
+    let distance = |chr: usize| -> Option<f32> {
+        let (a, b) = (here?, position(chr)?);
+        Some(((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt())
+    };
+    let mut enemies: Vec<(String, usize, f32)> = found
+        .iter()
+        .filter(|(_, chr)| read_usize_checked(*chr).is_ok_and(|class| class != player_class))
+        .filter_map(|(origin, chr)| distance(*chr).map(|metres| (origin.clone(), *chr, metres)))
+        .filter(|(_, _, metres)| *metres <= DUMP_ENEMY_RANGE)
+        .collect();
+    enemies.sort_by(|a, b| a.2.total_cmp(&b.2));
+    enemies.truncate(DUMP_ENEMIES);
+    found.retain(|(_, chr)| read_usize_checked(*chr) == Ok(player_class));
 
     let mut text = String::new();
+    if let Some((session, _)) = phantom_list() {
+        text.push_str(&format!("SESSION {session:#x}\n"));
+        dump_region(&mut text, "session", session, 0x200);
+    }
     for (origin, chr) in &found {
         let chr = *chr;
         let pointer = |offset: usize| read_usize_checked(chr + offset).unwrap_or(0);
@@ -3692,6 +3719,30 @@ pub fn dump_phantoms() -> Result<String, String> {
         dump_region(&mut text, "ai", pointer(0x1FA8), 0x200);
         dump_region(&mut text, "ai2", pointer(0x1FB0), 0x100);
         dump_region(&mut text, "npc_lookup", pointer(NPC_ROW_LOOKUP), 0x10);
+        dump_region(&mut text, "ai_module", module(AI_MODULE_OFFSET), 0x200);
+    }
+    for (origin, chr, metres) in &enemies {
+        let chr = *chr;
+        let pointer = |offset: usize| read_usize_checked(chr + offset).unwrap_or(0);
+        let modules = pointer(MODULES_OFFSET);
+        let module = |offset: usize| read_usize_checked(modules + offset).unwrap_or(0);
+        text.push_str(&format!(
+            "CHR {chr:#x} origin={origin} name={:?} npc={} type={} team={} hp={:?} kind=enemy distance={metres:.1}\n",
+            chr_name(chr),
+            read_u32_checked(chr + 0x68).unwrap_or(0),
+            read_u32_checked(chr + CHR_TYPE_OFFSET).unwrap_or(0),
+            read_u32_checked(chr + CHR_TEAM_OFFSET).unwrap_or(0),
+            chr_health(chr),
+        ));
+        dump_region(&mut text, "chr_head", chr, 0x200);
+        dump_region(&mut text, "chr_flags", chr + 0x1A00, 0x180);
+        dump_region(&mut text, "chr_tail", chr + 0x1EC0, 0x150);
+        text.push_str(&format!("NOTE {}\n", team_report(chr)));
+        text.push_str(&format!("NOTE {}\n", ai_target_list(chr, false)));
+        dump_region(&mut text, "modules", modules, 0x90);
+        dump_region(&mut text, "data_module", module(DATA_MODULE_OFFSET), 0x140);
+        dump_region(&mut text, "physics_module", module(PHYSICS_MODULE_OFFSET), 0x100);
+        dump_region(&mut text, "ai_module", module(AI_MODULE_OFFSET), 0x200);
     }
     let dir = crate::log::app_dir()?;
     std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
@@ -3701,7 +3752,7 @@ pub fn dump_phantoms() -> Result<String, String> {
         .unwrap_or(0);
     let path = dir.join(format!("phantom-dump-{stamp}.txt"));
     std::fs::write(&path, text).map_err(|error| error.to_string())?;
-    Ok(format!("recorded {} player-type characters in {}", found.len(), path.display()))
+    Ok(format!("recorded {} player-type characters and {} enemies nearby in {}", found.len(), enemies.len(), path.display()))
 }
 
 pub fn is_empty_item(item_id: i32) -> bool {
@@ -4290,6 +4341,14 @@ fn poll_spawn_checks(queue: &mut EnemyQueue) {
         };
         let state = spawn_state(exists, model);
         match state {
+            // Spawned enemies go on the AI's target list too, so allies and invaders see
+            // them. Allies and invaders get there in their own setup a little later.
+            SpawnState::Fine if !check.skip_frozen_delete => {
+                let mut listed = AI_LISTED_NPCS.lock().unwrap_or_else(|poison| poison.into_inner());
+                if !listed.contains(&check.chr) {
+                    listed.push(check.chr);
+                }
+            }
             SpawnState::Fine => {}
             SpawnState::Gone => failed += 1,
             SpawnState::Frozen if check.skip_frozen_delete => {}
@@ -4351,8 +4410,14 @@ fn delete_spawns(chrs: &[usize], requested: &mut Vec<usize>) -> Result<(), Strin
     for chr in chrs.iter().copied() {
         forget_invader_name(chr);
         if !requested.contains(&chr) {
+            let handle = read_u32_checked(chr + 0x08).ok();
             call(world, chr);
             requested.push(chr);
+            // An ally or invader also has a place in the session's phantom list. Left
+            // there, it would describe whoever is spawned into the same slot next.
+            if let Some(handle) = handle {
+                forget_phantom_entry(handle);
+            }
         }
     }
     Ok(())
@@ -4743,6 +4808,11 @@ const DEBUG_BLOCK_OFFSET: u32 = 2;
 const CHR_DATA_MAP_DATA: usize = 0x10;
 const CHR_DATA_MAP_ENTRY: usize = 0x18;
 const PHYSICS_MODULE_OFFSET: usize = 0x68;
+/// Module list: the character's AI.
+const AI_MODULE_OFFSET: usize = 0x38;
+/// Dump phantoms also writes down the enemies this close to the player, at most this many.
+const DUMP_ENEMY_RANGE: f32 = 40.0;
+const DUMP_ENEMIES: usize = 20;
 const PHYSICS_ROTATION: usize = 0x70;
 const PHYSICS_POSITION: usize = 0x80;
 /// Character controller: the columns of its facing matrix. Forward is their negative.
@@ -5268,17 +5338,15 @@ fn install_locally_simulated_hook() {
     }
 }
 
-/// Rewrites the list of spawned characters that count as simulated here: the human NPCs.
-/// Spawned enemies stay as the game sees them.
+/// Rewrites the list of spawned characters that count as simulated here: all of them,
+/// allies, invaders and enemies, so they can hurt each other.
 fn refresh_local_npcs() {
     use std::sync::atomic::Ordering;
     if LOCALLY_SIMULATED_ORIGINAL.load(Ordering::Acquire) == 0 {
         return;
     }
-    let player_class = local_player().ok().and_then(|player| read_usize_checked(player as usize).ok());
     let mut ids = spawned_chrs()
         .into_iter()
-        .filter(|chr| player_class.is_some() && read_usize_checked(*chr).ok() == player_class)
         .filter_map(|chr| read_u32_checked(chr + CHR_SYNC_ID).ok())
         .map(|id| id & 0xFFFF);
     for slot in LOCAL_NPC_IDS.iter() {
@@ -5512,7 +5580,153 @@ pub fn poll_spawned_npcs() {
     let _ = catch_unwind(AssertUnwindSafe(|| {
         crate::perf::time(&crate::perf::LATE_NPC_SETUP, poll_late_npc_setup);
         crate::perf::time(&crate::perf::SIMULATED_LIST, refresh_local_npcs);
+        poll_phantom_list();
     }));
+}
+
+/// The session's list of phantoms: six entries from session + 0x20, 0x1C bytes each,
+/// starting with the character's handle.
+const PHANTOM_LIST: usize = 0x20;
+const PHANTOM_ENTRY: usize = 0x1C;
+const PHANTOM_ENTRIES: usize = 6;
+/// Session: how many are in the world, the host included. 2 or more is multiplayer.
+const SESSION_MEMBERS: usize = 0x18;
+
+/// The session object and its phantom list as bytes.
+fn phantom_list() -> Option<(usize, [u8; PHANTOM_ENTRY * PHANTOM_ENTRIES])> {
+    let summon = cached().ok().and_then(|located| located.summon_npc.as_ref().ok().copied())?;
+    let session: extern "C" fn() -> usize = unsafe { std::mem::transmute(summon.session) };
+    let session = session();
+    let mut bytes = [0u8; PHANTOM_ENTRY * PHANTOM_ENTRIES];
+    (session >= 0x10_000 && copy_readable(session + PHANTOM_LIST, &mut bytes) == bytes.len()).then_some((session, bytes))
+}
+
+/// Phantom list entry: the state a phantom is in. The game's "phantom leaves" routine
+/// (used when one is sent home) sets it to leaving and starts a timer; two seconds later
+/// the game asks the phantom's network connection to leave and marks the timer as done.
+/// A spawned NPC has no connection, so it would stay. The mod removes it at that point.
+const PHANTOM_STATE: usize = 2;
+const PHANTOM_TIMER: usize = 5;
+const PHANTOM_LEAVING: u32 = 5;
+const PHANTOM_TIMER_DONE: u32 = 0xFF7F_FFFF;
+/// The game's recount of the session from its phantom list: `(session)`. It sets how many
+/// white phantoms, dark spirits and members in all are in the world, and the game goes by
+/// those counts to say whether the world is still in multiplayer, which locks the bonfires.
+const PHANTOM_RECOUNT_PATTERN: &str = "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 20 33 C0 48 8D 79 20 48 8B D9 48 8B F7 48 89 41 08 89 41 10 89 41 18 8D 68 06 0F 1F 00 83 3F FF 74 6E";
+
+fn phantom_recount() -> Result<usize, String> {
+    static ROUTINE: OnceLock<Result<usize, String>> = OnceLock::new();
+    ROUTINE.get_or_init(|| find_unique(PHANTOM_RECOUNT_PATTERN)).clone()
+}
+
+/// What the game leaves in an unused entry.
+const PHANTOM_EMPTY_ENTRY: [u32; PHANTOM_ENTRY / 4] = [u32::MAX, 1, 0, u32::MAX, u32::MAX, PHANTOM_TIMER_DONE, 0];
+
+/// How long a dead ally or invader stays before it fades: a real phantom dies, falls and
+/// is gone a few seconds later.
+const DEAD_PHANTOM_FRAMES: u32 = 240;
+
+/// Spawned allies and invaders that have died, by character, with frames since.
+static DEAD_PHANTOMS: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+/// Removes spawned allies and invaders that the game has sent home, or that died a few
+/// seconds ago. The game would do this for a real phantom, but for an NPC the mod spawned
+/// nothing does it, so it would stay, or lie there dead, and keep the bonfires locked.
+fn poll_phantom_list() {
+    let player_class = local_player().ok().and_then(|player| read_usize_checked(player as usize).ok());
+    let present = spawned_chrs();
+    // A character that is gone is no longer waiting to be deleted. The game reuses the
+    // memory, so a new ally or invader can sit at the same address and must not count as
+    // already deleted.
+    DELETE_REQUESTED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .retain(|chr| present.contains(chr));
+    let spawned: Vec<(usize, u32)> = present
+        .into_iter()
+        .filter(|chr| player_class.is_some() && read_usize_checked(*chr).ok() == player_class)
+        .filter_map(|chr| read_u32_checked(chr + 0x08).ok().map(|handle| (chr, handle)))
+        .collect();
+    let mut dead = DEAD_PHANTOMS.lock().unwrap_or_else(|poison| poison.into_inner());
+    dead.retain(|(chr, _)| spawned.iter().any(|(present, _)| present == chr));
+    if spawned.is_empty() {
+        return;
+    }
+    let mut leaving: Vec<(usize, u32, &str)> = Vec::new();
+    for &(chr, handle) in &spawned {
+        if chr_health(chr).is_none_or(|hp| hp > 0) {
+            dead.retain(|(gone, _)| *gone != chr);
+            continue;
+        }
+        match dead.iter_mut().find(|(gone, _)| *gone == chr) {
+            Some((_, frames)) => {
+                *frames += 1;
+                if *frames == DEAD_PHANTOM_FRAMES {
+                    leaving.push((chr, handle, "died"));
+                }
+            }
+            None => dead.push((chr, 0)),
+        }
+    }
+    drop(dead);
+    let list = phantom_list();
+    if let Some((_, bytes)) = list {
+        for index in 0..PHANTOM_ENTRIES {
+            let words: Vec<u32> = bytes[index * PHANTOM_ENTRY..(index + 1) * PHANTOM_ENTRY]
+                .chunks_exact(4)
+                .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+                .collect();
+            if let Some(&(chr, handle)) = spawned.iter().find(|(_, handle)| *handle == words[0]) {
+                if words[PHANTOM_STATE] == PHANTOM_LEAVING
+                    && words[PHANTOM_TIMER] == PHANTOM_TIMER_DONE
+                    && !leaving.iter().any(|(gone, _, _)| *gone == chr)
+                {
+                    leaving.push((chr, handle, "was sent home"));
+                }
+            }
+        }
+    }
+    for (chr, handle, why) in leaving {
+        remove_phantom(chr, handle, why);
+    }
+}
+
+/// Removes one spawned ally or invader. Deleting it also clears its place in the phantom
+/// list (see `forget_phantom_entry`).
+fn remove_phantom(chr: usize, handle: u32, why: &str) {
+    let mut requested = DELETE_REQUESTED.lock().unwrap_or_else(|poison| poison.into_inner());
+    if requested.contains(&chr) {
+        return;
+    }
+    let removed = delete_spawns(&[chr], &mut requested);
+    drop(requested);
+    crate::log::log(format!("phantom {handle:#x} {why}: removed {removed:?}"));
+}
+
+/// Clears a deleted character's place in the session's phantom list, and recounts the
+/// session. Without the recount the game still thinks someone is visiting, which keeps
+/// the bonfires locked.
+fn forget_phantom_entry(handle: u32) {
+    let Some((session, bytes)) = phantom_list() else {
+        return;
+    };
+    let empty: Vec<u8> = PHANTOM_EMPTY_ENTRY.iter().flat_map(|word| word.to_ne_bytes()).collect();
+    let mut cleared = Vec::new();
+    for index in 0..PHANTOM_ENTRIES {
+        let first = u32::from_ne_bytes(bytes[index * PHANTOM_ENTRY..index * PHANTOM_ENTRY + 4].try_into().unwrap());
+        if first == handle {
+            cleared.push((index, write_bytes_checked(session + PHANTOM_LIST + index * PHANTOM_ENTRY, &empty).is_ok()));
+        }
+    }
+    if cleared.is_empty() {
+        return;
+    }
+    let members = phantom_recount().map(|routine| {
+        let recount: extern "C" fn(usize) = unsafe { std::mem::transmute(routine) };
+        recount(session);
+        read_u32_checked(session + SESSION_MEMBERS)
+    });
+    crate::log::log(format!("phantom {handle:#x}: list places cleared {cleared:?}, members now {members:?}"));
 }
 
 /// Runs the last step for spawned NPCs whose model and equipment have had time to load.
@@ -6196,7 +6410,7 @@ pub fn schemas_json() -> Value {
         {
             "id": "dump_phantoms",
             "name": "Dump phantoms",
-            "description": "Writes the state of every player-type character in the area to a file: you, real NPC phantoms and spawned ones.",
+            "description": "Writes the state of every player-type character in the area to a file (you, real NPC phantoms and spawned ones), and of the enemies within 40 metres of you.",
             "arguments": []
         },
         {

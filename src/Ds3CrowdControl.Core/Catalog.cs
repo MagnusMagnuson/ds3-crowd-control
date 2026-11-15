@@ -371,7 +371,7 @@ public static class BuiltinHandlers
         {
             Id = "dump_phantoms",
             Name = "Dump phantoms",
-            Description = "Writes the state of every player-type character in the area to a file: you, real NPC phantoms and spawned ones.",
+            Description = "Writes the state of every player-type character in the area to a file (you, real NPC phantoms and spawned ones), and of the enemies within 40 metres of you.",
             Arguments = []
         },
         new HandlerSchema
