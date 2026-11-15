@@ -220,6 +220,7 @@ pub fn prepare() {
     // ally or invader does not freeze the game for that long.
     install_locally_simulated_hook();
     ai_target_list_slot();
+    let _ = npc_name_routine();
 }
 
 #[derive(Clone, Debug)]
@@ -5009,13 +5010,16 @@ struct InvaderNote {
     delay: Duration,
     /// The animation it appears with, or 0 for none.
     animation: i32,
+    /// The NPC's own name in the game's text files, for the message when there is no
+    /// sender's name and the mod does not know the name itself.
+    npc_name_id: i32,
     /// When the message was shown. None until its turn comes.
     announced: Option<Instant>,
 }
 
 static INVADER_NOTES: Mutex<Vec<InvaderNote>> = Mutex::new(Vec::new());
 
-fn keep_invader_note(name: Option<&str>, delay: Duration, animation: i32) -> u32 {
+fn keep_invader_note(name: Option<&str>, delay: Duration, animation: i32, npc_name_id: i32) -> u32 {
     use std::sync::atomic::{AtomicU32, Ordering};
     static NEXT: AtomicU32 = AtomicU32::new(1);
     let key = NEXT.fetch_add(1, Ordering::Relaxed).max(1);
@@ -5026,6 +5030,7 @@ fn keep_invader_note(name: Option<&str>, delay: Duration, animation: i32) -> u32
         name,
         delay,
         animation,
+        npc_name_id,
         announced: None,
     });
     key
@@ -5041,11 +5046,10 @@ fn invader_arrival_due(enemy: EnemyChoice) -> bool {
     match note.announced {
         Some(announced) => announced.elapsed() >= note.delay,
         None => {
-            let shown = note
-                .name
-                .as_deref()
-                .or_else(|| known_invader_name(enemy.npc_id))
-                .unwrap_or("Phantom");
+            let shown = match note.name.as_deref().or_else(|| known_invader_name(enemy.npc_id)) {
+                Some(name) => ShownName::Text(name),
+                None => ShownName::Npc(note.npc_name_id),
+            };
             if let Err(error) = show_arrival_message(shown, enemy.friendly) {
                 crate::log::log(format!("npc {}: arrival message not shown: {error}", enemy.npc_id));
             }
@@ -5137,21 +5141,69 @@ fn fill_name_object(base: usize, units: &[u16]) -> Result<(), String> {
     Ok(())
 }
 
+/// The game's routine that turns a name in its text files into a name object:
+/// `(name object, text id, with title) -> name object`. It is what gives an NPC the name
+/// shown on lock-on, and it works before the NPC exists.
+const NPC_NAME_PATTERN: &str = "40 55 56 57 48 8D 6C 24 C0 48 81 EC 40 01 00 00 48 C7 44 24 48 FE FF FF FF 48 89 9C 24 70 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 30 41 0F B6 D8 48 8B F9 48 89 4C 24 40 33 F6 89 74 24 38";
+
+fn npc_name_routine() -> Result<usize, String> {
+    static ROUTINE: OnceLock<Result<usize, String>> = OnceLock::new();
+    ROUTINE.get_or_init(|| find_unique(NPC_NAME_PATTERN)).clone()
+}
+
+/// The name in an arrival message.
+enum ShownName<'a> {
+    /// The sender's name, or a name the mod knows.
+    Text(&'a str),
+    /// The NPC's own name, by its text id in the game's files.
+    Npc(i32),
+}
+
+/// Fills a new name object with an NPC's own name from the game's text files.
+fn fill_npc_name_object(base: usize, text_id: i32) -> Result<(), String> {
+    if text_id <= 0 {
+        return Err("the NPC has no name in the game's text".to_string());
+    }
+    let make = *cached()?.name_object.as_ref().map_err(|error| error.clone())?;
+    let routine = npc_name_routine()?;
+    let make_object: extern "C" fn(usize) -> usize = unsafe { std::mem::transmute(make) };
+    let fill: extern "C" fn(usize, i32, u8) -> usize = unsafe { std::mem::transmute(routine) };
+    make_object(base);
+    fill(base, text_id, 0);
+    let length = unsafe { ((base + NAME_LENGTH) as *const usize).read() };
+    if length > 0 {
+        // The fixed text wins over the string when it is set, as in fill_name_object.
+        unsafe { ((base + NAME_FIXED_TEXT) as *mut usize).write(0) };
+        return Ok(());
+    }
+    // Or the routine pointed the fixed text at the name.
+    let fixed = unsafe { ((base + NAME_FIXED_TEXT) as *const usize).read() };
+    if fixed >= 0x10_000 && read_u16_checked(fixed).is_ok_and(|first| first != 0) {
+        return Ok(());
+    }
+    Err(format!("text {text_id} gave an empty name"))
+}
+
 /// Shows the game's own arrival line, such as "Invaded by dark spirit NAME". The routine
 /// frees the name object it is given.
-fn show_arrival_message(name: &str, friendly: bool) -> Result<(), String> {
+fn show_arrival_message(name: ShownName, friendly: bool) -> Result<(), String> {
     let message = *cached()?.summon_message.as_ref().map_err(|error| error.clone())?;
     let owner = read_usize_checked(message.owner_slot)?;
     if owner < 0x10_000 {
         return Err("the message owner is not ready".to_string());
     }
-    let units = name_units(name, MESSAGE_NAME_LENGTH);
-    if units.is_empty() {
-        return Err("no name to show".to_string());
-    }
     let mut object = [0u64; NAME_OBJECT_SIZE / 8];
     let base = object.as_mut_ptr() as usize;
-    fill_name_object(base, &units)?;
+    match name {
+        ShownName::Text(name) => {
+            let units = name_units(name, MESSAGE_NAME_LENGTH);
+            if units.is_empty() {
+                return Err("no name to show".to_string());
+            }
+            fill_name_object(base, &units)?;
+        }
+        ShownName::Npc(text_id) => fill_npc_name_object(base, text_id)?,
+    }
     let show: extern "C" fn(usize, u32, u32, u32, usize, u32) = unsafe { std::mem::transmute(message.show) };
     let invade_type = if friendly { INVADE_TYPE_WHITE_PHANTOM } else { INVADE_TYPE_DARK_SPIRIT };
     show(owner, ARRIVAL_MESSAGE_ROW, invade_type, ARRIVAL_NAME_SLOT, base, 0);
@@ -5759,6 +5811,7 @@ pub fn spawn_npc_invader(options: InvaderOptions) -> Result<String, String> {
             use_sender_name.then_some(viewer),
             Duration::from_secs(u64::from(arrival_delay)),
             arrival_animation,
+            row.name_id(),
         ),
         friendly,
     };
