@@ -135,7 +135,7 @@ Viewers on a Discord server press buttons in a channel to trigger events. Pressi
 
 Pressing a button also opens the viewer's own panel: a message in the same channel that only they can see. It says what happened with their last press, such as "Blind is queued" and then "Blind ran", and has all the buttons again, grey while their own cooldown or the event's runs, with countdowns. Pressing a button there changes that same message, so each viewer has one personal panel at a time, and the buttons come back by themselves when a cooldown ends. With more than 25 events it has pages. Discord only lets a bot change such a message for 15 minutes after the last press, so the bot removes a personal panel after 14 minutes without a press; pressing on the public panel opens a fresh one.
 
-> **Not yet tested on a real server.** The Discord part has been tested against a fake Discord only. If you use it, please [report any problems](https://github.com/MagnusMagnuson/ds3-crowd-control/issues).
+> **Only tested on a small test server so far**, not yet during a stream with many viewers. If you use it, please [report any problems](https://github.com/MagnusMagnuson/ds3-crowd-control/issues).
 
 Each streamer uses a bot of their own, which takes a few minutes to set up once:
 

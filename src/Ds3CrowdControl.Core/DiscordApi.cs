@@ -45,7 +45,7 @@ public sealed class DiscordRestClient(HttpClient http, string token) : IDiscordR
 {
     public static readonly Uri DefaultBase = new("https://discord.com/api/v10/");
     /// <summary>Discord asks bots to name themselves like this.</summary>
-    private const string UserAgent = "DiscordBot (https://github.com/MagnusMagnuson/ds3-crowd-control, 0.2)";
+    private const string UserAgent = "DiscordBot (https://github.com/MagnusMagnuson/ds3-crowd-control, 0.3)";
     /// <summary>A reply with this flag is shown only to the person who pressed.</summary>
     private const int Ephemeral = 64;
     private const int ChannelMessageReply = 4;
