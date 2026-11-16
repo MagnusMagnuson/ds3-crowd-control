@@ -47,7 +47,7 @@ fn execute(handler: &str, args: &Value) -> Outcome {
         "show_you_died" => game::show_you_died(),
         "empty_stamina" => game::empty_stamina(),
         "no_stamina" => {
-            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(5);
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(10);
             game::no_stamina(seconds.clamp(1, 60) as i32)
         }
         "decrease_speed" => {
@@ -91,18 +91,27 @@ fn execute(handler: &str, args: &Value) -> Outcome {
                 args.get(name).and_then(Value::as_i64).unwrap_or(default)
             };
             game::temporary_armor(
-                number("seconds", 60).clamp(1, 600) as i32,
+                number("seconds", 120).clamp(1, 600) as i32,
                 game::ArmorStyle::from_index(number("armorStyle", 0)),
                 number("includeMissingDlc", 0) != 0,
             )
         }
         "bombardier" => {
-            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(60);
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(120);
             game::bombardier(seconds.clamp(5, 600) as i32)
         }
         "firestarter" => {
-            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(300);
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(120);
             game::firestarter(seconds.clamp(5, 600) as i32)
+        }
+        "mimic_chests" => {
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
+            let prize = game::PrizeKind::from_index(args.get("prize").and_then(Value::as_i64).unwrap_or(0));
+            game::mimic_chests(seconds.clamp(10, 600) as i32, prize)
+        }
+        "ooga_booga" | "big_ooga_booga" => {
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(120);
+            game::ooga_booga(seconds.clamp(5, 600) as i32, handler == "big_ooga_booga")
         }
         "shuffle_stats" => {
             let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(0);
@@ -114,7 +123,7 @@ fn execute(handler: &str, args: &Value) -> Outcome {
         }
         "set_health_random_percent" => game::set_health_random_percent(),
         "oversaturate" => {
-            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(15);
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
             let percent = args.get("percent").and_then(Value::as_i64).unwrap_or(2000);
             game::oversaturate(seconds.clamp(1, 300) as i32, percent.clamp(100, 2000) as i32)
         }
@@ -123,7 +132,7 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             game::blind(seconds.clamp(1, 60) as i32)
         }
         "freeze" => {
-            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(5);
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(10);
             game::freeze(seconds.clamp(1, 60) as i32)
         }
         "invert_controls" => {
@@ -135,14 +144,22 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
             crate::input::pacifist(seconds.clamp(1, 300) as i32)
         }
-        "spawn_random_enemy" => {
+        "spawn_random_enemy" | "spawn_random_boss" | "spawn_anything" => {
             let amount = args.get("amount").and_then(Value::as_i64).unwrap_or(1);
             let whole_game = args.get("wholeGame").and_then(Value::as_i64).unwrap_or(0) != 0;
-            let bosses = args.get("bosses").and_then(Value::as_i64).unwrap_or(1) != 0;
-            let only_bosses = args.get("onlyBosses").and_then(Value::as_i64).unwrap_or(0) != 0;
             let replace_oldest = args.get("replaceOldest").and_then(Value::as_i64).unwrap_or(1) != 0;
             let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(5).clamp(1, 16) as usize;
-            game::spawn_random_enemy(amount.clamp(1, 10) as i32, whole_game, bosses, only_bosses, replace_oldest, limit)
+            let invader_chance = args.get("invaderChance").and_then(Value::as_i64).unwrap_or(20).clamp(0, 100);
+            match handler {
+                "spawn_anything" if game::roll_percent(invader_chance as u32) => game::spawn_npc_invader(
+                    game::InvaderOptions::invader(args.get("viewer").and_then(Value::as_str).unwrap_or("")),
+                ),
+                "spawn_anything" => game::spawn_random_enemy(1, whole_game, true, false, replace_oldest, limit),
+                "spawn_random_boss" => {
+                    game::spawn_random_enemy(amount.clamp(1, 3) as i32, whole_game, true, true, replace_oldest, limit)
+                }
+                _ => game::spawn_random_enemy(amount.clamp(1, 10) as i32, whole_game, false, false, replace_oldest, limit),
+            }
         }
         "spawn_npc_invader" | "spawn_npc_ally" => {
             let friendly = handler == "spawn_npc_ally";
@@ -172,6 +189,33 @@ fn execute(handler: &str, args: &Value) -> Outcome {
         "toggle_invincible" => game::toggle_invincible(),
         "toggle_invisible" => game::toggle_invisible(),
         "dump_phantoms" => game::dump_phantoms(),
+        "test_mimic_chests" => {
+            let number = |name: &str, fallback: i64| args.get(name).and_then(Value::as_i64).unwrap_or(fallback);
+            game::test_mimic_chests(
+                number("spawn", 1) != 0,
+                number("npcId", 212_000).clamp(100_000, 999_999) as u32,
+                number("thinkId", 0).clamp(0, 99_999_999) as u32,
+            )
+        }
+        "scan_nearest_animations" => game::scan_nearest_animations(),
+        "try_vanish_effect" => {
+            let effect = args.get("effect").and_then(Value::as_i64).unwrap_or(10_633).clamp(0, 999_999_999);
+            let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(2).clamp(0, 30);
+            game::try_vanish_effect(effect as i32, seconds as f32)
+        }
+        "play_nearest_sequence" => {
+            let animations = args.get("animations").and_then(Value::as_str).unwrap_or("3000, 3004, 4100");
+            let gap = args.get("gapFrames").and_then(Value::as_i64).unwrap_or(45).clamp(21, 600);
+            game::play_nearest_sequence(animations, gap as u32)
+        }
+        "force_nearest_animation" => {
+            let animation = args.get("animation").and_then(Value::as_i64).unwrap_or(0);
+            let player_animation = args.get("playerAnimation").and_then(Value::as_i64).unwrap_or(0);
+            game::force_nearest_animation(
+                animation.clamp(0, 99_999_999) as i32,
+                player_animation.clamp(0, 99_999_999) as i32,
+            )
+        }
         "toggle_performance" => crate::perf::toggle(),
         "performance_report" => crate::perf::report(),
         "watch_item_button" => game::start_button_watch(),
@@ -185,7 +229,7 @@ fn execute(handler: &str, args: &Value) -> Outcome {
 
 fn speed_args(args: &Value) -> (i32, i32, bool) {
     let percent = args.get("percent").and_then(Value::as_i64).unwrap_or(30);
-    let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
+    let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(10);
     let movement_only = args.get("movementOnly").and_then(Value::as_i64).unwrap_or(0) != 0;
     (percent.clamp(1, 300) as i32, seconds.clamp(1, 300) as i32, movement_only)
 }

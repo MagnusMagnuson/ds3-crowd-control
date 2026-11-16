@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use darksouls3::app_menu::NewMenuSystem;
 use darksouls3::param::{
     CHARACTER_INIT_PARAM, EQUIP_PARAM_PROTECTOR_ST, EQUIP_PARAM_WEAPON_ST, MAGIC_PARAM_ST, NPC_PARAM_ST,
+    SP_EFFECT_PARAM_ST, THROW_INFO_BANK,
     NPC_THINK_PARAM_ST, REINFORCE_PARAM_WEAPON_ST,
 };
 use darksouls3::sprj::{
@@ -222,6 +223,9 @@ pub fn prepare() {
     ai_target_list_slot();
     let _ = npc_name_routine();
     let _ = phantom_recount();
+    let _ = force_play_animation_routine();
+    let _ = add_sp_effect_routine();
+    let _ = erase_sp_effect_routine();
 }
 
 #[derive(Clone, Debug)]
@@ -2017,12 +2021,21 @@ struct PendingRestores {
     armor: Option<TemporaryArmor>,
     bombardier: Option<Bombardier>,
     firestarter: Option<Firestarter>,
+    #[serde(default)]
+    ooga_booga: Option<OogaBooga>,
     stats: Option<ShuffledStats>,
+    #[serde(default)]
+    recently_ended: Vec<EndedSwap>,
 }
 
 impl PendingRestores {
     fn is_empty(&self) -> bool {
-        self.armor.is_none() && self.bombardier.is_none() && self.firestarter.is_none() && self.stats.is_none()
+        self.armor.is_none()
+            && self.bombardier.is_none()
+            && self.firestarter.is_none()
+            && self.ooga_booga.is_none()
+            && self.stats.is_none()
+            && self.recently_ended.is_empty()
     }
 
     /// Bombardier and Firestarter both take the weapons and armor slots.
@@ -2031,6 +2044,8 @@ impl PendingRestores {
             Some(BOMBARDIER_ACTIVE)
         } else if self.firestarter.is_some() {
             Some(FIRESTARTER_ACTIVE)
+        } else if self.ooga_booga.is_some() {
+            Some(OOGA_BOOGA_ACTIVE)
         } else {
             None
         }
@@ -2038,7 +2053,14 @@ impl PendingRestores {
 }
 
 static PENDING: Mutex<PendingRestores> =
-    Mutex::new(PendingRestores { armor: None, bombardier: None, firestarter: None, stats: None });
+    Mutex::new(PendingRestores {
+    armor: None,
+    bombardier: None,
+    firestarter: None,
+    ooga_booga: None,
+    stats: None,
+    recently_ended: Vec::new(),
+});
 
 fn pending() -> MutexGuard<'static, PendingRestores> {
     PENDING.lock().unwrap_or_else(|poison| poison.into_inner())
@@ -2222,6 +2244,7 @@ pub fn poll_temporary_armor() {
                 crate::log::log(format!("temporary armor slot {} restore failed: {error}", swap.slot));
             }
         }
+        slot.remember_ended(EndedKind::Armor(active));
         save_pending(&slot);
     }));
 }
@@ -2595,6 +2618,7 @@ pub fn poll_bombardier() {
         if let Err(error) = end_bombardier(unsafe { &mut *player }, &active) {
             crate::log::log(format!("Bombardier restore failed: {error}"));
         }
+        slot.remember_ended(EndedKind::Bombardier(active));
         save_pending(&slot);
     }));
 }
@@ -2880,6 +2904,7 @@ fn end_other_gear_swaps(
         slot.armor.as_ref().map(|active| &active.character),
         slot.bombardier.as_ref().map(|active| &active.character),
         slot.firestarter.as_ref().map(|active| &active.character),
+        slot.ooga_booga.as_ref().map(|active| &active.character),
     ];
     if owners.into_iter().flatten().any(|owner| owner != character) {
         return Err(OTHER_CHARACTER_WAITING.to_string());
@@ -2892,18 +2917,29 @@ fn end_other_gear_swaps(
             }
         }
         ended.push("Temporary Armor");
+        slot.remember_ended(EndedKind::Armor(active));
     }
     if let Some(active) = slot.bombardier.take() {
         if let Err(error) = end_bombardier(player, &active) {
             crate::log::log(format!("Bombardier restore failed: {error}"));
         }
         ended.push("Bombardier");
+        slot.remember_ended(EndedKind::Bombardier(active));
     }
     if let Some(active) = slot.firestarter.take() {
         if let Err(error) = end_firestarter(player, &active) {
             crate::log::log(format!("Firestarter restore failed: {error}"));
         }
         ended.push("Firestarter");
+        slot.remember_ended(EndedKind::Firestarter(active));
+    }
+    if let Some(active) = slot.ooga_booga.take() {
+        let name = ooga_name(active.big);
+        if let Err(error) = end_ooga_booga(player, &active) {
+            crate::log::log(format!("{name} restore failed: {error}"));
+        }
+        ended.push(name);
+        slot.remember_ended(EndedKind::OogaBooga(active));
     }
     if !ended.is_empty() {
         save_pending(slot);
@@ -3026,38 +3062,8 @@ fn keep_flame_only(active: &mut Firestarter) {
         return;
     };
     let player = unsafe { &mut *player };
-    for weapon_slot in WEAPON_SLOTS {
-        let Some((index, weapon)) = equipped_weapon(player, weapon_slot) else {
-            continue;
-        };
-        if weapon == active.flame || !is_removable_weapon(weapon) {
-            continue;
-        }
-        if let Err(error) = call_equip(player, weapon_slot, -1) {
-            crate::log::log(format!("Firestarter: could not clear slot {weapon_slot}: {error}"));
-            continue;
-        }
-        if !active.weapons.iter().any(|removed| removed.slot == weapon_slot) {
-            active.weapons.push(RemovedWeapon { slot: weapon_slot, index, weapon });
-            active.weapons_changed = true;
-        }
-    }
-    if equipped_weapon(player, RIGHT_HAND_SLOT).is_some_and(|(_, weapon)| weapon == active.flame) {
-        return;
-    }
-    let index = match current_index(player, ItemCategory::Weapon, active.flame, active.flame_index) {
-        Some(index) => call_equip(player, RIGHT_HAND_SLOT, index).map(|_| index),
-        None => ItemId::new(ItemCategory::Weapon, active.flame)
-            .map_err(|error| format!("{error:?}"))
-            .and_then(|item| give_and_equip(player, item, RIGHT_HAND_SLOT)),
-    };
-    match index {
-        Ok(index) if index != active.flame_index => {
-            active.flame_index = index;
-            active.weapons_changed = true;
-        }
-        Ok(_) => {}
-        Err(error) => crate::log::log(format!("Firestarter: could not equip the flame again: {error}")),
+    if keep_only_weapon(player, &mut active.weapons, active.flame, &mut active.flame_index, "Firestarter") {
+        active.weapons_changed = true;
     }
 }
 
@@ -3145,7 +3151,1157 @@ pub fn poll_firestarter() {
         if let Err(error) = end_firestarter(unsafe { &mut *player }, &active) {
             crate::log::log(format!("Firestarter restore failed: {error}"));
         }
+        slot.remember_ended(EndedKind::Firestarter(active));
         save_pending(&slot);
+    }));
+}
+
+const CLUB: u32 = 8_000_000;
+const GREAT_CLUB: u32 = 8_080_000;
+/// Worn on the legs, so naked is the game's own naked look.
+const LOINCLOTH: u32 = 76_503_000;
+const LEGS_SLOT: u32 = 0xF;
+const OOGA_BOOGA_ACTIVE: &str = "Ooga Booga is using the weapon and armor slots";
+/// War Cry weapon arts, from the game's own names. The one with the biggest attack boost
+/// that exists in the game data is used.
+const WAR_CRY_EFFECTS: [i32; 7] = [1_062_301, 1_070_101, 1_070_401, 1_070_501, 1_080_001, 1_080_601, 120_000];
+
+#[derive(Deserialize, Serialize)]
+struct OogaBooga {
+    until: u64,
+    character: String,
+    big: bool,
+    weapons: Vec<RemovedWeapon>,
+    armor: Vec<ArmorSwap>,
+    club: u32,
+    club_index: i32,
+    clubs_before: u32,
+    /// The club row as it was, so the lifted requirements and the buff can go back.
+    row_before: Option<ClubRow>,
+    #[serde(skip)]
+    changed: bool,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+struct ClubRow {
+    strength: u8,
+    dexterity: u8,
+    intelligence: u8,
+    faith: u8,
+    resident_effect: i32,
+}
+
+fn ooga_name(big: bool) -> &'static str {
+    if big {
+        "Big Ooga Booga"
+    } else {
+        "Ooga Booga"
+    }
+}
+
+/// The War Cry effect with the biggest physical attack boost, if any is in the game data.
+fn war_cry_effect() -> Option<i32> {
+    let regulation = unsafe { CSRegulationManager::instance() }.ok()?;
+    let effects = regulation.get_param::<SP_EFFECT_PARAM_ST>();
+    WAR_CRY_EFFECTS
+        .iter()
+        .filter_map(|id| effects.get(*id as u64).map(|row| (*id, row.physics_attack_power_rate())))
+        .filter(|(_, rate)| rate.is_finite())
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(id, _)| id)
+}
+
+/// No stat requirements, and War Cry's boost for as long as the club is held. Returns the
+/// row as it was, or nothing when `remember` is off, which is how it is set again after
+/// the params reload.
+fn boost_club(base: u32, effect: Option<i32>, remember: bool) -> Option<ClubRow> {
+    let regulation = unsafe { CSRegulationManager::instance_mut() }.ok()?;
+    let row = regulation.get_mut_param::<EQUIP_PARAM_WEAPON_ST>().get_mut(u64::from(base))?;
+    let before = ClubRow {
+        strength: row.proper_strength(),
+        dexterity: row.proper_agility(),
+        intelligence: row.proper_magic(),
+        faith: row.proper_faith(),
+        resident_effect: row.resident_sp_effect_id0(),
+    };
+    row.set_proper_strength(0);
+    row.set_proper_agility(0);
+    row.set_proper_magic(0);
+    row.set_proper_faith(0);
+    if let Some(effect) = effect {
+        row.set_resident_sp_effect_id0(effect);
+    }
+    remember.then_some(before)
+}
+
+fn restore_club(base: u32, before: &ClubRow) {
+    let Ok(regulation) = (unsafe { CSRegulationManager::instance_mut() }) else {
+        return;
+    };
+    if let Some(row) = regulation.get_mut_param::<EQUIP_PARAM_WEAPON_ST>().get_mut(u64::from(base)) {
+        row.set_proper_strength(before.strength);
+        row.set_proper_agility(before.dexterity);
+        row.set_proper_magic(before.intelligence);
+        row.set_proper_faith(before.faith);
+        row.set_resident_sp_effect_id0(before.resident_effect);
+    }
+}
+
+fn club_base(big: bool) -> u32 {
+    if big {
+        GREAT_CLUB
+    } else {
+        CLUB
+    }
+}
+
+/// Takes off every armor piece but the legs, which get the Loincloth. Remembers in `swaps`
+/// what each slot needs to get its own armor back. Returns whether `swaps` changed.
+fn strip_armor(player: &mut PlayerIns, swaps: &mut Vec<ArmorSwap>, event: &str) -> bool {
+    let mut changed = wear_loincloth(player, swaps, event);
+    for slot in ARMOR_SLOTS.into_iter().filter(|slot| *slot != LEGS_SLOT) {
+        let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+        let old_index = equipment.equipment_indexes[slot as usize];
+        let old_id = u32::try_from(old_index)
+            .ok()
+            .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+            .map_or(0, |entry| entry.item_id.param_id());
+        if !is_real_armor(old_id) {
+            continue;
+        }
+        if let Err(error) = call_equip(player, slot, -1) {
+            crate::log::log(format!("{event}: could not take off armor slot {slot}: {error}"));
+            continue;
+        }
+        // Only the first piece taken from a slot is the player's own.
+        if !swaps.iter().any(|swap| swap.slot == slot) {
+            swaps.push(ArmorSwap { slot, old_index, old_id, owned_before: 0, piece: 0 });
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Puts the Loincloth on the legs, giving one only the first time.
+fn wear_loincloth(player: &mut PlayerIns, swaps: &mut Vec<ArmorSwap>, event: &str) -> bool {
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+    let old_index = equipment.equipment_indexes[LEGS_SLOT as usize];
+    let old_id = u32::try_from(old_index)
+        .ok()
+        .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+        .map_or(0, |entry| entry.item_id.param_id());
+    if old_id == LOINCLOTH {
+        return false;
+    }
+    let item = match ItemId::new(ItemCategory::Protector, LOINCLOTH) {
+        Ok(item) => item,
+        Err(error) => {
+            crate::log::log(format!("{event}: the Loincloth id is invalid: {error:?}"));
+            return false;
+        }
+    };
+    let owned_before = count_armor(player, LOINCLOTH);
+    let result = match spare_armor_index(player, LOINCLOTH) {
+        Some(index) => call_equip(player, LEGS_SLOT, index),
+        None => give_and_equip(player, item, LEGS_SLOT).map(|_| ()),
+    };
+    if let Err(error) = result {
+        crate::log::log(format!("{event}: could not put on the Loincloth: {error}"));
+        return false;
+    }
+    match swaps.iter_mut().find(|swap| swap.slot == LEGS_SLOT) {
+        // Already remembered: only the leg armor put on during the event comes off.
+        Some(_) => false,
+        None => {
+            swaps.push(ArmorSwap { slot: LEGS_SLOT, old_index, old_id, owned_before, piece: LOINCLOTH });
+            true
+        }
+    }
+}
+
+pub fn ooga_booga(seconds: i32, big: bool) -> Result<String, String> {
+    let name = ooga_name(big);
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let until = unix_now() + seconds as u64;
+    let character = read_character().1;
+    let mut slot = pending();
+    if let Some(active) = slot.ooga_booga.as_mut() {
+        if active.character != character {
+            return Err(OTHER_CHARACTER_WAITING.to_string());
+        }
+        if active.big == big {
+            active.until = active.until.max(until);
+            save_pending(&slot);
+            return Ok(format!("{name} extended to at least {seconds} more seconds"));
+        }
+    }
+    let ended = end_other_gear_swaps(&mut slot, player, &character)?;
+
+    let base = club_base(big);
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the weapon list is unavailable: {error:?}"))?;
+    let row = regulation
+        .get_param::<EQUIP_PARAM_WEAPON_ST>()
+        .get(u64::from(base))
+        .ok_or_else(|| format!("weapon {base} is missing from the game data"))?;
+    let club = base + max_weapon_level(regulation, row);
+    let club_item = ItemId::new(ItemCategory::Weapon, club)
+        .map_err(|error| format!("the club id is invalid: {error:?}"))?;
+
+    let effect = war_cry_effect();
+    let row_before = boost_club(base, effect, true);
+    let weapons = take_weapons(player)?;
+    let clubs_before = count_owned(player, ItemCategory::Weapon, club);
+    let club_index = match give_and_equip(player, club_item, RIGHT_HAND_SLOT) {
+        Ok(index) => index,
+        Err(error) => {
+            put_weapons_back(player, &weapons, name);
+            if let Some(before) = &row_before {
+                restore_club(base, before);
+            }
+            return Err(error);
+        }
+    };
+    let mut armor = Vec::new();
+    strip_armor(player, &mut armor, name);
+
+    let removed = weapons.len();
+    let stripped = armor.len();
+    slot.ooga_booga = Some(OogaBooga {
+        until,
+        character,
+        big,
+        weapons,
+        armor,
+        club,
+        club_index,
+        clubs_before,
+        row_before,
+        changed: false,
+    });
+    save_pending(&slot);
+    let buff = match effect {
+        Some(effect) => format!("War Cry boost {effect}"),
+        None => "no War Cry boost was found in the game data".to_string(),
+    };
+    Ok(format!(
+        "{}{name} for {seconds} seconds: weapon {club} (+{}), {removed} weapons and {stripped} armor pieces taken off, {buff}",
+        ended_prefix(&ended),
+        weapon_level(club),
+    ))
+}
+
+/// The club stays in the right hand, nothing else goes in the hands, and no armor goes on.
+fn keep_club_only(active: &mut OogaBooga) {
+    let Ok(player) = local_player() else {
+        return;
+    };
+    let player = unsafe { &mut *player };
+    let name = ooga_name(active.big);
+    if keep_only_weapon(player, &mut active.weapons, active.club, &mut active.club_index, name) {
+        active.changed = true;
+    }
+    if strip_armor(player, &mut active.armor, name) {
+        active.changed = true;
+    }
+}
+
+/// Anything equipped from the menu comes straight off, and `weapon` goes back into the
+/// right hand if it left. The first time, a weapon is remembered so it is not lost at the
+/// end. Returns whether anything to remember changed.
+fn keep_only_weapon(
+    player: &mut PlayerIns,
+    weapons: &mut Vec<RemovedWeapon>,
+    weapon_id: u32,
+    weapon_index: &mut i32,
+    event: &str,
+) -> bool {
+    let mut changed = false;
+    for weapon_slot in WEAPON_SLOTS {
+        let Some((index, weapon)) = equipped_weapon(player, weapon_slot) else {
+            continue;
+        };
+        if weapon == weapon_id || !is_removable_weapon(weapon) {
+            continue;
+        }
+        if let Err(error) = call_equip(player, weapon_slot, -1) {
+            crate::log::log(format!("{event}: could not clear slot {weapon_slot}: {error}"));
+            continue;
+        }
+        if !weapons.iter().any(|removed| removed.slot == weapon_slot) {
+            weapons.push(RemovedWeapon { slot: weapon_slot, index, weapon });
+            changed = true;
+        }
+    }
+    if equipped_weapon(player, RIGHT_HAND_SLOT).is_some_and(|(_, weapon)| weapon == weapon_id) {
+        return changed;
+    }
+    let index = match current_index(player, ItemCategory::Weapon, weapon_id, *weapon_index) {
+        Some(index) => call_equip(player, RIGHT_HAND_SLOT, index).map(|_| index),
+        None => ItemId::new(ItemCategory::Weapon, weapon_id)
+            .map_err(|error| format!("{error:?}"))
+            .and_then(|item| give_and_equip(player, item, RIGHT_HAND_SLOT)),
+    };
+    match index {
+        Ok(index) if index != *weapon_index => {
+            *weapon_index = index;
+            changed = true;
+        }
+        Ok(_) => {}
+        Err(error) => crate::log::log(format!("{event}: could not equip the weapon again: {error}")),
+    }
+    changed
+}
+
+fn end_ooga_booga(player: &mut PlayerIns, active: &OogaBooga) -> Result<(), String> {
+    let name = ooga_name(active.big);
+    // The club comes off before its row loses the War Cry effect, so the game takes off
+    // the same effect it put on.
+    for weapon_slot in WEAPON_SLOTS {
+        if equipped_weapon(player, weapon_slot).is_some_and(|(_, weapon)| weapon == active.club) {
+            call_equip(player, weapon_slot, -1)?;
+        }
+    }
+    if let Some(before) = &active.row_before {
+        restore_club(club_base(active.big), before);
+    }
+    put_weapons_back(player, &active.weapons, name);
+    for swap in &active.armor {
+        if let Err(error) = restore_armor_slot(player, swap) {
+            crate::log::log(format!("{name}: armor slot {} restore failed: {error}", swap.slot));
+        }
+    }
+    // After a crash before a save the count is unchanged, so nothing is removed.
+    if count_owned(player, ItemCategory::Weapon, active.club) > active.clubs_before {
+        if let Some(index) = current_index(player, ItemCategory::Weapon, active.club, active.club_index) {
+            remove_inventory_entry(player, index)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn poll_ooga_booga() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = pending();
+        let Some(active) = slot.ooga_booga.as_mut() else {
+            return;
+        };
+        // A pending run from before a restart must not touch another character.
+        if !load_screen_open() && unix_now() < active.until && read_character().1 == active.character {
+            keep_club_only(active);
+            // The params reload with the game, so after a restart they are changed again.
+            if active.row_before.is_some() {
+                boost_club(club_base(active.big), war_cry_effect(), false);
+            }
+        }
+        if std::mem::take(&mut active.changed) {
+            save_pending(&slot);
+        }
+        let Some(active) = slot.ooga_booga.as_ref() else {
+            return;
+        };
+        if unix_now() < active.until {
+            return;
+        }
+        let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+        let player = local_player();
+        let alive = player
+            .as_ref()
+            .is_ok_and(|player| unsafe { &**player }.super_chr_ins.modules.data.hp > 0);
+        if !can_restore_armor(load_screen_open(), player.is_ok(), alive, fake_death) {
+            return;
+        }
+        let (loaded, character) = read_character();
+        let Ok(player) = player else {
+            return;
+        };
+        if !loaded || character != active.character {
+            return;
+        }
+        let Some(active) = slot.ooga_booga.take() else {
+            return;
+        };
+        if let Err(error) = end_ooga_booga(unsafe { &mut *player }, &active) {
+            crate::log::log(format!("{} restore failed: {error}", ooga_name(active.big)));
+        }
+        slot.remember_ended(EndedKind::OogaBooga(active));
+        save_pending(&slot);
+    }));
+}
+
+/// How long a finished swap is kept in this run of the game. The game saves the gear well
+/// before this, so after it closing the game can no longer bring the swap back.
+const KEEP_ENDED_SWAP: Duration = Duration::from_secs(15 * 60);
+
+/// A swap that was put back. Closing the game with its window's X skips the last save, so
+/// the next start can load a save from the middle of the swap. The record is kept, and if
+/// the swap is visibly back on the first load, it is put back once more.
+#[derive(Deserialize, Serialize)]
+enum EndedKind {
+    Armor(TemporaryArmor),
+    Bombardier(Bombardier),
+    Firestarter(Firestarter),
+    OogaBooga(OogaBooga),
+    Stats(ShuffledStats),
+}
+
+#[derive(Deserialize, Serialize)]
+struct EndedSwap {
+    kind: EndedKind,
+    /// When it ended in this run of the game. None for one from an earlier run.
+    #[serde(skip)]
+    here: Option<Instant>,
+}
+
+impl EndedKind {
+    fn character(&self) -> &str {
+        match self {
+            Self::Armor(active) => &active.character,
+            Self::Bombardier(active) => &active.character,
+            Self::Firestarter(active) => &active.character,
+            Self::OogaBooga(active) => &active.character,
+            Self::Stats(active) => &active.character,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Armor(_) => "Temporary Armor",
+            Self::Bombardier(_) => "Bombardier",
+            Self::Firestarter(_) => "Firestarter",
+            Self::OogaBooga(active) => ooga_name(active.big),
+            Self::Stats(_) => "Shuffle Stats",
+        }
+    }
+
+    /// Whether the loaded character still shows the swap: its weapon in hand, its armor
+    /// worn or its stats shuffled.
+    fn is_back(&self, player: &PlayerIns) -> bool {
+        let holds = |id: u32| {
+            WEAPON_SLOTS.into_iter().any(|slot| equipped_weapon(player, slot).is_some_and(|(_, weapon)| weapon == id))
+        };
+        let wears = |swaps: &[ArmorSwap]| {
+            let equipment = unsafe { &player.player_game_data.as_ref().equipment };
+            swaps.iter().filter(|swap| swap.piece != 0).any(|swap| {
+                u32::try_from(equipment.equipment_indexes[swap.slot as usize])
+                    .ok()
+                    .and_then(|index| equipment.equip_inventory_data.items_data[index].as_option())
+                    .is_some_and(|entry| is_armor(entry, swap.piece))
+            })
+        };
+        match self {
+            Self::Armor(active) => wears(&active.swaps),
+            Self::Bombardier(active) => wears(&active.armor),
+            Self::Firestarter(active) => holds(active.flame),
+            Self::OogaBooga(active) => holds(active.club),
+            Self::Stats(active) => {
+                let current = read_stats(unsafe { &player.player_game_data.as_ref().player_info });
+                current != active.original && can_restore_stats(current, active.original)
+            }
+        }
+    }
+
+    fn put_back(&self, player: &mut PlayerIns) -> Result<(), String> {
+        match self {
+            Self::Armor(active) => {
+                for swap in &active.swaps {
+                    restore_armor_slot(player, swap)?;
+                }
+                Ok(())
+            }
+            Self::Bombardier(active) => end_bombardier(player, active),
+            Self::Firestarter(active) => end_firestarter(player, active),
+            Self::OogaBooga(active) => end_ooga_booga(player, active),
+            Self::Stats(active) => apply_stats(player, active.original),
+        }
+    }
+}
+
+impl PendingRestores {
+    fn remember_ended(&mut self, kind: EndedKind) {
+        self.recently_ended.push(EndedSwap { kind, here: Some(Instant::now()) });
+    }
+}
+
+/// Forgets finished swaps of this run once the game has surely saved, and checks the ones
+/// from an earlier run the first time their character is in the world.
+pub fn poll_recently_ended() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = pending();
+        if slot.recently_ended.is_empty() {
+            return;
+        }
+        let before = slot.recently_ended.len();
+        slot.recently_ended
+            .retain(|ended| ended.here.is_none_or(|at| at.elapsed() < KEEP_ENDED_SWAP));
+        let mut changed = slot.recently_ended.len() != before;
+
+        if slot.recently_ended.iter().any(|ended| ended.here.is_none()) {
+            let fake_death = FAKE_DEATH.lock().unwrap_or_else(|poison| poison.into_inner()).is_some();
+            if let Ok(player) = local_player() {
+                let player = unsafe { &mut *player };
+                let alive = player.super_chr_ins.modules.data.hp > 0;
+                let (loaded, character) = read_character();
+                if loaded && can_restore_armor(load_screen_open(), true, alive, fake_death) {
+                    let (mine, rest): (Vec<EndedSwap>, Vec<EndedSwap>) = std::mem::take(&mut slot.recently_ended)
+                        .into_iter()
+                        .partition(|ended| ended.here.is_none() && ended.kind.character() == character);
+                    slot.recently_ended = rest;
+                    // Newest first, so older swaps end up with the gear they started from.
+                    for ended in mine.iter().rev() {
+                        if !ended.kind.is_back(player) {
+                            continue;
+                        }
+                        let name = ended.kind.name();
+                        crate::log::log(format!("{name}: the game loaded a save from the middle of it, putting things back again"));
+                        if let Err(error) = ended.kind.put_back(player) {
+                            crate::log::log(format!("{name} restore failed: {error}"));
+                        }
+                    }
+                    changed |= !mine.is_empty();
+                }
+            }
+        }
+        if changed {
+            save_pending(&slot);
+        }
+    }));
+}
+
+// ---- Mimic Chests: three chests, one holds a prize, the others are Mimics. ----
+
+/// Weapons the winning chest can hold, from the game's own names. They are given fully
+/// upgraded and without an infusion.
+const PRIZE_WEAPONS: [u32; 28] = [
+    6_020_000,  // Claymore
+    2_060_000,  // Lothric Knight Sword
+    6_070_000,  // Astora Greatsword
+    6_240_000,  // Dark Sword
+    5_000_000,  // Uchigatana
+    6_250_000,  // Black Knight Sword
+    6_200_000,  // Farron Greatsword
+    6_150_000,  // Exile Greatsword
+    10_050_000, // Black Knight Greataxe
+    6_180_000,  // Profaned Greatsword
+    16_000_000, // Sellsword Twinblades
+    5_010_000,  // Washing Pole
+    6_330_000,  // Drakeblood Greatsword
+    6_310_000,  // Hollowslayer Greatsword
+    2_140_000,  // Irithyll Straight Sword
+    6_080_000,  // Murakumo
+    6_170_000,  // Greatsword of Judgment
+    6_270_000,  // Twin Princes' Greatsword
+    9_160_000,  // Dragonslayer Swordspear
+    4_070_000,  // Pontiff Knight Curved Sword
+    16_090_000, // Onikiri and Ubadachi
+    10_150_000, // Black Knight Glaive
+    6_300_000,  // Wolf Knight's Greatsword
+    7_070_000,  // Butcher Knife
+    8_170_000,  // Gargoyle Flame Hammer
+    6_280_000,  // Lothric's Holy Sword
+    4_080_000,  // Storm Curved Sword
+    6_320_000,  // Moonlight Greatsword
+];
+const ASHES_OF_ARIANDEL_PRIZE_WEAPONS: [u32; 1] = [10_180_000]; // Friede's Great Scythe
+const RINGED_CITY_PRIZE_WEAPONS: [u32; 2] = [2_250_000, 2_260_000]; // Ringed Knight Straight Sword, Gael's Greatsword
+/// Rings, in their strongest version.
+const PRIZE_RINGS: [u32; 23] = [
+    20_023, // Havel's Ring+3
+    20_033, // Ring of Favor+3
+    20_013, // Chloranthy Ring+3
+    20_003, // Life Ring+3
+    20_380, // Hornet Ring
+    20_251, // Ring of the Sun's First Born
+    20_272, // Lingering Dragoncrest Ring+2
+    20_300, // Dusk Crown Ring
+    20_510, // Fire Clutch Ring
+    20_660, // Lloyd's Sword Ring
+    20_750, // Pontiff's Right Eye
+    20_480, // Knight Slayer's Ring
+    20_082, // Dark Stoneplate Ring+2
+    20_043, // Ring of Steel Protection+3
+    20_240, // Great Swamp Ring
+    20_241, // Witch's Ring
+    20_282, // Sage Ring+2
+    20_250, // Morne's Ring
+    20_450, // Carthus Milkring
+    20_370, // Hawk Ring
+    20_393, // Covetous Gold Serpent Ring+3
+    20_193, // Wolf Ring+3
+    20_200, // Leo Ring
+];
+
+/// The Mimic's own animations, asked for through the force-play routine. A sleeping Mimic
+/// shows them with 2000000 added. 3000 starts opening the lid; 4100 after it is the bite
+/// from the chest (the Mimicry grab), and 3004 after it makes it stand up instead.
+const MIMIC_OPEN: i32 = 3000;
+const MIMIC_BITE: i32 = 4100;
+const MIMIC_STAND: i32 = 3004;
+/// Frames between opening the lid and the bite or standing up. Tested at 45.
+const MIMIC_FOLLOW_FRAMES: u32 = 45;
+/// How close and how straight ahead a chest must be for the interact button to open it.
+const CHEST_REACH_METRES: f32 = 1.8;
+const CHEST_FACING_COSINE: f32 = 0.6;
+/// How long the chests may take to appear before the game gives up.
+const CHEST_SPAWN_SECONDS: u64 = 30;
+/// After the pick, the game lingers this long before it lets go of the chests.
+const CHEST_AFTERMATH_SECONDS: u64 = 8;
+/// Controls are locked from opening the wrong chest until the bite has caught the player.
+const BITE_LOCK_SECONDS: i32 = 2;
+/// The bitten Mimic wakes once the bite is over, so it fights on after.
+const AFTER_BITE_FRAMES: u32 = 240;
+/// Stands for "wake it up" in the list of things to do later.
+const WAKE: i32 = -1;
+/// Stands for "log its effects" in the list of things to do later.
+const LOG_EFFECTS: i32 = -2;
+/// A on an Xbox controller, interact on the game's default controls.
+const XINPUT_GAMEPAD_A: u16 = 0x1000;
+/// E, interact on the game's default keyboard controls.
+const KEY_E: i32 = 0x45;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrizeKind {
+    Either,
+    Weapon,
+    Ring,
+}
+
+impl PrizeKind {
+    pub fn from_index(index: i64) -> Self {
+        match index {
+            1 => Self::Weapon,
+            2 => Self::Ring,
+            _ => Self::Either,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChestPhase {
+    /// Waiting for the three Mimics to appear.
+    Spawning,
+    /// Three chests stand there; one press of interact in front of one opens it.
+    Waiting,
+    /// A chest was picked or the time ran out; the animations finish, then it is over.
+    Done,
+}
+
+struct ChestGame {
+    phase: ChestPhase,
+    started: Instant,
+    seconds: u64,
+    prize: PrizeKind,
+    spots: Vec<([f32; 3], f32)>,
+    chests: Vec<usize>,
+    place_frames: u32,
+    winner: usize,
+    full_health: Vec<i32>,
+    interact_was_down: bool,
+    /// Animations to ask for later: character, animation, frames left.
+    later: Vec<(usize, i32, u32)>,
+    done_at: Option<Instant>,
+}
+
+/// The routine behind the game's SetEventSpecialEffect command: (character, effect id).
+/// The event command reaches it through an object only map-placed characters have, so the
+/// mod calls it directly. A near copy of it exists, so the pattern is long.
+const ADD_SP_EFFECT_PATTERN: &str = "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 48 89 78 20 41 56 48 81 EC 90 00 00 00 C7 40 B8 00 00 80 3F C7 40 BC 00 00 80 3F C7 40 C0 00 00 80 3F 0F 29 70 E8 F3 0F 10 35 D3 F8 4E 03 C7 40 C4 00 00 80 3F 45 32 F6 F6 81 0C 1A 00 00 40 0F 28 40 B8 66 0F 7F 40 B8 8B EA 48 8B F9 C7 40 C8 00 00 80 3F C7 40 CC 00 00 80 3F C7 40 D0 00 00 80 3F C7 40 D4 00 00 80 3F C7 40 D8 00 00 80 3F C7 40 DC 00 00 80 3F C7 40 E0 00 00 80 3F 40 B6 01 74 77 E8 59 DA FF FF 84 C0 0F";
+/// The routine behind EraseEventSpecialEffect: (character, effect id).
+const ERASE_SP_EFFECT_PATTERN: &str = "48 8B 89 C8 11 00 00 E9 ?? ?? ?? ?? CC 48 8B 4B 48";
+
+fn add_sp_effect_routine() -> Result<usize, String> {
+    static ROUTINE: OnceLock<Result<usize, String>> = OnceLock::new();
+    ROUTINE.get_or_init(|| find_unique(ADD_SP_EFFECT_PATTERN)).clone()
+}
+
+fn erase_sp_effect_routine() -> Result<usize, String> {
+    static ROUTINE: OnceLock<Result<usize, String>> = OnceLock::new();
+    ROUTINE.get_or_init(|| find_unique(ERASE_SP_EFFECT_PATTERN)).clone()
+}
+
+/// Puts a special effect on a character, as the game's event scripts do.
+fn add_sp_effect(chr: usize, effect: i32) -> Result<(), String> {
+    let add: extern "C" fn(usize, i32) -> u8 = unsafe { std::mem::transmute(add_sp_effect_routine()?) };
+    add(chr, effect);
+    Ok(())
+}
+
+/// Takes a special effect off a character, as the game's event scripts do.
+fn erase_sp_effect(chr: usize, effect: i32) -> Result<(), String> {
+    let erase: extern "C" fn(usize, i32) -> u8 = unsafe { std::mem::transmute(erase_sp_effect_routine()?) };
+    erase(chr, effect);
+    Ok(())
+}
+
+/// A Mimic that was hit and fights has effect 5400 where a sleeping one has 5405; the
+/// rest of its effects, its "Sleep State" (11720) included, stay the same. Swapping the
+/// two is what a hit does to it.
+const MIMIC_DORMANT_EFFECT: i32 = 5_405;
+const MIMIC_FIGHTING_EFFECT: i32 = 5_400;
+
+/// ChrIns: the special effect holder. Its list of active effects starts at +8; each entry
+/// has the effect id at +0x60 and the next entry at +0x78.
+const CHR_SP_EFFECTS: usize = 0x11C8;
+const SP_EFFECT_LIST: usize = 0x08;
+const SP_EFFECT_ENTRY_ID: usize = 0x60;
+const SP_EFFECT_ENTRY_NEXT: usize = 0x78;
+
+/// The ids of the effects on a character right now.
+fn chr_sp_effects(chr: usize) -> Vec<i32> {
+    let mut ids = Vec::new();
+    let Ok(holder) = read_usize_checked(chr + CHR_SP_EFFECTS) else {
+        return ids;
+    };
+    let mut entry = read_usize_checked(holder + SP_EFFECT_LIST).unwrap_or(0);
+    while entry >= 0x10_000 && ids.len() < 64 {
+        ids.push(read_u32_checked(entry + SP_EFFECT_ENTRY_ID).map_or(-1, |id| id as i32));
+        entry = read_usize_checked(entry + SP_EFFECT_ENTRY_NEXT).unwrap_or(0);
+    }
+    ids
+}
+
+fn wake_mimic(chr: usize) -> Result<(), String> {
+    erase_sp_effect(chr, MIMIC_DORMANT_EFFECT)?;
+    add_sp_effect(chr, MIMIC_FIGHTING_EFFECT)
+}
+
+static CHEST_GAME: Mutex<Option<ChestGame>> = Mutex::new(None);
+
+/// Mimics side by side in a straight row in front of the player, all turned the same
+/// way: back toward the player, like chests standing against a wall.
+fn chest_row_spots() -> Result<Vec<([f32; 3], f32)>, String> {
+    let (ahead, _) = invader_spawn_point(MIMIC_DISTANCE)?;
+    let here = local_player().ok().and_then(|player| chr_position(player as usize)).unwrap_or(ahead);
+    let convention = player_facing_convention()?;
+    // Sideways is across the real way ahead, which is where the middle chest stands.
+    let (dx, dz) = (ahead[0] - here[0], ahead[2] - here[2]);
+    let length = (dx * dx + dz * dz).sqrt().max(0.01);
+    let right = [dz / length, -dx / length];
+    // The middle chest's way to the player; the others face the same way, not the player.
+    let turn = facing_for(convention, here[0] - ahead[0], here[2] - ahead[2]);
+    Ok(MIMIC_ROW
+        .iter()
+        .map(|side| ([ahead[0] + right[0] * side, ahead[1], ahead[2] + right[1] * side], turn))
+        .collect())
+}
+
+/// Writes each character's spot and turn. The game's physics can put a character back on
+/// its first frames, so this runs for a few frames in a row.
+fn place_row(chrs: &[usize], spots: &[([f32; 3], f32)]) {
+    for (chr, (spot, facing)) in chrs.iter().zip(spots) {
+        let Ok(physics) = module_pointer(*chr, PHYSICS_MODULE_OFFSET) else {
+            continue;
+        };
+        for (axis, value) in spot.iter().enumerate() {
+            let _ = write_bytes_checked(physics + PHYSICS_POSITION + axis * 4, &value.to_ne_bytes());
+        }
+        let _ = write_bytes_checked(physics + PHYSICS_ROTATION + 4, &facing.to_ne_bytes());
+    }
+}
+
+/// Three Mimic spawns with the Mimic's own AI.
+fn mimic_picks() -> Result<Vec<EnemyChoice>, String> {
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the NPC list is unavailable: {error:?}"))?;
+    if regulation.get_param::<NPC_PARAM_ST>().get(u64::from(MIMIC)).is_none() {
+        return Err(format!("NPC {MIMIC} is missing from the game data"));
+    }
+    let think_ids: Vec<u32> = regulation
+        .get_param::<NPC_THINK_PARAM_ST>()
+        .iter()
+        .filter(|(id, _)| *id > 0)
+        .map(|(id, _)| id as u32)
+        .collect();
+    let think_id = think_candidates(MIMIC, &think_ids)
+        .into_iter()
+        .next()
+        .ok_or("the Mimic has no AI row")?;
+    Ok(MIMIC_ROW
+        .iter()
+        .map(|_| EnemyChoice { npc_id: MIMIC, think_id, invader: false, label: 0, friendly: false })
+        .collect())
+}
+
+fn queue_spawns(picks: Vec<EnemyChoice>) -> Result<(), String> {
+    let routine = create_npc_address()?;
+    let creator = debug_creator()?;
+    let mut slot = ENEMY_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
+    match slot.as_mut() {
+        Some(queue) => {
+            queue.remaining.extend(picks.iter().copied());
+            queue.replacements = 0;
+        }
+        None => {
+            *slot = Some(EnemyQueue {
+                creator,
+                routine,
+                remaining: picks.clone(),
+                pool: picks,
+                replace_oldest: true,
+                limit: 5,
+                full_frames: 0,
+                pause_frames: 0,
+                replacements: 0,
+                checks: Vec::new(),
+                in_flight: None,
+                started: 0,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn mimic_chests(seconds: i32, prize: PrizeKind) -> Result<String, String> {
+    let player = unsafe { &*local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    let mut slot = CHEST_GAME.lock().unwrap_or_else(|poison| poison.into_inner());
+    if slot.is_some() {
+        return Err("three chests are already waiting".to_string());
+    }
+    force_play_animation_routine()?;
+    add_sp_effect_routine()?;
+    erase_sp_effect_routine()?;
+    let picks = mimic_picks()?;
+    let spots = chest_row_spots()?;
+    // Only Mimics made from here on count: the queue reports each one it makes.
+    NEW_MIMICS.lock().unwrap_or_else(|poison| poison.into_inner()).clear();
+    queue_spawns(picks)?;
+    *slot = Some(ChestGame {
+        phase: ChestPhase::Spawning,
+        started: Instant::now(),
+        seconds: seconds.max(1) as u64,
+        prize,
+        spots,
+        chests: Vec::new(),
+        place_frames: 0,
+        winner: random_index(MIMIC_ROW.len()),
+        full_health: Vec::new(),
+        interact_was_down: false,
+        later: Vec::new(),
+        done_at: None,
+    });
+    Ok(format!("three chests for {seconds} seconds, one holds a prize"))
+}
+
+/// Interact on a controller (A) or the keyboard (E, only while the game has focus).
+fn interact_down() -> bool {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    if crate::input::controller_buttons() & XINPUT_GAMEPAD_A != 0 {
+        return true;
+    }
+    let mut owner = 0u32;
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut owner)) };
+    owner == unsafe { GetCurrentProcessId() } && unsafe { GetAsyncKeyState(KEY_E) } as u16 & 0x8000 != 0
+}
+
+fn player_forward(player: usize) -> Option<[f32; 2]> {
+    let ctrl = read_usize_checked(player + CHR_CTRL_OFFSET).ok()?;
+    let x = -read_f32_checked(ctrl + CTRL_FORWARD[0]).ok()?;
+    let z = -read_f32_checked(ctrl + CTRL_FORWARD[2]).ok()?;
+    let length = (x * x + z * z).sqrt();
+    (0.5..1.5).contains(&length).then(|| [x / length, z / length])
+}
+
+/// The chest the player stands in front of and faces most directly, if any.
+pub fn chest_in_front(here: [f32; 3], forward: [f32; 2], chests: &[[f32; 3]]) -> Option<usize> {
+    chests
+        .iter()
+        .enumerate()
+        .filter_map(|(index, chest)| {
+            let (dx, dz) = (chest[0] - here[0], chest[2] - here[2]);
+            let distance = (dx * dx + dz * dz).sqrt();
+            let facing = if distance > 0.01 { (dx * forward[0] + dz * forward[1]) / distance } else { 1.0 };
+            (distance <= CHEST_REACH_METRES && facing >= CHEST_FACING_COSINE).then_some((index, facing))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(index, _)| index)
+}
+
+/// A random good weapon (fully upgraded) or ring, as an item id.
+fn pick_prize(kind: PrizeKind) -> Result<(ItemId, String), String> {
+    let weapon = match kind {
+        PrizeKind::Weapon => true,
+        PrizeKind::Ring => false,
+        PrizeKind::Either => random_index(2) == 0,
+    };
+    if !weapon {
+        let ring = PRIZE_RINGS[random_index(PRIZE_RINGS.len())];
+        let item = ItemId::new(ItemCategory::Accessory, ring).map_err(|error| format!("ring {ring}: {error:?}"))?;
+        return Ok((item, format!("ring {ring}")));
+    }
+    let (ashes, ringed_city) = unsafe { darksouls3::cs::CSDlc::instance() }
+        .map(|dlc| (dlc.dlc1_installed, dlc.dlc2_installed))
+        .unwrap_or((false, false));
+    let mut pool = PRIZE_WEAPONS.to_vec();
+    if ashes {
+        pool.extend(ASHES_OF_ARIANDEL_PRIZE_WEAPONS);
+    }
+    if ringed_city {
+        pool.extend(RINGED_CITY_PRIZE_WEAPONS);
+    }
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the weapon list is unavailable: {error:?}"))?;
+    let weapons = regulation.get_param::<EQUIP_PARAM_WEAPON_ST>();
+    pool.retain(|base| weapons.get(u64::from(*base)).is_some());
+    if pool.is_empty() {
+        return Err("none of the prize weapons are in the game data".to_string());
+    }
+    let base = pool[random_index(pool.len())];
+    let level = weapons.get(u64::from(base)).map_or(0, |row| max_weapon_level(regulation, row));
+    let id = base + level;
+    let item = ItemId::new(ItemCategory::Weapon, id).map_err(|error| format!("weapon {id}: {error:?}"))?;
+    Ok((item, format!("weapon {id} (+{level})")))
+}
+
+fn give_prize(kind: PrizeKind) -> Result<String, String> {
+    let (item, label) = pick_prize(kind)?;
+    let game_data = unsafe { GameDataMan::instance_mut() }
+        .map_err(|error| format!("GameDataMan is unavailable: {error:?}"))?;
+    game_data.give_item_directly(item, 1);
+    if let Ok(menu) = unsafe { darksouls3::sprj::ItemGetMenuMan::instance_mut() } {
+        menu.show_item(item, 1, false);
+    }
+    Ok(label)
+}
+
+/// The effect a chest gets before it goes, by the game's own name "City Map Sniper
+/// Transparent effect". Of those tried in game it fades out best; 10633 faded out and
+/// back in, and 10635 stopped at about 20%.
+const CHEST_VANISH_EFFECT: i32 = 12_030;
+const CHEST_VANISH_SECONDS: f32 = 1.5;
+
+fn remove_chest(chr: usize) {
+    vanish(chr, CHEST_VANISH_EFFECT, CHEST_VANISH_SECONDS);
+}
+
+/// Spawned characters fading out: character, frames until it is removed.
+static VANISHING: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+
+/// Puts `effect` on a spawned character, then removes it `seconds` later. With effect 0 it
+/// is removed straight away.
+fn vanish(chr: usize, effect: i32, seconds: f32) {
+    if effect > 0 {
+        if let Err(error) = add_sp_effect(chr, effect) {
+            crate::log::log(format!("vanish: effect {effect} failed: {error}"));
+        }
+    }
+    let frames = (seconds.max(0.0) * 60.0) as u32;
+    let mut list = VANISHING.lock().unwrap_or_else(|poison| poison.into_inner());
+    if !list.iter().any(|(known, _)| *known == chr) {
+        list.push((chr, frames));
+    }
+}
+
+pub fn poll_vanishing() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut list = VANISHING.lock().unwrap_or_else(|poison| poison.into_inner());
+        if list.is_empty() {
+            return;
+        }
+        let present = spawned_chrs();
+        list.retain(|(chr, _)| present.contains(chr));
+        let mut due = Vec::new();
+        for (chr, frames) in list.iter_mut() {
+            if *frames == 0 {
+                due.push(*chr);
+            } else {
+                *frames -= 1;
+            }
+        }
+        list.retain(|(chr, _)| !due.contains(chr));
+        drop(list);
+        if !due.is_empty() {
+            let mut requested = DELETE_REQUESTED.lock().unwrap_or_else(|poison| poison.into_inner());
+            if let Err(error) = delete_spawns(&due, &mut requested) {
+                crate::log::log(format!("vanish: could not remove: {error}"));
+            }
+        }
+    }));
+}
+
+/// Developer test: the closest spawned character gets `effect` and is removed `seconds`
+/// later, to see which effect makes a good way out.
+pub fn try_vanish_effect(effect: i32, seconds: f32) -> Result<String, String> {
+    add_sp_effect_routine()?;
+    let spawned = spawned_chrs();
+    let (chr, distance) = *chrs_near_player(NEARBY_METRES)
+        .iter()
+        .find(|(chr, _)| spawned.contains(chr))
+        .ok_or_else(|| format!("no spawned enemy is within {NEARBY_METRES} m"))?;
+    vanish(chr, effect, seconds);
+    Ok(format!("{chr:#x} ({distance:.1} m away) gets effect {effect} and goes in {seconds} seconds"))
+}
+
+/// What happens when chest `picked` is opened.
+fn open_chest(game: &mut ChestGame, picked: usize) {
+    let chests = game.chests.clone();
+    if picked == game.winner {
+        for chr in &chests {
+            remove_chest(*chr);
+        }
+        match give_prize(game.prize) {
+            Ok(label) => crate::log::log(format!("Mimic Chests: the right chest, the prize is {label}")),
+            Err(error) => crate::log::log(format!("Mimic Chests: the prize could not be given: {error}")),
+        }
+    } else {
+        crate::log::log("Mimic Chests: a Mimic".to_string());
+        remove_chest(chests[game.winner]);
+        crate::input::block_input(BITE_LOCK_SECONDS);
+        for (index, chr) in chests.iter().enumerate() {
+            if index == game.winner {
+                continue;
+            }
+            let follow = if index == picked { MIMIC_BITE } else { MIMIC_STAND };
+            if let Err(error) = request_animation(*chr, MIMIC_OPEN) {
+                crate::log::log(format!("Mimic Chests: could not wake a Mimic: {error}"));
+            }
+            game.later.push((*chr, follow, MIMIC_FOLLOW_FRAMES));
+            let wake_after = if index == picked { AFTER_BITE_FRAMES } else { MIMIC_FOLLOW_FRAMES + 1 };
+            game.later.push((*chr, WAKE, wake_after));
+            game.later.push((*chr, LOG_EFFECTS, wake_after + 30));
+            game.later.push((*chr, LOG_EFFECTS, wake_after + 150));
+        }
+    }
+    game.phase = ChestPhase::Done;
+    game.done_at = Some(Instant::now());
+}
+
+/// Time is up, or a chest was attacked: every chest turns out to be a Mimic, and there is
+/// no prize. One that was hit is awake already and only gets the wake-up effect.
+fn wake_all_chests(game: &mut ChestGame, hit: Option<usize>) {
+    let reason = if hit.is_some() { "a chest was attacked" } else { "time is up" };
+    crate::log::log(format!("Mimic Chests: {reason}, all three wake"));
+    for (index, chr) in game.chests.clone().into_iter().enumerate() {
+        if hit == Some(index) {
+            game.later.push((chr, WAKE, 1));
+            continue;
+        }
+        let _ = request_animation(chr, MIMIC_OPEN);
+        game.later.push((chr, MIMIC_STAND, MIMIC_FOLLOW_FRAMES));
+        game.later.push((chr, WAKE, MIMIC_FOLLOW_FRAMES + 1));
+    }
+    game.phase = ChestPhase::Done;
+    game.done_at = Some(Instant::now());
+}
+
+pub fn poll_mimic_chests() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = CHEST_GAME.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(game) = slot.as_mut() else {
+            return;
+        };
+        if load_screen_open() {
+            *slot = None;
+            return;
+        }
+        // Animations asked for a moment after the first.
+        let present = spawned_chrs();
+        for entry in game.later.iter_mut() {
+            entry.2 = entry.2.saturating_sub(1);
+            if entry.2 == 0 && present.contains(&entry.0) {
+                let result = if entry.1 == LOG_EFFECTS {
+                    crate::log::log(format!("Mimic Chests: {:#x} effects {:?}", entry.0, chr_sp_effects(entry.0)));
+                    Ok(())
+                } else if entry.1 == WAKE {
+                    let woken = wake_mimic(entry.0);
+                    crate::log::log(format!("Mimic Chests: {:#x} woken, effects now {:?}", entry.0, chr_sp_effects(entry.0)));
+                    woken
+                } else {
+                    request_animation(entry.0, entry.1)
+                };
+                if let Err(error) = result {
+                    crate::log::log(format!("Mimic Chests: step {} failed: {error}", entry.1));
+                }
+            }
+        }
+        game.later.retain(|entry| entry.2 > 0);
+
+        match game.phase {
+            ChestPhase::Spawning => {
+                let made: Vec<usize> = std::mem::take(&mut *NEW_MIMICS.lock().unwrap_or_else(|poison| poison.into_inner()));
+                for chr in made {
+                    if !game.chests.contains(&chr) && game.chests.len() < MIMIC_ROW.len() {
+                        game.chests.push(chr);
+                    }
+                }
+                if game.chests.len() >= MIMIC_ROW.len() {
+                    game.full_health = game.chests.iter().map(|chr| chr_health(*chr).unwrap_or(0)).collect();
+                    game.phase = ChestPhase::Waiting;
+                    game.started = Instant::now();
+                    crate::log::log(format!("Mimic Chests: chests ready, the prize is in chest {}", game.winner + 1));
+                    for chr in &game.chests {
+                        crate::log::log(format!("Mimic Chests: {chr:#x} effects {:?}", chr_sp_effects(*chr)));
+                    }
+                } else if game.started.elapsed() > Duration::from_secs(CHEST_SPAWN_SECONDS) {
+                    crate::log::log("Mimic Chests: the chests never appeared".to_string());
+                    *slot = None;
+                }
+            }
+            ChestPhase::Waiting => {
+                if game.chests.iter().any(|chr| !present.contains(chr)) {
+                    crate::log::log("Mimic Chests: a chest is gone, ending".to_string());
+                            *slot = None;
+                    return;
+                }
+                if game.place_frames < MIMIC_PLACE_FRAMES {
+                    game.place_frames += 1;
+                    place_row(&game.chests, &game.spots);
+                }
+                // Hitting a chest picks it too.
+                let hit = game
+                    .chests
+                    .iter()
+                    .zip(&game.full_health)
+                    .position(|(chr, full)| chr_health(*chr).is_some_and(|hp| hp < *full));
+                // Attacking is not a way to pick: all three wake and nobody wins.
+                if let Some(index) = hit {
+                    wake_all_chests(game, Some(index));
+                    return;
+                }
+                let down = interact_down();
+                let pressed = down && !game.interact_was_down;
+                game.interact_was_down = down;
+                if pressed {
+                    let Ok(player) = local_player() else {
+                        return;
+                    };
+                    let player = player as usize;
+                    let spots: Vec<[f32; 3]> = game.chests.iter().filter_map(|chr| chr_position(*chr)).collect();
+                    if let (Some(here), Some(forward)) = (chr_position(player), player_forward(player)) {
+                        if spots.len() == game.chests.len() {
+                            if let Some(index) = chest_in_front(here, forward, &spots) {
+                                open_chest(game, index);
+                                return;
+                            }
+                            let nearest = spots
+                                .iter()
+                                .map(|spot| distance_between(here, *spot))
+                                .fold(f32::MAX, f32::min);
+                            crate::log::log(format!(
+                                "Mimic Chests: interact pressed, but no chest straight ahead (closest {nearest:.1} m)"
+                            ));
+                        }
+                    }
+                }
+                if game.started.elapsed() > Duration::from_secs(game.seconds) {
+                    wake_all_chests(game, None);
+                }
+            }
+            ChestPhase::Done => {
+                let finished = game.later.is_empty()
+                    && game.done_at.is_some_and(|at| at.elapsed() > Duration::from_secs(CHEST_AFTERMATH_SECONDS));
+                if finished {
+                            *slot = None;
+                }
+            }
+        }
     }));
 }
 
@@ -3293,7 +4449,7 @@ pub fn restore_gear(slot: usize) -> Result<String, String> {
         restores.armor.is_some() || restores.gear_event().is_some()
     };
     if swapping {
-        return Err("a temporary armor, Bombardier or Firestarter swap is still active".to_string());
+        return Err("a temporary armor, Bombardier, Firestarter or Ooga Booga swap is still active".to_string());
     }
     let snapshots = load_gear_snapshots();
     let snapshot = snapshots
@@ -3454,6 +4610,7 @@ pub fn poll_shuffled_stats() {
             if let Err(error) = apply_stats(player, active.original) {
                 crate::log::log(format!("stat shuffle restore failed: {error}"));
             }
+            slot.remember_ended(EndedKind::Stats(active));
         } else {
             crate::log::log("stat shuffle not restored: the stat total changed");
         }
@@ -4233,7 +5390,11 @@ fn placed_enemies() -> Result<Vec<(u32, u32)>, String> {
 struct EnemyInFlight {
     previous: usize,
     frames: u32,
+    npc_id: u32,
 }
+
+/// Mimics the queue has just made, for Mimic Chests to pick up as its chests.
+static NEW_MIMICS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 /// The creator makes one character at a time, so the rest wait here.
 struct EnemyQueue {
@@ -4557,8 +5718,506 @@ fn start_enemy_spawn(queue: &mut EnemyQueue, enemy: EnemyChoice) -> Result<(), S
     let call: extern "C" fn(usize, u32) = unsafe { std::mem::transmute(queue.routine) };
     call(creator, CREATE_NPC_COMMAND);
     queue.started += 1;
-    queue.in_flight = Some(EnemyInFlight { previous, frames: 0 });
+    queue.in_flight = Some(EnemyInFlight { previous, frames: 0, npc_id: enemy.npc_id });
     Ok(())
+}
+
+/// The Mimic of the High Wall. Every area's Mimic shares the c2120 model.
+const MIMIC: u32 = 212_000;
+/// Where the three chests stand, in metres to the side of straight ahead.
+const MIMIC_ROW: [f32; 3] = [-1.8, 0.0, 1.8];
+const MIMIC_DISTANCE: f32 = 3.0;
+/// Positions are written for this many frames, in case the game's physics puts a Mimic
+/// back on the first one.
+const MIMIC_PLACE_FRAMES: u32 = 10;
+/// A Mimic's wake-up when it is hit.
+const MIMIC_WAKE_ANIMATION: i32 = 2_003_010;
+const MIMIC_TEST_SECONDS: u64 = 90;
+
+struct MimicWatch {
+    started: Instant,
+    last_log: Instant,
+    /// Spawned characters that were there before, so the new chests can be told apart.
+    before: Vec<usize>,
+    last_player_anim: i32,
+    last_anims: Vec<(usize, i32)>,
+    /// Where each new Mimic goes and which way it faces, worked out from where the player
+    /// stood when the test started.
+    spots: Vec<([f32; 3], f32)>,
+    placed: Vec<usize>,
+    place_frames: u32,
+    /// The first Mimic hit; the others are then told to wake up.
+    hit: Option<usize>,
+}
+
+static MIMIC_WATCH: Mutex<Option<MimicWatch>> = Mutex::new(None);
+
+/// Developer test for the chest game: three Mimics side by side in front of you. For a
+/// while afterwards the log shows your animation, and each Mimic's animation and distance,
+/// so it shows whether they stay asleep and what opening one looks like.
+pub fn test_mimic_chests(spawn: bool, npc_id: u32, think_override: u32) -> Result<String, String> {
+    log_mimic_throws();
+    if !spawn {
+        start_mimic_watch(Vec::new())?;
+        return Ok(format!(
+            "logging animations of everything within {NEARBY_METRES} m for {MIMIC_TEST_SECONDS} seconds"
+        ));
+    }
+    let routine = create_npc_address()?;
+    let creator = debug_creator()?;
+    let regulation = unsafe { CSRegulationManager::instance() }
+        .map_err(|error| format!("the NPC list is unavailable: {error:?}"))?;
+    if regulation.get_param::<NPC_PARAM_ST>().get(u64::from(npc_id)).is_none() {
+        return Err(format!("NPC {npc_id} is missing from the game data"));
+    }
+    let think_ids: Vec<u32> = regulation
+        .get_param::<NPC_THINK_PARAM_ST>()
+        .iter()
+        .filter(|(id, _)| *id > 0)
+        .map(|(id, _)| id as u32)
+        .collect();
+    let think_id = if think_override > 0 {
+        think_override
+    } else {
+        think_candidates(npc_id, &think_ids).into_iter().next().ok_or("this NPC has no AI row")?
+    };
+    let picks: Vec<EnemyChoice> = MIMIC_ROW
+        .iter()
+        .map(|_| EnemyChoice { npc_id, think_id, invader: false, label: 0, friendly: false })
+        .collect();
+    start_mimic_watch(picks.clone())?;
+    let mut slot = ENEMY_QUEUE.lock().unwrap_or_else(|poison| poison.into_inner());
+    match slot.as_mut() {
+        Some(queue) => {
+            queue.remaining.extend(picks.iter().copied());
+            queue.replacements = 0;
+        }
+        None => {
+            *slot = Some(EnemyQueue {
+                creator,
+                routine,
+                remaining: picks.clone(),
+                pool: picks,
+                replace_oldest: true,
+                limit: 5,
+                full_frames: 0,
+                pause_frames: 0,
+                replacements: 0,
+                checks: Vec::new(),
+                in_flight: None,
+                started: 0,
+            });
+        }
+    }
+    Ok(format!(
+        "spawning three Mimics ({npc_id}, AI {think_id}), logging for {MIMIC_TEST_SECONDS} seconds"
+    ))
+}
+
+/// Starts logging. With `picks`, the spawned Mimics are moved into a row in front of you.
+fn start_mimic_watch(picks: Vec<EnemyChoice>) -> Result<(), String> {
+    let spots: Vec<([f32; 3], f32)> = if picks.is_empty() {
+        Vec::new()
+    } else {
+        chest_row_spots()?
+    };
+    *MIMIC_WATCH.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(MimicWatch {
+        started: Instant::now(),
+        last_log: Instant::now(),
+        before: spawned_chrs(),
+        last_player_anim: 0,
+        last_anims: Vec::new(),
+        spots,
+        placed: Vec::new(),
+        place_frames: 0,
+        hit: None,
+    });
+    Ok(())
+}
+
+/// Characters this close are logged by the Mimic test, map enemies too.
+const NEARBY_METRES: f32 = 6.0;
+
+/// Every character the game has loaded: the map's, the spawned ones and the other sets.
+fn all_chrs() -> Vec<usize> {
+    let Ok(world) = (unsafe { WorldChrMan::instance() }) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let slots = world.world_block_chr.as_ptr() as usize;
+    let slot_size = std::mem::size_of_val(&world.world_block_chr) / world.world_block_chr.len();
+    for index in 0..world.world_block_chr.len() {
+        let block = slots + index * slot_size;
+        let capacity = read_u32_checked(block + BLOCK_CHR_SET_CAPACITY).unwrap_or(0) as usize;
+        let entries = read_usize_checked(block + BLOCK_CHR_SET_ENTRIES).unwrap_or(0);
+        if capacity == 0 || capacity > MAX_CHRS_PER_BLOCK as usize || entries < 0x10_000 {
+            continue;
+        }
+        for entry in 0..capacity {
+            let chr = read_usize_checked(entries + entry * CHR_SET_ENTRY_SIZE).unwrap_or(0);
+            if chr >= 0x10_000 {
+                found.push(chr);
+            }
+        }
+    }
+    let world = world as *const WorldChrMan as usize;
+    found.extend(chr_set_members(world + DEBUG_CHR_SET));
+    for offset in OTHER_CHR_SETS {
+        found.extend(chr_set_members(world + offset));
+    }
+    found.sort_unstable();
+    found.dedup();
+    found
+}
+
+fn distance_between(a: [f32; 3], b: [f32; 3]) -> f32 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+/// Characters other than the player within `metres`, closest first.
+fn chrs_near_player(metres: f32) -> Vec<(usize, f32)> {
+    let Ok(player) = local_player() else {
+        return Vec::new();
+    };
+    let player = player as usize;
+    let Some(here) = chr_position(player) else {
+        return Vec::new();
+    };
+    let mut near: Vec<(usize, f32)> = all_chrs()
+        .into_iter()
+        .filter(|chr| *chr != player)
+        .filter_map(|chr| chr_position(chr).map(|there| (chr, distance_between(here, there))))
+        .filter(|(_, distance)| *distance <= metres)
+        .collect();
+    near.sort_by(|a, b| a.1.total_cmp(&b.1));
+    near
+}
+
+/// The Mimic's grabs in the game's throw list, from the game's own names. The last two are
+/// the bite from the closed chest ("Mimicry").
+const MIMIC_THROWS: [(u32, &str); 5] = [
+    (521_200, "Hug"),
+    (521_201, "Jump"),
+    (521_202, "Back Bite"),
+    (521_203, "Mimicry"),
+    (521_204, "Mimicry"),
+];
+
+/// Writes the Mimic's grabs to the log: the Mimic's animation and the player's for each.
+fn log_mimic_throws() {
+    let Ok(regulation) = (unsafe { CSRegulationManager::instance() }) else {
+        return;
+    };
+    let throws = regulation.get_param::<THROW_INFO_BANK>();
+    for (id, name) in MIMIC_THROWS {
+        match throws.get(u64::from(id)) {
+            Some(row) => crate::log::log(format!(
+                "mimic test: throw {id} {name}: Mimic animation {}, player animation {}, distance {:.2}, type {}",
+                row.atk_anim_id(),
+                row.def_anim_id(),
+                row.dist(),
+                row.throw_type_id(),
+            )),
+            None => crate::log::log(format!("mimic test: throw {id} {name} is missing")),
+        }
+    }
+}
+
+/// The routine behind the game's ForcePlayAnimation event command: (character, animation,
+/// two flags). It marks the character and passes the animation to its event module. The
+/// event command reaches it through an object only map-placed characters have, so the mod
+/// calls it directly, which works for spawned characters too.
+const FORCE_PLAY_ANIMATION_PATTERN: &str =
+    "48 85 C9 74 ?? 80 A1 09 1A 00 00 FD 41 80 E1 01 45 02 C9 44 08 89 09 1A 00 00 48 8B 89 90 1F 00 00 48 8B 49 58 E9";
+
+fn force_play_animation_routine() -> Result<usize, String> {
+    static ROUTINE: OnceLock<Result<usize, String>> = OnceLock::new();
+    ROUTINE.get_or_init(|| find_unique(FORCE_PLAY_ANIMATION_PATTERN)).clone()
+}
+
+/// Plays an animation on any character the way the game's event scripts force one,
+/// interrupting whatever it was doing. Must run on the game's thread.
+fn request_animation(chr: usize, animation: i32) -> Result<(), String> {
+    request_animation_with(chr, animation, 0, 0)
+}
+
+fn request_animation_with(chr: usize, animation: i32, first: u8, second: u8) -> Result<(), String> {
+    let routine = force_play_animation_routine()?;
+    let play: extern "C" fn(usize, i32, u8, u8) = unsafe { std::mem::transmute(routine) };
+    play(chr, animation, first, second);
+    Ok(())
+}
+
+/// Ids the scan tries: the Mimic's own animations seen in the logs, the grabs from the
+/// throw list, and the same with the 2000000 the chest pose's ids carry.
+const SCAN_ANIMATIONS: [i32; 22] = [
+    7000, 2000020, 2003010, 3000, 3004, 4100, 4110, 5003, 9500, 2000000, 2000010, 2001000,
+    2002000, 2003000, 2003020, 2004000, 2004100, 2004110, 2005000, 2006000, 2007000, 2009000,
+];
+const SCAN_FLAGS: [(u8, u8); 2] = [(0, 0), (0, 1)];
+/// A sleeping Mimic shows its animations with this added: asking for 3000 plays 2003000.
+const CHEST_GROUP: i32 = 2_000_000;
+/// Frames between asking and reading back, and between one try and the next.
+const SCAN_SETTLE_FRAMES: u32 = 20;
+const SCAN_STEP_FRAMES: u32 = 45;
+
+struct AnimationScan {
+    chr: usize,
+    /// Each try: the animation and the two flags.
+    tries: Vec<(i32, u8, u8)>,
+    step_frames: u32,
+    step: usize,
+    frame: u32,
+    before: i32,
+}
+
+static ANIMATION_SCAN: Mutex<Option<AnimationScan>> = Mutex::new(None);
+
+/// Developer test: tries every id in [SCAN_ANIMATIONS] on the closest character, one after
+/// another, and logs which ones it really plays.
+pub fn scan_nearest_animations() -> Result<String, String> {
+    let (chr, distance) = *chrs_near_player(NEARBY_METRES)
+        .first()
+        .ok_or_else(|| format!("nothing is within {NEARBY_METRES} m"))?;
+    let tries: Vec<(i32, u8, u8)> = SCAN_ANIMATIONS
+        .iter()
+        .flat_map(|animation| SCAN_FLAGS.iter().map(|(first, second)| (*animation, *first, *second)))
+        .collect();
+    start_animation_scan(chr, tries, SCAN_STEP_FRAMES)?;
+    let count = SCAN_ANIMATIONS.len() * SCAN_FLAGS.len();
+    Ok(format!(
+        "trying {count} animations on {chr:#x} ({distance:.1} m away), about {} seconds",
+        count as u32 * SCAN_STEP_FRAMES / 60
+    ))
+}
+
+fn start_animation_scan(chr: usize, tries: Vec<(i32, u8, u8)>, step_frames: u32) -> Result<(), String> {
+    force_play_animation_routine()?;
+    *ANIMATION_SCAN.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(AnimationScan {
+        chr,
+        tries,
+        step_frames,
+        step: 0,
+        frame: 0,
+        before: chr_anim(chr).unwrap_or(-1),
+    });
+    Ok(())
+}
+
+/// Developer test: plays the listed animations on the closest character, one after
+/// another with `gap_frames` between them, and logs what it really plays.
+pub fn play_nearest_sequence(text: &str, gap_frames: u32) -> Result<String, String> {
+    let animations = parse_npc_param_ids(text);
+    if animations.is_empty() {
+        return Err("no animation ids given".to_string());
+    }
+    let (chr, distance) = *chrs_near_player(NEARBY_METRES)
+        .first()
+        .ok_or_else(|| format!("nothing is within {NEARBY_METRES} m"))?;
+    let tries = animations.iter().map(|animation| (*animation as i32, 0, 0)).collect();
+    start_animation_scan(chr, tries, gap_frames.max(SCAN_SETTLE_FRAMES + 1))?;
+    Ok(format!("playing {animations:?} on {chr:#x} ({distance:.1} m away), {gap_frames} frames apart"))
+}
+
+pub fn poll_animation_scan() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = ANIMATION_SCAN.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(scan) = slot.as_mut() else {
+            return;
+        };
+        if scan.step >= scan.tries.len() || !all_chrs().contains(&scan.chr) {
+            crate::log::log("animation scan: done".to_string());
+            *slot = None;
+            return;
+        }
+        let (animation, first, second) = scan.tries[scan.step];
+        if scan.frame == 0 {
+            scan.before = chr_anim(scan.chr).unwrap_or(-1);
+            if let Err(error) = request_animation_with(scan.chr, animation, first, second) {
+                crate::log::log(format!("animation scan: {animation} failed: {error}"));
+            }
+        }
+        if scan.frame == SCAN_SETTLE_FRAMES {
+            let now = chr_anim(scan.chr).unwrap_or(-1);
+            let verdict = if now == animation || now == animation + CHEST_GROUP { "PLAYS" } else { "no" };
+            crate::log::log(format!(
+                "animation scan: {animation} flags {first}/{second}: {verdict} (was {}, now {now})",
+                scan.before
+            ));
+        }
+        scan.frame += 1;
+        if scan.frame >= scan.step_frames {
+            scan.frame = 0;
+            scan.step += 1;
+        }
+    }));
+}
+
+/// Developer test: makes the closest character play an animation, the way the game's
+/// event scripts ask for one, and the player another one at the same moment if asked.
+pub fn force_nearest_animation(animation: i32, player_animation: i32) -> Result<String, String> {
+    let (chr, distance) = *chrs_near_player(NEARBY_METRES)
+        .first()
+        .ok_or_else(|| format!("nothing is within {NEARBY_METRES} m"))?;
+    request_animation(chr, animation)?;
+    if player_animation > 0 {
+        request_animation(local_player()? as usize, player_animation)?;
+        return Ok(format!(
+            "asked {chr:#x} ({distance:.1} m away) to play {animation} and the player {player_animation}"
+        ));
+    }
+    Ok(format!("asked {chr:#x} ({distance:.1} m away) to play {animation}"))
+}
+
+fn chr_anim(chr: usize) -> Option<i32> {
+    let action = module_pointer(chr, ACTION_REQUEST_OFFSET).ok()?;
+    read_u32_checked(action + CURRENT_ANIM_OFFSET).ok().map(|anim| anim as i32)
+}
+
+fn chr_position(chr: usize) -> Option<[f32; 3]> {
+    let physics = module_pointer(chr, PHYSICS_MODULE_OFFSET).ok()?;
+    let mut bytes = [0u8; 12];
+    (copy_readable(physics + PHYSICS_POSITION, &mut bytes) == 12).then(|| {
+        [0, 1, 2].map(|axis| f32::from_ne_bytes(bytes[axis * 4..axis * 4 + 4].try_into().unwrap()))
+    })
+}
+
+/// The ways a facing angle can stand for a direction on the ground (x, z): sine or cosine
+/// for x, and the signs. Which one the game uses is read off the player, whose angle and
+/// direction are both known, instead of being assumed.
+const FACING_CONVENTIONS: usize = 8;
+
+fn facing_direction(convention: usize, angle: f32) -> [f32; 2] {
+    let (sx, sz) = ([1.0, -1.0][convention & 1], [1.0, -1.0][(convention >> 1) & 1]);
+    if convention & 4 == 0 {
+        [sx * angle.sin(), sz * angle.cos()]
+    } else {
+        [sx * angle.cos(), sz * angle.sin()]
+    }
+}
+
+/// The angle that looks along (x, z) under `convention`.
+pub fn facing_for(convention: usize, x: f32, z: f32) -> f32 {
+    let (sx, sz) = ([1.0, -1.0][convention & 1], [1.0, -1.0][(convention >> 1) & 1]);
+    if convention & 4 == 0 {
+        (sx * x).atan2(sz * z)
+    } else {
+        (sz * z).atan2(sx * x)
+    }
+}
+
+/// The convention under which `angle` points closest to `forward`.
+pub fn pick_facing_convention(angle: f32, forward: [f32; 2]) -> usize {
+    (0..FACING_CONVENTIONS)
+        .min_by(|a, b| {
+            let miss = |convention: usize| {
+                let [x, z] = facing_direction(convention, angle);
+                (x - forward[0]).powi(2) + (z - forward[1]).powi(2)
+            };
+            miss(*a).total_cmp(&miss(*b))
+        })
+        .unwrap_or(0)
+}
+
+fn player_facing_convention() -> Result<usize, String> {
+    let player = local_player()? as usize;
+    let physics = module_pointer(player, PHYSICS_MODULE_OFFSET)?;
+    let angle = read_f32_checked(physics + PHYSICS_ROTATION + 4)?;
+    let ctrl = read_usize_checked(player + CHR_CTRL_OFFSET)?;
+    let forward = [-read_f32_checked(ctrl + CTRL_FORWARD[0])?, -read_f32_checked(ctrl + CTRL_FORWARD[2])?];
+    Ok(pick_facing_convention(angle, forward))
+}
+
+/// Moves each new Mimic to its spot in the row, facing the player.
+fn place_mimics(watch: &mut MimicWatch, mimics: &[usize]) {
+    for chr in mimics {
+        if !watch.placed.contains(chr) && watch.placed.len() < watch.spots.len() {
+            watch.placed.push(*chr);
+            watch.place_frames = 0;
+        }
+    }
+    if watch.place_frames >= MIMIC_PLACE_FRAMES {
+        return;
+    }
+    watch.place_frames += 1;
+    for (chr, (spot, facing)) in watch.placed.iter().zip(&watch.spots) {
+        let Ok(physics) = module_pointer(*chr, PHYSICS_MODULE_OFFSET) else {
+            continue;
+        };
+        for (axis, value) in spot.iter().enumerate() {
+            let _ = write_bytes_checked(physics + PHYSICS_POSITION + axis * 4, &value.to_ne_bytes());
+        }
+        let _ = write_bytes_checked(physics + PHYSICS_ROTATION + 4, &facing.to_ne_bytes());
+        if watch.place_frames == MIMIC_PLACE_FRAMES {
+            crate::log::log(format!(
+                "mimic test: placed {chr:#x} at {spot:?} facing {facing:.2}, effects {:?}",
+                chr_sp_effects(*chr)
+            ));
+        }
+    }
+}
+
+/// Logs any change of animation right away, and positions twice a second.
+pub fn poll_mimic_test() {
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        let mut slot = MIMIC_WATCH.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Some(watch) = slot.as_mut() else {
+            return;
+        };
+        if watch.started.elapsed() > Duration::from_secs(MIMIC_TEST_SECONDS) {
+            crate::log::log("mimic test: done logging".to_string());
+            *slot = None;
+            return;
+        }
+        let Ok(player) = local_player() else {
+            return;
+        };
+        let player = player as usize;
+        let player_anim = chr_anim(player).unwrap_or(-1);
+        if player_anim != watch.last_player_anim {
+            crate::log::log(format!("mimic test: player animation {player_anim}"));
+            watch.last_player_anim = player_anim;
+        }
+        let here = chr_position(player);
+        let mimics: Vec<usize> = spawned_chrs().into_iter().filter(|chr| !watch.before.contains(chr)).collect();
+        place_mimics(watch, &mimics);
+        if watch.hit.is_none() && !watch.spots.is_empty() {
+            // They all start with the same health, so one below the rest was hit.
+            let full = mimics.iter().filter_map(|chr| chr_health(*chr)).max().unwrap_or(0);
+            if let Some(hit) = mimics.iter().copied().find(|chr| chr_health(*chr).is_some_and(|hp| hp < full)) {
+                watch.hit = Some(hit);
+                for other in mimics.iter().copied().filter(|chr| *chr != hit) {
+                    let woken = request_animation(other, MIMIC_WAKE_ANIMATION);
+                    crate::log::log(format!("mimic test: {hit:#x} was hit, waking {other:#x}: {woken:?}"));
+                }
+            }
+        }
+        let mut lines = Vec::new();
+        let mut watched: Vec<usize> = chrs_near_player(NEARBY_METRES).into_iter().map(|(chr, _)| chr).collect();
+        for chr in &mimics {
+            if !watched.contains(chr) {
+                watched.push(*chr);
+            }
+        }
+        for chr in &watched {
+            let anim = chr_anim(*chr).unwrap_or(-1);
+            let previous = watch.last_anims.iter().find(|(known, _)| known == chr).map(|(_, anim)| *anim);
+            if previous != Some(anim) {
+                crate::log::log(format!("mimic test: {chr:#x} animation {anim}, effects {:?}", chr_sp_effects(*chr)));
+                watch.last_anims.retain(|(known, _)| known != chr);
+                watch.last_anims.push((*chr, anim));
+            }
+            let metres = here.zip(chr_position(*chr)).map(|(a, b)| {
+                ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+            });
+            let hp = chr_health(*chr).unwrap_or(-1);
+            lines.push(format!("{chr:#x} {:.1} m hp {hp}", metres.unwrap_or(-1.0)));
+        }
+        if watch.last_log.elapsed() >= Duration::from_millis(500) && !lines.is_empty() {
+            watch.last_log = Instant::now();
+            crate::log::log(format!("mimic test: {}", lines.join(", ")));
+        }
+    }));
 }
 
 fn invader_candidates(ashes: bool, ringed_city: bool) -> Vec<(u32, &'static str)> {
@@ -5948,6 +7607,26 @@ pub struct InvaderOptions<'a> {
     pub friendly: bool,
 }
 
+impl<'a> InvaderOptions<'a> {
+    /// A random invader with Spawn NPC Invader's default settings.
+    pub fn invader(viewer: &'a str) -> Self {
+        Self {
+            viewer,
+            use_sender_name: true,
+            ids_text: "",
+            think_override: 0,
+            arrival_delay: 4,
+            arrival_animation: 63_010,
+            friendly: false,
+        }
+    }
+}
+
+/// True with the given chance in percent.
+pub fn roll_percent(percent: u32) -> bool {
+    (random_index(100) as u32) < percent
+}
+
 /// Queues one random named NPC invader near you.
 pub fn spawn_npc_invader(options: InvaderOptions) -> Result<String, String> {
     let InvaderOptions {
@@ -6082,13 +7761,20 @@ pub fn poll_enemy_queue() {
             flight.frames += 1;
             let chr = read_usize_checked(queue.creator + CREATOR_RESULT).unwrap_or(0);
             if chr >= 0x10_000 && chr != flight.previous {
-                Some(chr)
+                Some((chr, flight.npc_id))
             } else {
                 None
             }
         });
-        if let Some(chr) = finished {
+        if let Some((chr, npc_id)) = finished {
             queue.in_flight = None;
+            if npc_id == MIMIC {
+                let mut made = NEW_MIMICS.lock().unwrap_or_else(|poison| poison.into_inner());
+                made.push(chr);
+                // Nobody collects them outside Mimic Chests, so only the latest few stay.
+                let extra = made.len().saturating_sub(MIMIC_ROW.len());
+                made.drain(..extra);
+            }
             // A new enemy can land on the address of an invader that is gone.
             forget_invader_name(chr);
             queue.checks.push(SpawnCheck {
@@ -6168,7 +7854,7 @@ pub fn schemas_json() -> Value {
             "name": "Adjust souls",
             "description": "Adds a signed amount to held souls. Negative values remove souls and the result is clamped at 0.",
             "arguments": [
-                { "name": "delta", "type": "int", "default": -100, "min": -999999999, "max": 999999999 },
+                { "name": "delta", "type": "int", "label": "Souls to add", "hint": "A negative number takes souls away, for example -100.", "default": -100, "min": -999999999, "max": 999999999 },
                 { "name": "scaleWithLevel", "type": "bool", "default": 0, "min": 0, "max": 1, "label": "Scale with level", "hint": "Grows with the cost of your next level. The amount is what you lose at level 10, so -100 takes about 1800 souls at level 50 and 7400 at level 100." }
             ]
         },
@@ -6206,7 +7892,7 @@ pub fn schemas_json() -> Value {
             "id": "no_stamina",
             "name": "No Stamina",
             "description": "Holds stamina empty for the chosen number of seconds, blocking sprinting, rolling and attacks.",
-            "arguments": [{ "name": "seconds", "type": "int", "default": 5, "min": 1, "max": 60 }]
+            "arguments": [{ "name": "seconds", "type": "int", "default": 10, "min": 1, "max": 60 }]
         },
         {
             "id": "decrease_speed",
@@ -6214,7 +7900,7 @@ pub fn schemas_json() -> Value {
             "description": "Slows the player by a percentage for the chosen time. Adds together with Increase Speed.",
             "arguments": [
                 { "name": "percent", "type": "int", "default": 30, "min": 1, "max": 90 },
-                { "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 },
+                { "name": "seconds", "type": "int", "default": 10, "min": 1, "max": 300 },
                 { "name": "movementOnly", "type": "bool", "label": "Movement only (experimental)", "hint": "Only walking, running and rolling change speed. Attacks can still start at the changed speed, because the game reports them a moment late.", "default": 0, "min": 0, "max": 1 }
             ]
         },
@@ -6224,7 +7910,7 @@ pub fn schemas_json() -> Value {
             "description": "Speeds up the player by a percentage for the chosen time. Adds together with Decrease Speed.",
             "arguments": [
                 { "name": "percent", "type": "int", "default": 30, "min": 1, "max": 300 },
-                { "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 },
+                { "name": "seconds", "type": "int", "default": 10, "min": 1, "max": 300 },
                 { "name": "movementOnly", "type": "bool", "label": "Movement only (experimental)", "hint": "Only walking, running and rolling change speed. Attacks can still start at the changed speed, because the game reports them a moment late.", "default": 0, "min": 0, "max": 1 }
             ]
         },
@@ -6273,7 +7959,7 @@ pub fn schemas_json() -> Value {
             "name": "Temporary Armor",
             "description": "Swaps all armor slots for a random outfit, then puts your own armor back when the time is up.",
             "arguments": [
-                { "name": "seconds", "type": "int", "default": 60, "min": 1, "max": 600 },
+                { "name": "seconds", "type": "int", "default": 120, "min": 1, "max": 600 },
                 { "name": "armorStyle", "type": "choice", "label": "Armor style", "hint": "Matching set picks one armor set. If it has no piece for a slot, that slot stays as it is.", "options": ["Random pieces", "Matching set", "Either at random"], "default": 0, "min": 0, "max": 2 },
                 { "name": "includeMissingDlc", "type": "bool", "label": "Include armor from DLC you do not have (experimental)", "hint": "Weapons from a missing DLC worked in a short test, but armor has not been tried.", "default": 0, "min": 0, "max": 1 }
             ]
@@ -6282,13 +7968,77 @@ pub fn schemas_json() -> Value {
             "id": "bombardier",
             "name": "Bombardier",
             "description": "Takes away all your weapons, dresses you in the Mirrah Chain Set and gives you endless Black Firebombs in a free quick slot, then puts everything back when the time is up.",
-            "arguments": [{ "name": "seconds", "type": "int", "default": 60, "min": 5, "max": 600 }]
+            "arguments": [{ "name": "seconds", "type": "int", "default": 120, "min": 5, "max": 600 }]
         },
         {
             "id": "firestarter",
             "name": "Firestarter",
             "description": "Takes away your weapons and gives you a Pyromancy Flame at a random level, the Fire Witch Set and every pyromancy. As many as your slots hold are attuned, without stat requirements. Everything goes back when the time is up.",
-            "arguments": [{ "name": "seconds", "type": "int", "default": 300, "min": 5, "max": 600 }]
+            "arguments": [{ "name": "seconds", "type": "int", "default": 120, "min": 5, "max": 600 }]
+        },
+        {
+            "id": "test_mimic_chests",
+            "name": "Test Mimic chests",
+            "description": "Developer test: spawns three Mimics in a row in front of you, and for 90 seconds logs your animation and that of everything within 6 m, map enemies included.",
+            "arguments": [
+                { "name": "spawn", "type": "bool", "label": "Spawn the Mimics", "hint": "Off only logs, for example next to a real Mimic while you open it.", "default": 1, "min": 0, "max": 1 },
+                { "name": "npcId", "type": "int", "label": "NPC id", "hint": "Which Mimic row to spawn. 212000 is the High Wall Mimic.", "default": 212000, "min": 100000, "max": 999999 },
+                { "name": "thinkId", "type": "int", "label": "AI row", "hint": "0 uses the NPC's own AI.", "default": 0, "min": 0, "max": 99999999 }
+            ]
+        },
+        {
+            "id": "play_nearest_sequence",
+            "name": "Play nearest animation chain",
+            "description": "Developer test: the character closest to you plays the listed animations one after another.",
+            "arguments": [
+                { "name": "animations", "type": "string", "label": "Animation ids", "hint": "Comma-separated, played in this order.", "defaultText": "3000, 3004, 4100" },
+                { "name": "gapFrames", "type": "int", "label": "Frames between them", "hint": "60 frames are about a second.", "default": 45, "min": 21, "max": 600 }
+            ]
+        },
+        {
+            "id": "try_vanish_effect",
+            "name": "Try vanish effect",
+            "description": "Developer test: the closest spawned enemy gets the chosen special effect and is removed a moment later.",
+            "arguments": [
+                { "name": "effect", "type": "int", "label": "Effect id", "hint": "10633, 10635 and 12030 are transparency effects; 101341000 is Hidden Body; 0 for none.", "default": 10633, "min": 0, "max": 999999999 },
+                { "name": "seconds", "type": "int", "label": "Seconds until removed", "default": 2, "min": 0, "max": 30 }
+            ]
+        },
+        {
+            "id": "scan_nearest_animations",
+            "name": "Scan nearest animations",
+            "description": "Developer test: tries a list of animation ids on the character closest to you, one every few frames, and logs which ones it really plays. Takes about 30 seconds.",
+            "arguments": []
+        },
+        {
+            "id": "force_nearest_animation",
+            "name": "Force nearest animation",
+            "description": "Developer test: the character closest to you, within 6 m, plays the chosen animation.",
+            "arguments": [
+                { "name": "animation", "type": "int", "label": "Animation id", "default": 2003010, "min": 0, "max": 99999999 },
+                { "name": "playerAnimation", "type": "int", "label": "Player animation id", "hint": "Optional. Above 0, you play this one at the same moment.", "default": 0, "min": 0, "max": 99999999 }
+            ]
+        },
+        {
+            "id": "mimic_chests",
+            "name": "Mimic Chests",
+            "description": "Three chests appear in front of you. One holds a good weapon or ring, fully upgraded; the other two are Mimics. Open one with the interact button. A wrong pick bites you and the other Mimic wakes up. Attacking a chest, or taking too long, wakes all three and wins nothing.",
+            "arguments": [
+                { "name": "seconds", "type": "int", "label": "Seconds to pick", "default": 30, "min": 10, "max": 600 },
+                { "name": "prize", "type": "choice", "label": "Prize", "options": ["Weapon or ring", "Weapon", "Ring"], "default": 0, "min": 0, "max": 2 }
+            ]
+        },
+        {
+            "id": "ooga_booga",
+            "name": "Ooga Booga",
+            "description": "Takes away your weapons and armor and gives you a Club at its highest level, without stat requirements and with War Cry's attack boost, then puts everything back when the time is up.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 120, "min": 5, "max": 600 }]
+        },
+        {
+            "id": "big_ooga_booga",
+            "name": "Big Ooga Booga",
+            "description": "Takes away your weapons and armor and gives you a Great Club at its highest level, without stat requirements and with War Cry's attack boost, then puts everything back when the time is up.",
+            "arguments": [{ "name": "seconds", "type": "int", "default": 120, "min": 5, "max": 600 }]
         },
         {
             "id": "shuffle_stats",
@@ -6303,7 +8053,7 @@ pub fn schemas_json() -> Value {
             "name": "Oversaturate",
             "description": "Pushes the colours far past normal for the chosen number of seconds, for a badly over-edited look.",
             "arguments": [
-                { "name": "seconds", "type": "int", "default": 15, "min": 1, "max": 300 },
+                { "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 },
                 { "name": "percent", "type": "int", "default": 2000, "min": 100, "max": 2000 }
             ]
         },
@@ -6317,7 +8067,7 @@ pub fn schemas_json() -> Value {
             "id": "freeze",
             "name": "Freeze",
             "description": "Freezes the player in place for the chosen number of seconds. The camera still moves.",
-            "arguments": [{ "name": "seconds", "type": "int", "default": 5, "min": 1, "max": 60 }]
+            "arguments": [{ "name": "seconds", "type": "int", "default": 10, "min": 1, "max": 60 }]
         },
         {
             "id": "invert_controls",
@@ -6349,13 +8099,33 @@ pub fn schemas_json() -> Value {
         {
             "id": "spawn_random_enemy",
             "name": "Spawn Random Enemy",
-            "description": "Spawns random enemies near you, from the current map unless Whole game is on.",
+            "description": "Spawns random regular enemies near you, from the current map unless Whole game is on.",
             "arguments": [
                 { "name": "amount", "type": "int", "default": 1, "min": 1, "max": 10 },
                 { "name": "limit", "type": "int", "label": "Enemy limit", "hint": "How many spawned enemies can be active at once. The game itself stops at 16.", "default": 5, "min": 1, "max": 16 },
                 { "name": "wholeGame", "type": "bool", "label": "Whole game (experimental)", "hint": "Picks from every area and gives enemies from elsewhere a random local AI. They may act oddly.", "default": 0, "min": 0, "max": 1 },
-                { "name": "bosses", "type": "bool", "label": "Include bosses", "hint": "Bosses can spawn too. Many rely on map events, so some may act oddly.", "default": 1, "min": 0, "max": 1 },
-                { "name": "onlyBosses", "type": "bool", "label": "Only bosses", "hint": "Spawns nothing but bosses. Without Whole game, only bosses from the current map can appear.", "default": 0, "min": 0, "max": 1 },
+                { "name": "replaceOldest", "type": "bool", "label": "Replace oldest at limit", "hint": "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot.", "default": 1, "min": 0, "max": 1 }
+            ]
+        },
+        {
+            "id": "spawn_random_boss",
+            "name": "Spawn Random Boss",
+            "description": "Spawns a random boss near you, from the current map unless Whole game is on. Many bosses rely on map events, so some may act oddly.",
+            "arguments": [
+                { "name": "amount", "type": "int", "default": 1, "min": 1, "max": 3 },
+                { "name": "limit", "type": "int", "label": "Enemy limit", "hint": "How many spawned enemies can be active at once. The game itself stops at 16.", "default": 5, "min": 1, "max": 16 },
+                { "name": "wholeGame", "type": "bool", "label": "Whole game (experimental)", "hint": "Picks from every area and gives enemies from elsewhere a random local AI. They may act oddly.", "default": 0, "min": 0, "max": 1 },
+                { "name": "replaceOldest", "type": "bool", "label": "Replace oldest at limit", "hint": "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot.", "default": 1, "min": 0, "max": 1 }
+            ]
+        },
+        {
+            "id": "spawn_anything",
+            "name": "Spawn Anything",
+            "description": "Spawns one random thing near you: any enemy or boss, or sometimes an NPC invader.",
+            "arguments": [
+                { "name": "invaderChance", "type": "int", "label": "NPC invader chance", "hint": "The chance in percent that an NPC invader comes instead of an enemy. Invaders use the Spawn NPC Invader defaults.", "default": 20, "min": 0, "max": 100 },
+                { "name": "limit", "type": "int", "label": "Enemy limit", "hint": "How many spawned enemies can be active at once. The game itself stops at 16.", "default": 5, "min": 1, "max": 16 },
+                { "name": "wholeGame", "type": "bool", "label": "Whole game (experimental)", "hint": "Picks from every area and gives enemies from elsewhere a random local AI. They may act oddly.", "default": 0, "min": 0, "max": 1 },
                 { "name": "replaceOldest", "type": "bool", "label": "Replace oldest at limit", "hint": "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot.", "default": 1, "min": 0, "max": 1 }
             ]
         },
@@ -6726,7 +8496,9 @@ mod tests {
         ai_choices, enemy_teams, has_fight_logic, is_spawnable_enemy, most_common_team, spawn_state,
         SpawnState, model_from_chr_name, think_candidates, usable_two_handed, wait_reason, weapon_available,
         weapon_infusion, weapon_level, WeaponTrait, with_no_damage_bit, without_bits,
-        attunement_slots, magic_entry, pick_attunement, pyromancies_available, Firestarter, SpellRequirement,
+        attunement_slots, magic_entry, pick_attunement, pyromancies_available, ClubRow, EndedKind, EndedSwap, Firestarter,
+        OogaBooga,
+        SpellRequirement,
         ended_prefix, choose_invader_ids, known_invader_name, parse_npc_param_ids, think_for_invader,
         clear_entity_ids, is_summon_side, name_units, MESSAGE_NAME_LENGTH,
     };
@@ -7038,11 +8810,31 @@ mod tests {
                 requirements: vec![SpellRequirement { spell: 2_400_000, intelligence: 6, faith: 6 }],
                 weapons_changed: false,
             }),
+            ooga_booga: Some(OogaBooga {
+                until: 260,
+                character: "Ash".to_string(),
+                big: true,
+                weapons: vec![RemovedWeapon { slot: 1, index: 2, weapon: 3_000_000 }],
+                armor: vec![ArmorSwap { slot: 12, old_index: 4, old_id: 21_000_000, owned_before: 0, piece: 0 }],
+                club: 8_080_010,
+                club_index: 41,
+                clubs_before: 0,
+                row_before: Some(ClubRow { strength: 28, dexterity: 0, intelligence: 0, faith: 0, resident_effect: -1 }),
+                changed: false,
+            }),
             stats: Some(ShuffledStats {
                 until: 300,
                 character: "Ash".to_string(),
                 original: [12, 10, 11, 15, 13, 12, 9, 9, 7],
             }),
+            recently_ended: vec![EndedSwap {
+                kind: EndedKind::Stats(ShuffledStats {
+                    until: 50,
+                    character: "Ash".to_string(),
+                    original: [1, 2, 3, 4, 5, 6, 7, 8, 9],
+                }),
+                here: Some(std::time::Instant::now()),
+            }],
         };
 
         let text = serde_json::to_string(&saved).unwrap();
@@ -7058,8 +8850,48 @@ mod tests {
         assert_eq!((firestarter.flame, firestarter.selected_before), (13_400_007, 3));
         assert_eq!(firestarter.attuned_before.unwrap().len(), 14);
         assert_eq!(firestarter.requirements[0].intelligence, 6);
+        let ooga = loaded.ooga_booga.unwrap();
+        assert_eq!((ooga.big, ooga.club, ooga.armor[0].old_id), (true, 8_080_010, 21_000_000));
+        assert_eq!(ooga.row_before.unwrap().strength, 28);
         assert_eq!(loaded.stats.unwrap().original[3], 15);
+        // An ended swap from an earlier run is checked on the next load, not timed out.
+        assert_eq!(loaded.recently_ended.len(), 1);
+        assert!(loaded.recently_ended[0].here.is_none());
+        assert_eq!(loaded.recently_ended[0].kind.character(), "Ash");
         assert!(PendingRestores::default().is_empty());
+    }
+
+    #[test]
+    fn the_chest_in_front_is_the_one_faced_and_in_reach() {
+        let chests = [[-1.8, 0.0, 1.5], [0.0, 0.0, 1.5], [1.8, 0.0, 1.5]];
+        let here = [0.0, 0.0, 0.0];
+        assert_eq!(super::chest_in_front(here, [0.0, 1.0], &chests), Some(1));
+        // Between two chests and turned toward the right-hand one.
+        let length = (0.9f32 * 0.9 + 1.0 * 1.0).sqrt();
+        assert_eq!(super::chest_in_front([0.9, 0.0, 0.5], [0.9 / length, 1.0 / length], &chests), Some(2));
+        // Facing away, or too far.
+        assert_eq!(super::chest_in_front(here, [0.0, -1.0], &chests), None);
+        assert_eq!(super::chest_in_front([0.0, 0.0, -3.0], [0.0, 1.0], &chests), None);
+    }
+
+    #[test]
+    fn facing_conventions_are_read_off_a_known_direction() {
+        for convention in 0..super::FACING_CONVENTIONS {
+            let angle = 0.7f32;
+            let forward = super::facing_direction(convention, angle);
+            let picked = super::pick_facing_convention(angle, forward);
+            assert_eq!(picked, convention);
+            let back = super::facing_for(picked, forward[0], forward[1]);
+            assert!((back - angle).abs() < 1e-4, "{convention}: {back}");
+        }
+    }
+
+    #[test]
+    fn a_file_saved_before_ooga_booga_still_loads() {
+        let text = r#"{"stats":{"until":1,"character":"Ash","original":[1,2,3,4,5,6,7,8,9]}}"#;
+        let loaded: PendingRestores = serde_json::from_str(text).unwrap();
+        assert!(loaded.ooga_booga.is_none());
+        assert!(loaded.stats.is_some());
     }
 
     #[test]

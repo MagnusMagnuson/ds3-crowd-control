@@ -12,6 +12,8 @@ public static class AppPaths
 
     public static string TwitchTokensFile => Path.Combine(Root, "twitch-sign-in.bin");
 
+    public static string DiscordTokenFile => Path.Combine(Root, "discord-bot.bin");
+
     public static string ManagerSettingsFile => Path.Combine(Root, "manager-settings.json");
 
     public static string GearSnapshotsFile => Path.Combine(Root, "gear-snapshots.json");

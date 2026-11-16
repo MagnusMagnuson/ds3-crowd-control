@@ -84,6 +84,8 @@ parts! {
     TEMPORARY_ARMOR: new "Temporary armor",
     BOMBARDIER: new "Bombardier",
     FIRESTARTER: new "Firestarter",
+    OOGA_BOOGA: new "Ooga Booga",
+    MIMIC_CHESTS: new "Mimic Chests",
     GEAR: new "Gear snapshots",
     STATS: new "Shuffled stats",
     ONE_HIT: new "One-hit run",

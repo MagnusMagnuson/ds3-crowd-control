@@ -170,6 +170,12 @@ fn on_frame() {
     time(&perf::TEMPORARY_ARMOR, game::poll_temporary_armor);
     time(&perf::BOMBARDIER, game::poll_bombardier);
     time(&perf::FIRESTARTER, game::poll_firestarter);
+    time(&perf::OOGA_BOOGA, game::poll_ooga_booga);
+    game::poll_recently_ended();
+    game::poll_mimic_test();
+    game::poll_animation_scan();
+    time(&perf::MIMIC_CHESTS, game::poll_mimic_chests);
+    game::poll_vanishing();
     time(&perf::GEAR, game::poll_gear_snapshots);
     time(&perf::STATS, game::poll_shuffled_stats);
     time(&perf::ONE_HIT, game::poll_one_hit_run);

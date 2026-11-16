@@ -126,9 +126,15 @@ public sealed class EffectQueue
             return "Test";
         }
 
-        return source.StartsWith(TwitchSourcePrefix, StringComparison.Ordinal)
-            ? source[TwitchSourcePrefix.Length..]
-            : source;
+        foreach (var prefix in new[] { TwitchSourcePrefix, DiscordTriggerSource.SourcePrefix })
+        {
+            if (source.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return source[prefix.Length..];
+            }
+        }
+
+        return source;
     }
 
     /// <summary>

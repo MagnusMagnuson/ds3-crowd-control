@@ -41,19 +41,19 @@ public class CatalogTests
         CatalogStore.Save(catalog, path);
         var loaded = CatalogStore.LoadOrCreate(path);
 
-        Assert.Contains(loaded.Presets, preset => preset.Name == "Lose 100 souls" && preset.HandlerId == "adjust_souls");
+        Assert.Contains(loaded.Presets, preset => preset.Name == "Add or remove souls" && preset.HandlerId == "adjust_souls");
         Assert.Contains(loaded.Presets, preset => preset.Name == "Kill player" && preset.HandlerId == "kill_player");
         Assert.Contains(loaded.Presets, preset => preset.Name == "Fake Death" && preset.HandlerId == "fake_death");
         Assert.DoesNotContain(loaded.Presets, preset => preset.HandlerId == "fake_death_staged");
         Assert.Contains(loaded.Presets, preset => preset.Name == "Show YOU DIED" && preset.HandlerId == "show_you_died");
         Assert.Contains(loaded.Presets, preset => preset.Name == "Empty Stamina" && preset.HandlerId == "empty_stamina");
         var noStamina = loaded.Presets.Single(preset => preset.HandlerId == "no_stamina");
-        Assert.Equal(5, noStamina.Arguments["seconds"].GetInt32());
+        Assert.Equal(10, noStamina.Arguments["seconds"].GetInt32());
         foreach (var handlerId in new[] { "decrease_speed", "increase_speed" })
         {
             var speed = loaded.Presets.Single(preset => preset.HandlerId == handlerId);
             Assert.Equal(30, speed.Arguments["percent"].GetInt32());
-            Assert.Equal(30, speed.Arguments["seconds"].GetInt32());
+            Assert.Equal(10, speed.Arguments["seconds"].GetInt32());
             Assert.Equal(0, speed.Arguments["movementOnly"].GetInt32());
         }
 
@@ -73,9 +73,9 @@ public class CatalogTests
         Assert.Equal(0, randomArmor.Arguments["armorStyle"].GetInt32());
         Assert.Equal(0, randomArmor.Arguments["includeMissingDlc"].GetInt32());
         var temporaryArmor = loaded.Presets.Single(preset => preset.Name == "Temporary Armor" && preset.HandlerId == "temporary_armor");
-        Assert.Equal(60, temporaryArmor.Arguments["seconds"].GetInt32());
+        Assert.Equal(120, temporaryArmor.Arguments["seconds"].GetInt32());
         var oversaturate = loaded.Presets.Single(preset => preset.Name == "Oversaturate" && preset.HandlerId == "oversaturate");
-        Assert.Equal(15, oversaturate.Arguments["seconds"].GetInt32());
+        Assert.Equal(30, oversaturate.Arguments["seconds"].GetInt32());
         Assert.Equal(2000, oversaturate.Arguments["percent"].GetInt32());
         var blind = loaded.Presets.Single(preset => preset.Name == "Blind" && preset.HandlerId == "blind");
         Assert.Equal(5, blind.Arguments["seconds"].GetInt32());
@@ -92,16 +92,69 @@ public class CatalogTests
         var shuffle = loaded.Presets.Single(preset => preset.Name == "Shuffle Stats" && preset.HandlerId == "shuffle_stats");
         Assert.Equal(0, shuffle.Arguments["seconds"].GetInt32());
         var freeze = loaded.Presets.Single(preset => preset.Name == "Freeze" && preset.HandlerId == "freeze");
-        Assert.Equal(5, freeze.Arguments["seconds"].GetInt32());
+        Assert.Equal(10, freeze.Arguments["seconds"].GetInt32());
         var pacifist = loaded.Presets.Single(preset => preset.Name == "Pacifist" && preset.HandlerId == "pacifist");
         Assert.Equal(30, pacifist.Arguments["seconds"].GetInt32());
         var bombardier = loaded.Presets.Single(preset => preset.Name == "Bombardier" && preset.HandlerId == "bombardier");
-        Assert.Equal(60, bombardier.Arguments["seconds"].GetInt32());
+        Assert.Equal(120, bombardier.Arguments["seconds"].GetInt32());
         var firestarter = loaded.Presets.Single(preset => preset.Name == "Firestarter" && preset.HandlerId == "firestarter");
-        Assert.Equal(300, firestarter.Arguments["seconds"].GetInt32());
+        Assert.Equal(120, firestarter.Arguments["seconds"].GetInt32());
+        foreach (var handlerId in new[] { "ooga_booga", "big_ooga_booga" })
+        {
+            Assert.Equal(120, loaded.Presets.Single(preset => preset.HandlerId == handlerId).Arguments["seconds"].GetInt32());
+        }
+
+        Assert.Equal(30, loaded.Presets.Single(preset => preset.HandlerId == "mimic_chests").Arguments["seconds"].GetInt32());
         var souls = loaded.Presets.Single(preset => preset.HandlerId == "adjust_souls");
         Assert.Equal(-100, souls.Arguments["delta"].GetInt32());
         Assert.Equal(0, souls.Arguments["scaleWithLevel"].GetInt32());
+        Assert.Equal(Catalog.CurrentDefaultsVersion, loaded.DefaultsVersion);
+    }
+
+    [Fact]
+    public void Presets_load_in_the_shared_order_with_developer_tools_last()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "ds3-cc-tests", Guid.NewGuid().ToString("N"), "catalog.json");
+        var catalog = Catalog.CreateDefault();
+        catalog.Presets.Reverse();
+        CatalogStore.Save(catalog, path);
+
+        var loaded = CatalogStore.LoadOrCreate(path);
+
+        var ranks = loaded.Presets
+            .Select(preset => Catalog.PresetOrder.ToList().IndexOf(preset.HandlerId))
+            .Select(index => index < 0 ? int.MaxValue : index)
+            .ToList();
+        Assert.Equal(ranks.OrderBy(rank => rank), ranks);
+        Assert.Equal("adjust_souls", loaded.Presets[0].HandlerId);
+        var ooga = loaded.Presets.FindIndex(preset => preset.HandlerId == "ooga_booga");
+        Assert.Equal("big_ooga_booga", loaded.Presets[ooga + 1].HandlerId);
+    }
+
+    [Fact]
+    public void Old_default_values_are_brought_up_once_and_changed_values_are_kept()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "ds3-cc-tests", Guid.NewGuid().ToString("N"), "catalog.json");
+        var catalog = Catalog.CreateDefault();
+        catalog.DefaultsVersion = 0;
+        var freeze = catalog.Presets.Single(preset => preset.HandlerId == "freeze");
+        freeze.Arguments["seconds"] = JsonSerializer.SerializeToElement(5);
+        var firestarter = catalog.Presets.Single(preset => preset.HandlerId == "firestarter");
+        firestarter.Arguments["seconds"] = JsonSerializer.SerializeToElement(200);
+        var souls = catalog.Presets.Single(preset => preset.HandlerId == "adjust_souls");
+        souls.Name = "Lose 100 souls";
+        CatalogStore.Save(catalog, path);
+
+        var loaded = CatalogStore.LoadOrCreate(path);
+
+        Assert.Equal(10, loaded.Presets.Single(preset => preset.HandlerId == "freeze").Arguments["seconds"].GetInt32());
+        Assert.Equal(200, loaded.Presets.Single(preset => preset.HandlerId == "firestarter").Arguments["seconds"].GetInt32());
+        Assert.Equal("Add or remove souls", loaded.Presets.Single(preset => preset.HandlerId == "adjust_souls").Name);
+        Assert.Equal(Catalog.CurrentDefaultsVersion, loaded.DefaultsVersion);
+        // Once upgraded, an old value chosen on purpose stays.
+        loaded.Presets.Single(preset => preset.HandlerId == "freeze").Arguments["seconds"] = JsonSerializer.SerializeToElement(5);
+        CatalogStore.Save(loaded, path);
+        Assert.Equal(5, CatalogStore.LoadOrCreate(path).Presets.Single(preset => preset.HandlerId == "freeze").Arguments["seconds"].GetInt32());
     }
 
     [Fact]
@@ -346,7 +399,7 @@ public class QueueTests : IAsyncLifetime
         await WaitUntilAsync(() => _queue.Snapshot().FirstOrDefault()?.State == "paused");
 
         var rows = _queue.Snapshot();
-        Assert.Equal(["Lose 100 souls", "Kill player"], rows.Select(row => row.Name));
+        Assert.Equal(["Add or remove souls", "Kill player"], rows.Select(row => row.Name));
         Assert.Equal(["Viewer", "Test"], rows.Select(row => row.Who));
 
         _queue.Clear();

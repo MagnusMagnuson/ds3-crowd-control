@@ -48,6 +48,10 @@ public sealed class EffectPreset
     public int BitsAmount { get; set; } = 100;
     public bool GiftEnabled { get; set; }
     public int GiftAmount { get; set; } = 1;
+    /// <summary>Shown as a button on the Discord panel.</summary>
+    public bool DiscordEnabled { get; set; }
+    /// <summary>How long everyone waits after someone presses it on Discord. Separate from Twitch's, since pressing is free.</summary>
+    public int DiscordCooldownSeconds { get; set; } = 120;
     public Dictionary<string, JsonElement> Arguments { get; set; } = [];
 }
 
@@ -79,7 +83,7 @@ public static class BuiltinHandlers
             Description = "Adds a signed amount to held souls. Negative values remove souls and the result is clamped at 0.",
             Arguments =
             [
-                new EffectArgumentSchema { Name = "delta", Type = "int", Default = -100, Min = -999_999_999, Max = 999_999_999 },
+                new EffectArgumentSchema { Name = "delta", Type = "int", Default = -100, Min = -999_999_999, Max = 999_999_999, Label = "Souls to add", Hint = "A negative number takes souls away, for example -100." },
                 new EffectArgumentSchema { Name = "scaleWithLevel", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Scale with level", Hint = "Grows with the cost of your next level. The amount is what you lose at level 10, so -100 takes about 1800 souls at level 50 and 7400 at level 100." }
             ]
         },
@@ -123,7 +127,7 @@ public static class BuiltinHandlers
             Id = "no_stamina",
             Name = "No Stamina",
             Description = "Holds stamina empty for the chosen number of seconds, blocking sprinting, rolling and attacks.",
-            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 5, Min = 1, Max = 60 }]
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 10, Min = 1, Max = 60 }]
         },
         new HandlerSchema
         {
@@ -133,7 +137,7 @@ public static class BuiltinHandlers
             Arguments =
             [
                 new EffectArgumentSchema { Name = "percent", Type = "int", Default = 30, Min = 1, Max = 90 },
-                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 1, Max = 300 },
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 10, Min = 1, Max = 300 },
                 new EffectArgumentSchema { Name = "movementOnly", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Movement only (experimental)", Hint = "Only walking, running and rolling change speed. Attacks can still start at the changed speed, because the game reports them a moment late." }
             ]
         },
@@ -145,7 +149,7 @@ public static class BuiltinHandlers
             Arguments =
             [
                 new EffectArgumentSchema { Name = "percent", Type = "int", Default = 30, Min = 1, Max = 300 },
-                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 1, Max = 300 },
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 10, Min = 1, Max = 300 },
                 new EffectArgumentSchema { Name = "movementOnly", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Movement only (experimental)", Hint = "Only walking, running and rolling change speed. Attacks can still start at the changed speed, because the game reports them a moment late." }
             ]
         },
@@ -203,7 +207,7 @@ public static class BuiltinHandlers
             Description = "Swaps all armor slots for a random outfit, then puts your own armor back when the time is up.",
             Arguments =
             [
-                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 60, Min = 1, Max = 600 },
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 120, Min = 1, Max = 600 },
                 new EffectArgumentSchema { Name = "armorStyle", Type = "choice", Default = 0, Min = 0, Max = 2, Label = "Armor style", Hint = "Matching set picks one armor set. If it has no piece for a slot, that slot stays as it is.", Options = ["Random pieces", "Matching set", "Either at random"] },
                 new EffectArgumentSchema { Name = "includeMissingDlc", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Include armor from DLC you do not have (experimental)", Hint = "Weapons from a missing DLC worked in a short test, but armor has not been tried." }
             ]
@@ -213,14 +217,91 @@ public static class BuiltinHandlers
             Id = "bombardier",
             Name = "Bombardier",
             Description = "Takes away all your weapons, dresses you in the Mirrah Chain Set and gives you endless Black Firebombs in a free quick slot, then puts everything back when the time is up.",
-            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 60, Min = 5, Max = 600 }]
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 120, Min = 5, Max = 600 }]
         },
         new HandlerSchema
         {
             Id = "firestarter",
             Name = "Firestarter",
             Description = "Takes away your weapons and gives you a Pyromancy Flame at a random level, the Fire Witch Set and every pyromancy. As many as your slots hold are attuned, without stat requirements. Everything goes back when the time is up.",
-            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 300, Min = 5, Max = 600 }]
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 120, Min = 5, Max = 600 }]
+        },
+        new HandlerSchema
+        {
+            Id = "test_mimic_chests",
+            Name = "Test Mimic chests",
+            Description = "Developer test: spawns three Mimics in a row in front of you, and for 90 seconds logs your animation and that of everything within 6 m, map enemies included.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "spawn", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Spawn the Mimics", Hint = "Off only logs, for example next to a real Mimic while you open it." },
+                new EffectArgumentSchema { Name = "npcId", Type = "int", Default = 212000, Min = 100000, Max = 999999, Label = "NPC id", Hint = "Which Mimic row to spawn. 212000 is the High Wall Mimic." },
+                new EffectArgumentSchema { Name = "thinkId", Type = "int", Default = 0, Min = 0, Max = 99999999, Label = "AI row", Hint = "0 uses the NPC's own AI." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "play_nearest_sequence",
+            Name = "Play nearest animation chain",
+            Description = "Developer test: the character closest to you plays the listed animations one after another.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "animations", Type = "string", DefaultText = "3000, 3004, 4100", Label = "Animation ids", Hint = "Comma-separated, played in this order." },
+                new EffectArgumentSchema { Name = "gapFrames", Type = "int", Default = 45, Min = 21, Max = 600, Label = "Frames between them", Hint = "60 frames are about a second." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "try_vanish_effect",
+            Name = "Try vanish effect",
+            Description = "Developer test: the closest spawned enemy gets the chosen special effect and is removed a moment later.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "effect", Type = "int", Default = 10633, Min = 0, Max = 999999999, Label = "Effect id", Hint = "10633, 10635 and 12030 are transparency effects; 101341000 is Hidden Body; 0 for none." },
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 2, Min = 0, Max = 30, Label = "Seconds until removed" }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "scan_nearest_animations",
+            Name = "Scan nearest animations",
+            Description = "Developer test: tries a list of animation ids on the character closest to you, one every few frames, and logs which ones it really plays. Takes about 30 seconds.",
+            Arguments = []
+        },
+        new HandlerSchema
+        {
+            Id = "force_nearest_animation",
+            Name = "Force nearest animation",
+            Description = "Developer test: the character closest to you, within 6 m, plays the chosen animation.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "animation", Type = "int", Default = 2003010, Min = 0, Max = 99999999, Label = "Animation id" },
+                new EffectArgumentSchema { Name = "playerAnimation", Type = "int", Default = 0, Min = 0, Max = 99999999, Label = "Player animation id", Hint = "Optional. Above 0, you play this one at the same moment." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "mimic_chests",
+            Name = "Mimic Chests",
+            Description = "Three chests appear in front of you. One holds a good weapon or ring, fully upgraded; the other two are Mimics. Open one with the interact button. A wrong pick bites you and the other Mimic wakes up. Attacking a chest, or taking too long, wakes all three and wins nothing.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 10, Max = 600, Label = "Seconds to pick" },
+                new EffectArgumentSchema { Name = "prize", Type = "choice", Default = 0, Min = 0, Max = 2, Label = "Prize", Options = ["Weapon or ring", "Weapon", "Ring"] }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "ooga_booga",
+            Name = "Ooga Booga",
+            Description = "Takes away your weapons and armor and gives you a Club at its highest level, without stat requirements and with War Cry's attack boost, then puts everything back when the time is up.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 120, Min = 5, Max = 600 }]
+        },
+        new HandlerSchema
+        {
+            Id = "big_ooga_booga",
+            Name = "Big Ooga Booga",
+            Description = "Takes away your weapons and armor and gives you a Great Club at its highest level, without stat requirements and with War Cry's attack boost, then puts everything back when the time is up.",
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 120, Min = 5, Max = 600 }]
         },
         new HandlerSchema
         {
@@ -239,7 +320,7 @@ public static class BuiltinHandlers
             Description = "Pushes the colours far past normal for the chosen number of seconds, for a badly over-edited look.",
             Arguments =
             [
-                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 15, Min = 1, Max = 300 },
+                new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 30, Min = 1, Max = 300 },
                 new EffectArgumentSchema { Name = "percent", Type = "int", Default = 2000, Min = 100, Max = 2000 }
             ]
         },
@@ -255,7 +336,7 @@ public static class BuiltinHandlers
             Id = "freeze",
             Name = "Freeze",
             Description = "Freezes the player in place for the chosen number of seconds. The camera still moves.",
-            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 5, Min = 1, Max = 60 }]
+            Arguments = [new EffectArgumentSchema { Name = "seconds", Type = "int", Default = 10, Min = 1, Max = 60 }]
         },
         new HandlerSchema
         {
@@ -293,14 +374,38 @@ public static class BuiltinHandlers
         {
             Id = "spawn_random_enemy",
             Name = "Spawn Random Enemy",
-            Description = "Spawns random enemies near you, from the current map unless Whole game is on.",
+            Description = "Spawns random regular enemies near you, from the current map unless Whole game is on.",
             Arguments =
             [
                 new EffectArgumentSchema { Name = "amount", Type = "int", Default = 1, Min = 1, Max = 10 },
                 new EffectArgumentSchema { Name = "limit", Type = "int", Default = 5, Min = 1, Max = 16, Label = "Enemy limit", Hint = "How many spawned enemies can be active at once. The game itself stops at 16." },
                 new EffectArgumentSchema { Name = "wholeGame", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Whole game (experimental)", Hint = "Picks from every area and gives enemies from elsewhere a random local AI. They may act oddly." },
-                new EffectArgumentSchema { Name = "bosses", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Include bosses", Hint = "Bosses can spawn too. Many rely on map events, so some may act oddly." },
-                new EffectArgumentSchema { Name = "onlyBosses", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Only bosses", Hint = "Spawns nothing but bosses. Without Whole game, only bosses from the current map can appear." },
+                new EffectArgumentSchema { Name = "replaceOldest", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Replace oldest at limit", Hint = "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "spawn_random_boss",
+            Name = "Spawn Random Boss",
+            Description = "Spawns a random boss near you, from the current map unless Whole game is on. Many bosses rely on map events, so some may act oddly.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "amount", Type = "int", Default = 1, Min = 1, Max = 3 },
+                new EffectArgumentSchema { Name = "limit", Type = "int", Default = 5, Min = 1, Max = 16, Label = "Enemy limit", Hint = "How many spawned enemies can be active at once. The game itself stops at 16." },
+                new EffectArgumentSchema { Name = "wholeGame", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Whole game (experimental)", Hint = "Picks from every area and gives enemies from elsewhere a random local AI. They may act oddly." },
+                new EffectArgumentSchema { Name = "replaceOldest", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Replace oldest at limit", Hint = "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot." }
+            ]
+        },
+        new HandlerSchema
+        {
+            Id = "spawn_anything",
+            Name = "Spawn Anything",
+            Description = "Spawns one random thing near you: any enemy or boss, or sometimes an NPC invader.",
+            Arguments =
+            [
+                new EffectArgumentSchema { Name = "invaderChance", Type = "int", Default = 20, Min = 0, Max = 100, Label = "NPC invader chance", Hint = "The chance in percent that an NPC invader comes instead of an enemy. Invaders use the Spawn NPC Invader defaults." },
+                new EffectArgumentSchema { Name = "limit", Type = "int", Default = 5, Min = 1, Max = 16, Label = "Enemy limit", Hint = "How many spawned enemies can be active at once. The game itself stops at 16." },
+                new EffectArgumentSchema { Name = "wholeGame", Type = "bool", Default = 0, Min = 0, Max = 1, Label = "Whole game (experimental)", Hint = "Picks from every area and gives enemies from elsewhere a random local AI. They may act oddly." },
                 new EffectArgumentSchema { Name = "replaceOldest", Type = "bool", Default = 1, Min = 0, Max = 1, Label = "Replace oldest at limit", Hint = "The game allows 16 spawned enemies. Removes the oldest so new ones appear. Off means new ones wait for a free slot." }
             ]
         },
@@ -412,13 +517,116 @@ public static class BuiltinHandlers
 
 public sealed class Catalog
 {
+    public const string SoulsPresetName = "Add or remove souls";
+
+    /// <summary>Which changes of default values this catalog has been through.</summary>
+    public const int CurrentDefaultsVersion = 2;
+
     public List<HandlerSchema> Handlers { get; set; } = BuiltinHandlers.All.Select(Clone).ToList();
     public List<EffectPreset> Presets { get; set; } = [];
+    /// <summary>Saved catalogs from before default values changed have 0 here.</summary>
+    public int DefaultsVersion { get; set; }
+
+    /// <summary>Default values that changed in version 1: handler, argument, old value, new value.</summary>
+    private static readonly (string Handler, string Argument, int Old, int New)[] DefaultChangesV1 =
+    [
+        ("no_stamina", "seconds", 5, 10),
+        ("decrease_speed", "seconds", 30, 10),
+        ("increase_speed", "seconds", 30, 10),
+        ("temporary_armor", "seconds", 60, 120),
+        ("oversaturate", "seconds", 15, 30),
+        ("freeze", "seconds", 5, 10),
+        ("bombardier", "seconds", 60, 120),
+        ("firestarter", "seconds", 300, 120),
+        ("ooga_booga", "seconds", 60, 120),
+        ("big_ooga_booga", "seconds", 60, 120),
+        ("mimic_chests", "seconds", 60, 30),
+    ];
+
+    /// <summary>
+    /// Brings presets saved with old default values up to the new ones, once. A value the
+    /// user changed is left alone, and so are presets they renamed.
+    /// </summary>
+    public bool UpgradeDefaults()
+    {
+        if (DefaultsVersion >= CurrentDefaultsVersion)
+        {
+            return false;
+        }
+
+        foreach (var preset in Presets)
+        {
+            var changes = DefaultsVersion < 1 ? DefaultChangesV1 : [];
+            foreach (var change in changes.Where(change => change.Handler == preset.HandlerId))
+            {
+                if (preset.Arguments.TryGetValue(change.Argument, out var value)
+                    && value.ValueKind == JsonValueKind.Number
+                    && value.TryGetInt32(out var number)
+                    && number == change.Old)
+                {
+                    preset.Arguments[change.Argument] = JsonSerializer.SerializeToElement(change.New);
+                }
+            }
+
+            // The souls preset can give souls as well as take them, so its name says both.
+            if (preset.HandlerId == "adjust_souls" && preset.Name is "Lose 100 souls" or "Lose souls")
+            {
+                preset.Name = SoulsPresetName;
+            }
+        }
+
+        DefaultsVersion = CurrentDefaultsVersion;
+        return true;
+    }
+
+    /// <summary>
+    /// The order presets are listed in everywhere: the manager's pages, the Discord panel and
+    /// the README. Related events sit together. Anything not listed, such as the developer
+    /// tools, comes after, in the order it was added.
+    /// </summary>
+    public static readonly IReadOnlyList<string> PresetOrder =
+    [
+        // Souls and items
+        "adjust_souls", "give_ember", "use_selected_item",
+        // Death
+        "kill_player", "fake_death", "show_you_died",
+        // Health
+        "one_hp", "one_hit_run", "set_health_percent", "set_health_random_percent", "invincible",
+        // Stamina and movement
+        "empty_stamina", "no_stamina", "decrease_speed", "increase_speed", "freeze",
+        // Controls
+        "invert_controls", "pacifist",
+        // Screen
+        "blind", "oversaturate",
+        // Gear and stats
+        "random_weapon", "random_armor", "temporary_armor", "shuffle_stats", "bombardier", "firestarter", "ooga_booga", "big_ooga_booga",
+        // Spawns
+        "spawn_random_enemy", "spawn_random_boss", "spawn_anything", "spawn_npc_invader", "spawn_npc_ally", "mimic_chests",
+    ];
+
+    /// <summary>Puts the presets in <see cref="PresetOrder"/>. Returns whether anything moved.</summary>
+    public bool SortPresets()
+    {
+        int Rank(EffectPreset preset)
+        {
+            var index = PresetOrder.ToList().IndexOf(preset.HandlerId);
+            return index < 0 ? PresetOrder.Count : index;
+        }
+
+        var sorted = Presets.OrderBy(Rank).ToList();
+        if (sorted.SequenceEqual(Presets))
+        {
+            return false;
+        }
+
+        Presets = sorted;
+        return true;
+    }
 
     public static Catalog CreateDefault()
     {
-        var catalog = new Catalog();
-        catalog.Presets.Add(Preset("Lose 100 souls", "adjust_souls", catalog));
+        var catalog = new Catalog { DefaultsVersion = CurrentDefaultsVersion };
+        catalog.Presets.Add(Preset(SoulsPresetName, "adjust_souls", catalog));
         catalog.Presets.Add(Preset("Use selected item", "use_selected_item", catalog));
         catalog.Presets.Add(Preset("Kill player", "kill_player", catalog));
         catalog.Presets.Add(Preset("Fake Death", "fake_death", catalog));
@@ -435,6 +643,9 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Temporary Armor", "temporary_armor", catalog));
         catalog.Presets.Add(Preset("Bombardier", "bombardier", catalog));
         catalog.Presets.Add(Preset("Firestarter", "firestarter", catalog));
+        catalog.Presets.Add(Preset("Ooga Booga", "ooga_booga", catalog));
+        catalog.Presets.Add(Preset("Mimic Chests", "mimic_chests", catalog));
+        catalog.Presets.Add(Preset("Big Ooga Booga", "big_ooga_booga", catalog));
         catalog.Presets.Add(Preset("Shuffle Stats", "shuffle_stats", catalog));
         catalog.Presets.Add(Preset("Oversaturate", "oversaturate", catalog));
         catalog.Presets.Add(Preset("Blind", "blind", catalog));
@@ -444,6 +655,8 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Set health to 50%", "set_health_percent", catalog));
         catalog.Presets.Add(Preset("Set health to random %", "set_health_random_percent", catalog));
         catalog.Presets.Add(Preset("Spawn Random Enemy", "spawn_random_enemy", catalog));
+        catalog.Presets.Add(Preset("Spawn Random Boss", "spawn_random_boss", catalog));
+        catalog.Presets.Add(Preset("Spawn Anything", "spawn_anything", catalog));
         catalog.Presets.Add(Preset("Spawn NPC Invader", "spawn_npc_invader", catalog));
         catalog.Presets.Add(Preset("Spawn NPC Ally", "spawn_npc_ally", catalog));
         catalog.Presets.Add(Preset("Dump player data", "dump_player_data", catalog));
@@ -454,6 +667,7 @@ public sealed class Catalog
         catalog.Presets.Add(Preset("Toggle performance measuring", "toggle_performance", catalog));
         catalog.Presets.Add(Preset("Performance report", "performance_report", catalog));
         catalog.Presets.Add(Preset("Watch item button", "watch_item_button", catalog));
+        catalog.SortPresets();
         return catalog;
     }
 
@@ -547,6 +761,12 @@ public static class CatalogStore
         var loaded = JsonSerializer.Deserialize<Catalog>(json, Json) ?? Catalog.CreateDefault();
         // A saved schema can be older than this build, and the game may not be running yet.
         loaded.ReplaceHandlers(BuiltinHandlers.All);
+        var upgraded = loaded.UpgradeDefaults();
+        if (loaded.SortPresets() | upgraded)
+        {
+            Save(loaded, path);
+        }
+
         return loaded;
     }
 

@@ -12,6 +12,12 @@ public sealed class ManagerSettings
     public bool ShowDevTools { get; set; }
     public bool SyncTriggers { get; set; }
     public string RewardPrefix { get; set; } = "";
+    /// <summary>The channel the Discord panel is in.</summary>
+    public string DiscordChannelId { get; set; } = "";
+    /// <summary>How long one Discord viewer waits after pressing any button.</summary>
+    public int DiscordViewerCooldownSeconds { get; set; } = 60;
+    /// <summary>The panel's messages, so it is edited in place instead of posted again.</summary>
+    public List<string> DiscordPanelMessageIds { get; set; } = [];
 }
 
 public static class ManagerSettingsStore

@@ -49,7 +49,7 @@ public partial class ArgumentEditor : ObservableObject
     private string _value;
 }
 
-/// <summary>One row on the Events page. Changes reach the preset straight away.</summary>
+/// <summary>One row in the Twitch page's table. Changes reach the preset straight away.</summary>
 public partial class EventToggle : ObservableObject
 {
     public const string RedeemKind = "redeem";
@@ -211,7 +211,7 @@ public partial class EventToggle : ObservableObject
 public partial class MainViewModel : ObservableObject
 {
     /// <summary>Tools for working on the mod, shown on the Presets page only when asked for.</summary>
-    private static readonly HashSet<string> DiagnosticHandlers = ["dump_player_data", "dump_phantoms", "toggle_invincible", "toggle_invisible", "watch_item_button", "toggle_performance", "performance_report"];
+    private static readonly HashSet<string> DiagnosticHandlers = ["dump_player_data", "dump_phantoms", "toggle_invincible", "toggle_invisible", "watch_item_button", "toggle_performance", "performance_report", "test_mimic_chests", "force_nearest_animation", "scan_nearest_animations", "play_nearest_sequence", "try_vanish_effect"];
 
     private readonly SynchronizationContext _ui;
     private readonly Catalog _catalog;
@@ -269,6 +269,7 @@ public partial class MainViewModel : ObservableObject
             LogFromTwitch);
         _twitch.StatusChanged += status => Post(() => ApplyTwitchStatus(status));
         _twitch.RewardsChanged += () => Post(() => CatalogStore.Save(_catalog));
+        InitDiscord();
         RebuildPresets();
         RebuildEvents();
         _bridge.Logged += message => Post(() => AddLog(message));
@@ -299,8 +300,13 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("Temporary Armor", "temporary_armor"),
                 _catalog.EnsurePreset("Bombardier", "bombardier"),
                 _catalog.EnsurePreset("Firestarter", "firestarter"),
+                _catalog.EnsurePreset("Ooga Booga", "ooga_booga"),
+                _catalog.EnsurePreset("Mimic Chests", "mimic_chests"),
+                _catalog.EnsurePreset("Big Ooga Booga", "big_ooga_booga"),
                 _catalog.EnsurePreset("Shuffle Stats", "shuffle_stats"),
                 _catalog.EnsurePreset("Spawn Random Enemy", "spawn_random_enemy"),
+                _catalog.EnsurePreset("Spawn Random Boss", "spawn_random_boss"),
+                _catalog.EnsurePreset("Spawn Anything", "spawn_anything"),
                 _catalog.EnsurePreset("Spawn NPC Invader", "spawn_npc_invader"),
                 _catalog.EnsurePreset("Spawn NPC Ally", "spawn_npc_ally"),
                 _catalog.EnsurePreset("Oversaturate", "oversaturate"),
@@ -316,6 +322,11 @@ public partial class MainViewModel : ObservableObject
                 _catalog.EnsurePreset("Toggle performance measuring", "toggle_performance"),
                 _catalog.EnsurePreset("Performance report", "performance_report"),
                 _catalog.EnsurePreset("Dump phantoms", "dump_phantoms"),
+                _catalog.EnsurePreset("Test Mimic chests", "test_mimic_chests"),
+                _catalog.EnsurePreset("Force nearest animation", "force_nearest_animation"),
+                _catalog.EnsurePreset("Scan nearest animations", "scan_nearest_animations"),
+                _catalog.EnsurePreset("Play nearest animation chain", "play_nearest_sequence"),
+                _catalog.EnsurePreset("Try vanish effect", "try_vanish_effect"),
                 _catalog.EnsurePreset("Watch item button", "watch_item_button")
             }.Where(preset => preset is not null).Cast<EffectPreset>().ToList();
             if (!handlersChanged && added.Count == 0 && removed.Count == 0)
@@ -323,9 +334,12 @@ public partial class MainViewModel : ObservableObject
                 return;
             }
 
+            _catalog.SortPresets();
             CatalogStore.Save(_catalog);
             RebuildPresets();
             RebuildEvents();
+            RebuildDiscordEvents();
+            RequestDiscordPanel();
             LoadEditor();
         });
         _ = StartAsync();
@@ -431,6 +445,7 @@ public partial class MainViewModel : ObservableObject
         _settings.EffectsPaused = value;
         _queue.Paused = value;
         _twitchSource.Paused = value;
+        _discordSource.Paused = value;
         SaveSettings();
         _twitch.RequestSync();
         ApplyState();
@@ -474,7 +489,7 @@ public partial class MainViewModel : ObservableObject
     }
 
     public string RewardPrefixExample =>
-        $"On Twitch: \"{TwitchTriggerSource.RewardTitle(RewardPrefix, "Fake Death")}\"";
+        $"Example: the Fake Death redeem is named \"{TwitchTriggerSource.RewardTitle(RewardPrefix, "Fake Death")}\" on Twitch";
 
     partial void OnWaitingLimitChanged(int value)
     {
@@ -486,6 +501,7 @@ public partial class MainViewModel : ObservableObject
 
         _settings.WaitingLimit = value;
         _twitchSource.WaitingLimit = value;
+        _discordSource.WaitingLimit = value;
         SaveSettings();
     }
 
@@ -706,6 +722,7 @@ public partial class MainViewModel : ObservableObject
             $"mod build: {Stamp(DllPath)}",
             $"game: {Status}",
             $"twitch: {TwitchStatus}",
+            $"discord: {DiscordStatus}, channel set {DiscordChannelId.Length > 0}, panel messages {_settings.DiscordPanelMessageIds.Count}",
             $"effects paused: {EffectsPaused}, gap {GapSeconds} s, waiting limit {WaitingLimit}");
     }
 

@@ -91,6 +91,11 @@ static LEARNED_BUTTON: AtomicU32 = AtomicU32::new(0x4000);
 static FRAME: AtomicU32 = AtomicU32::new(0);
 static TRACE: Mutex<Option<Trace>> = Mutex::new(None);
 
+/// The buttons held on the controller at its last reading, as the controller reports them.
+pub fn controller_buttons() -> u16 {
+    LAST_BUTTONS.load(Ordering::Acquire) as u16
+}
+
 pub fn prepare() {
     if let Ok(button) = load_learned_button() {
         LEARNED_BUTTON.store(button as u32, Ordering::Release);

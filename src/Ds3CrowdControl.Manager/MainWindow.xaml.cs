@@ -9,6 +9,15 @@ public partial class MainWindow : Window
         InitializeComponent();
         var viewModel = new MainViewModel();
         DataContext = viewModel;
-        Closing += (_, _) => viewModel.PauseTwitchRewards();
+        Closing += (_, _) =>
+        {
+            viewModel.PauseTwitchRewards();
+            viewModel.SetDiscordOffline();
+        };
+        SaveDiscordTokenButton.Click += (_, _) =>
+        {
+            viewModel.SaveDiscordToken(DiscordTokenBox.Password);
+            DiscordTokenBox.Clear();
+        };
     }
 }
