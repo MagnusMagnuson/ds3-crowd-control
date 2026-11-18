@@ -1,7 +1,5 @@
 # DS3 Viewer Control
 
-Formerly called DS3 Crowd Control. It is not related to Crowd Control by Warp World.
-
 Lets Twitch chat and Discord viewers mess with an offline game of Dark Souls III. On Twitch, viewers trigger events with channel point redeems, Bits or gift subs; on Discord, with a panel of buttons in a channel. The streamer can also fire any event by hand.
 
 It has two parts: a Windows manager app where you set everything up, and `ds3mod.dll`, which the manager loads into the game to carry out the events. Events only run in an offline session with a character loaded. There is no online play and no anti-cheat bypass.
