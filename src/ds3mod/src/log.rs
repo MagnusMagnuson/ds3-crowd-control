@@ -31,7 +31,7 @@ pub fn init() {
 
 pub fn app_dir() -> Result<PathBuf, String> {
     let appdata = std::env::var("APPDATA").map_err(|_| "APPDATA is not set".to_string())?;
-    Ok(PathBuf::from(appdata).join("Ds3CrowdControl"))
+    Ok(PathBuf::from(appdata).join("Ds3ViewerControl"))
 }
 
 pub fn log(message: impl AsRef<str>) {

@@ -29,7 +29,7 @@ static COMMANDS: OnceLock<crossbeam_channel::Receiver<Command>> = OnceLock::new(
 pub extern "system" fn DllMain(_module: *mut std::ffi::c_void, reason: u32, _: *mut std::ffi::c_void) -> i32 {
     if reason == 1 {
         unsafe {
-            let mutex = match CreateMutexW(None, true, w!("Local\\Ds3CrowdControlMod")) {
+            let mutex = match CreateMutexW(None, true, w!("Local\\Ds3ViewerControlMod")) {
                 Ok(handle) => handle,
                 Err(_) => return 1,
             };

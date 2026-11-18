@@ -1,4 +1,6 @@
-# DS3 Crowd Control
+# DS3 Viewer Control
+
+Formerly called DS3 Crowd Control. It is not related to Crowd Control by Warp World.
 
 Lets Twitch chat and Discord viewers mess with an offline game of Dark Souls III. On Twitch, viewers trigger events with channel point redeems, Bits or gift subs; on Discord, with a panel of buttons in a channel. The streamer can also fire any event by hand.
 
@@ -6,14 +8,14 @@ It has two parts: a Windows manager app where you set everything up, and `ds3mod
 
 Written with AI: the code was written by Claude (Anthropic) working with the author, with some earlier work by Grok (xAI).
 
-> **Not yet tested on a real Affiliate or Partner channel.** The Twitch part has only been tested with the [Twitch CLI](https://dev.twitch.tv/docs/cli/)'s fake events, because creating channel point redeems needs an Affiliate or Partner channel. If you use it on one, please [report any problems](https://github.com/MagnusMagnuson/ds3-crowd-control/issues) you run into.
+> **Not yet tested on a real Affiliate or Partner channel.** The Twitch part has only been tested with the [Twitch CLI](https://dev.twitch.tv/docs/cli/)'s fake events, because creating channel point redeems needs an Affiliate or Partner channel. If you use it on one, please [report any problems](https://github.com/MagnusMagnuson/ds3-viewer-control/issues) you run into.
 
 ## Setup
 
 You need 64-bit Windows 10 or 11 and the Steam version of [Dark Souls III](https://store.steampowered.com/app/374320/DARK_SOULS_III/), updated to 1.15.2. Nothing else has to be installed: the download includes everything it needs, including .NET.
 
-1. Download `ds3-crowd-control-v<version>.zip` from the [Releases page](https://github.com/MagnusMagnuson/ds3-crowd-control/releases) and unzip it into its own folder.
-2. Start `Ds3CrowdControl.Manager.exe`. Keep `ds3mod.dll` in the same folder.
+1. Download `ds3-viewer-control-v<version>.zip` from the [Releases page](https://github.com/MagnusMagnuson/ds3-viewer-control/releases) and unzip it into its own folder.
+2. Start `Ds3ViewerControl.Manager.exe`. Keep `ds3mod.dll` in the same folder.
 3. Launch Dark Souls III and choose to play offline.
 4. Load a character, then press **Attach to Dark Souls III** on the General page.
 
@@ -22,7 +24,7 @@ Two warnings you may see, because the app is not signed and loads a DLL into the
 - Windows SmartScreen may say "Windows protected your PC". Click **More info**, then **Run anyway**.
 - Some antivirus programs flag tools that load a DLL into another program. If yours removes `ds3mod.dll` or blocks the manager, allow the folder.
 
-Settings, logs, the Twitch sign-in and the Discord bot token are kept in `%AppData%\Ds3CrowdControl`, so a new version can go in a new folder.
+Settings, logs, the Twitch sign-in and the Discord bot token are kept in `%AppData%\Ds3ViewerControl`, so a new version can go in a new folder.
 
 ### Building it yourself
 
@@ -34,7 +36,7 @@ This is only needed to change the code. You need:
 
 The first build downloads its packages, so it needs an internet connection.
 
-- `dotnet build Ds3CrowdControl.sln` builds the manager and `ds3mod.dll` into `src/Ds3CrowdControl.Manager/bin`.
+- `dotnet build Ds3ViewerControl.sln` builds the manager and `ds3mod.dll` into `src/Ds3ViewerControl.Manager/bin`.
 - `powershell -ExecutionPolicy Bypass -File scripts\package.ps1 -Version 0.1.0` builds the release zip in `dist`.
 
 ## Events
@@ -61,6 +63,8 @@ Each event can be fired with **Test** on the Presets page, or by Twitch and the 
 | Pacifist | No attacking, blocking or using items for a while. Use selected item still works. Needs a controller. |
 | Blind | Fades to black for a few seconds. |
 | Oversaturate | Pushes the colours far too high for a while. |
+| Unequip Weapon | Takes the weapon you are holding out of your hand. It stays in your inventory. |
+| Delete Weapon | Deletes the weapon you are holding for good. A gear snapshot on the General page can bring it back. |
 | Random Weapon | Gives and equips a random weapon in the right hand. |
 | Random Armor | Gives and equips a random piece in every armor slot. |
 | Temporary Armor | A random outfit for a while, then your own armor comes back. |
@@ -95,7 +99,7 @@ The log and the queue stay at the bottom of every page. The queue shows who trig
 
 Channel points, Bits and gift subs need an Affiliate or Partner channel, signed in as the broadcaster. On the Twitch page, press **Connect Twitch** and approve the code in the browser, then turn triggers on in the table below it.
 
-This has not been tested on a real Affiliate or Partner channel yet, only with the Twitch CLI's fake events (see below). Creating, changing and hiding redeems and refunding them are the parts most likely to need a fix, so please [report any problems](https://github.com/MagnusMagnuson/ds3-crowd-control/issues).
+This has not been tested on a real Affiliate or Partner channel yet, only with the Twitch CLI's fake events (see below). Creating, changing and hiding redeems and refunding them are the parts most likely to need a fix, so please [report any problems](https://github.com/MagnusMagnuson/ds3-viewer-control/issues).
 
 - **Redeem:** the manager creates its own channel point redeems on the channel, using the event name and the cost and cooldown from the Twitch page. The cooldown only limits redeems: Bits, gift subs and Test always run, since Twitch cannot refund Bits or gift subs. Twitch does not allow two redeems with the same name, so if another tool already has one called Blind or Freeze, set a **Redeem name prefix** on the Twitch page, such as `DS3: `. It goes in front of every redeem name, and changing it renames the redeems already made. Turning one off hides it on Twitch and never deletes it, so a custom icon stays. Redeems that fail are refunded, and so are redeems past the waiting limit. All redeems are hidden while the manager is closed.
 - **Bits:** a cheer of exactly the set amount runs the event. Power-ups count too.
@@ -135,11 +139,11 @@ Viewers on a Discord server press buttons in a channel to trigger events. Pressi
 
 Pressing a button also opens the viewer's own panel: a message in the same channel that only they can see. It says what happened with their last press, such as "Blind is queued" and then "Blind ran", and has all the buttons again, grey while their own cooldown or the event's runs, with countdowns. Pressing a button there changes that same message, so each viewer has one personal panel at a time, and the buttons come back by themselves when a cooldown ends. With more than 25 events it has pages. Discord only lets a bot change such a message for 15 minutes after the last press, so the bot removes a personal panel after 14 minutes without a press; pressing on the public panel opens a fresh one.
 
-> **Only tested on a small test server so far**, not yet during a stream with many viewers. If you use it, please [report any problems](https://github.com/MagnusMagnuson/ds3-crowd-control/issues).
+> **Only tested on a small test server so far**, not yet during a stream with many viewers. If you use it, please [report any problems](https://github.com/MagnusMagnuson/ds3-viewer-control/issues).
 
 Each streamer uses a bot of their own, which takes a few minutes to set up once:
 
-1. Open the [Discord Developer Portal](https://discord.com/developers/applications). The first time, Discord asks what brings you there: choose **Build a Bot**, then **Continue to Portal**. Create a new application (the button says **New Application** or **Create**) and give it a name, such as `DS3 Crowd Control`. On the General Information page that follows, nothing has to be filled in. Leave **Interactions Endpoint URL** empty: with an address there, Discord sends button presses to that address instead of to the manager.
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications). The first time, Discord asks what brings you there: choose **Build a Bot**, then **Continue to Portal**. Create a new application (the button says **New Application** or **Create**) and give it a name, such as `DS3 Viewer Control`. On the General Information page that follows, nothing has to be filled in. Leave **Interactions Endpoint URL** empty: with an address there, Discord sends button presses to that address instead of to the manager.
 2. On the **Bot** page, choose **Reset Token** and copy the token. It is shown only once. While there, you can turn off **Public Bot**, so only you can add it to servers.
 3. On the **OAuth2** page, open the **URL Generator**, tick the scope `bot` and the permissions **View Channels** and **Send Messages**, then open the link it makes and pick your server. Adding a bot needs the Manage Server permission on that server.
 4. In the manager, on the Discord page, paste the token and press **Save token**. The manager connects and stays connected whenever it runs.
@@ -159,13 +163,13 @@ After that, the panel follows your changes by itself. A message holds up to 25 b
 
 The mod saves your equipped weapons and armor every 5 minutes, taking turns between two snapshots, and skips it while a temporary swap is active. If gear ends up wrong, press **Restore** next to a snapshot on the General page. It puts that gear back on and gives back any piece that is no longer in the inventory, at the same upgrade level. A snapshot only restores onto the character it was taken from.
 
-Press **Save logs for support** at the bottom of the General page. It saves `ds3-crowd-control-logs-<date>.zip` to the Desktop and opens the folder, ready to send. It holds the logs and your events and settings, with your Windows user name and PC name taken out, since many people use their real name for them. It never holds your Twitch sign-in. If the game crashed, tick **Include the game's crash dump** first to add the newest Dark Souls III crash dump from the last week. A crash dump is a copy of the game's memory and can contain your Windows user name and things like your Steam account name, so it is left out unless you tick it.
+Press **Save logs for support** at the bottom of the General page. It saves `ds3-viewer-control-logs-<date>.zip` to the Desktop and opens the folder, ready to send. It holds the logs and your events and settings, with your Windows user name and PC name taken out, since many people use their real name for them. It never holds your Twitch sign-in. If the game crashed, tick **Include the game's crash dump** first to add the newest Dark Souls III crash dump from the last week. A crash dump is a copy of the game's memory and can contain your Windows user name and things like your Steam account name, so it is left out unless you tick it.
 
 Temporary Armor, Bombardier and a timed Shuffle Stats survive a crash or a quit. Attach the mod again and load the same character, and your own gear or stats come back. A stat shuffle is not undone if you levelled up in the meantime, so no levels are lost.
 
 ### Reporting a problem
 
-Open an issue on the [Issues page](https://github.com/MagnusMagnuson/ds3-crowd-control/issues) and say what you did, what you expected and what happened instead. Attach the zip from **Save logs for support**. You need a free GitHub account to open an issue.
+Open an issue on the [Issues page](https://github.com/MagnusMagnuson/ds3-viewer-control/issues) and say what you did, what you expected and what happened instead. Attach the zip from **Save logs for support**. You need a free GitHub account to open an issue.
 
 ## Credits
 

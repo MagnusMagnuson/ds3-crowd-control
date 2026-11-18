@@ -1,0 +1,304 @@
+<Window x:Class="Ds3ViewerControl.Manager.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="DS3 Viewer Control"
+        Height="780"
+        Width="1080"
+        Background="#1E1E1E"
+        Foreground="#F3F3F3">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="#F3F3F3" />
+        </Style>
+        <Style TargetType="TabItem">
+            <Setter Property="Foreground" Value="#D4D4D4" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TabItem">
+                        <Border x:Name="Tab" Background="#252526" BorderBrush="#3F3F46" BorderThickness="1,1,1,0" Padding="18,7" Margin="0,0,4,0">
+                            <ContentPresenter ContentSource="Header" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Tab" Property="Background" Value="#3F3F46" />
+                                <Setter Property="Foreground" Value="#FFFFFF" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="200" />
+        </Grid.RowDefinitions>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="360" />
+        </Grid.ColumnDefinitions>
+
+        <TextBlock Grid.ColumnSpan="2" Text="{Binding Status}" TextWrapping="Wrap" FontSize="16" Margin="0,0,0,12" />
+
+        <TabControl Grid.Row="1" Grid.ColumnSpan="2" Background="#1E1E1E" BorderBrush="#3F3F46" Padding="12">
+            <TabItem Header="General">
+                <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel MaxWidth="640" HorizontalAlignment="Left" Width="640">
+                        <TextBlock Text="Game" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
+                            <Button Content="Launch Dark Souls III" Command="{Binding LaunchGameCommand}" Padding="12,6" Margin="0,0,8,0" />
+                            <Button Content="Attach to Dark Souls III" Command="{Binding AttachCommand}" Padding="12,6" />
+                        </StackPanel>
+
+                        <TextBlock Text="Effects" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <CheckBox Content="Pause all effects" IsChecked="{Binding EffectsPaused}" />
+                        <TextBlock Text="Waiting effects stay in the queue and run when you turn this off. Twitch redeems are hidden from viewers until then, and Discord buttons answer that effects are paused." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,12" Foreground="#F3F3F3" />
+                        <TextBlock Text="Gap between effects (seconds)" Foreground="#F3F3F3" />
+                        <TextBox Text="{Binding GapSeconds, UpdateSourceTrigger=PropertyChanged}" Width="100" HorizontalAlignment="Left" Margin="0,4,0,0" />
+                        <TextBlock Text="The shortest time from one effect starting to the next. Effects wait their turn, and Test skips this. 0 means no gap." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,12" Foreground="#F3F3F3" />
+                        <TextBlock Text="Waiting effects limit" Foreground="#F3F3F3" />
+                        <TextBox Text="{Binding WaitingLimit, UpdateSourceTrigger=PropertyChanged}" Width="100" HorizontalAlignment="Left" Margin="0,4,0,0" />
+                        <TextBlock Text="Twitch redeems past this many waiting are refunded, and Discord presses are turned away. 0 means no limit." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
+
+                        <TextBlock Text="Gear snapshots" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <TextBlock Text="Your equipped weapons and armor are saved every 5 minutes, taking turns between two slots. Restore puts that gear back on, and gives back any piece that is gone. Snapshots wait while a temporary swap is active." TextWrapping="Wrap" Opacity="0.75" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <TextBlock Text="No snapshot yet. The first is taken once a character is loaded." Opacity="0.75" Foreground="#F3F3F3"
+                                   Visibility="{Binding NoGearSnapshots, Converter={StaticResource BoolToVisibility}}" />
+                        <ItemsControl ItemsSource="{Binding GearSnapshots}" Margin="0,0,0,16">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal" Margin="0,0,0,6">
+                                        <Button Content="Restore" Padding="10,3" Margin="0,0,10,0"
+                                                Command="{Binding DataContext.RestoreGearCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                                CommandParameter="{Binding}" />
+                                        <TextBlock Text="{Binding Description}" VerticalAlignment="Center" Foreground="#F3F3F3" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+
+                        <TextBlock Text="Help" FontSize="18" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <Button Content="Save logs for support" Command="{Binding SaveSupportLogsCommand}" Padding="12,6" HorizontalAlignment="Left" />
+                        <TextBlock Text="Saves a zip to your Desktop with the logs and settings needed to look into a problem. It never contains your Twitch sign-in, and your Windows user name and PC name are taken out." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,8" Foreground="#F3F3F3" />
+                        <CheckBox Content="Include the game's crash dump" IsChecked="{Binding IncludeCrashDump}" />
+                        <TextBlock Text="Only tick this if the game crashed. The dump is a copy of the game's memory from the last crash in the past 7 days, and can contain your Windows user name and things like your Steam account name." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,16" Foreground="#F3F3F3" />
+
+                        <CheckBox Content="Show developer tools" IsChecked="{Binding ShowDevTools}"
+                                  ToolTip="Adds the testing effects to the Presets page: Toggle invincibility, Toggle invisibility, Toggle performance measuring, Performance report, Dump phantoms, Dump player data and Watch item button." />
+                        <CheckBox Content="Focus game for item test" IsChecked="{Binding FocusGameForItemTest}" Margin="0,8,0,0"
+                                  Visibility="{Binding ShowDevTools, Converter={StaticResource BoolToVisibility}}"
+                                  ToolTip="When enabled, testing Use selected item brings Dark Souls III to the foreground so it polls the synthetic controller press." />
+                    </StackPanel>
+                </ScrollViewer>
+            </TabItem>
+
+            <TabItem Header="Twitch">
+                <DockPanel>
+                    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12" MaxWidth="640" HorizontalAlignment="Left" Width="640">
+                        <TextBlock Text="{Binding TwitchStatus}" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <Button Content="{Binding TwitchButtonText}" Command="{Binding ToggleTwitchCommand}" Padding="12,6" HorizontalAlignment="Left" Margin="0,0,0,12" />
+                        <TextBlock Text="Redeem name prefix" Foreground="#F3F3F3" />
+                        <TextBox Text="{Binding RewardPrefix, UpdateSourceTrigger=PropertyChanged}" Width="200" HorizontalAlignment="Left" Margin="0,4,0,0" />
+                        <TextBlock Text="{Binding RewardPrefixExample}" Opacity="0.75" Margin="0,4,0,0" Foreground="#F3F3F3" />
+                        <TextBlock Text="Goes in front of every redeem name, for example &quot;DS3: &quot;. Twitch does not allow two redeems with the same name, so use this if another tool already has a redeem called Blind or Freeze. Changing it renames the redeems already made. Twitch names are cut at 45 characters." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,12" Foreground="#F3F3F3" />
+                        <CheckBox Content="Use Twitch CLI test server" IsChecked="{Binding UseTwitchTestServer}" Margin="0,0,0,12"
+                                  Visibility="{Binding ShowDevTools, Converter={StaticResource BoolToVisibility}}"
+                                  ToolTip="Listens to twitch event websocket start-server on this PC instead of Twitch. Not saved, so it is off the next time the manager starts." />
+                        <CheckBox Content="Sync Redeem, Bits and Gift subs" IsChecked="{Binding SyncTriggers}" />
+                        <TextBlock Text="While ticked, a switch turns all three on or off for that event, and All on and All off change all three columns." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,0" Foreground="#F3F3F3" />
+                    </StackPanel>
+                    <Grid DockPanel.Dock="Top" Margin="0,0,0,8" TextElement.Foreground="#F3F3F3">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="260" />
+                            <ColumnDefinition Width="170" />
+                            <ColumnDefinition Width="130" />
+                            <ColumnDefinition Width="170" />
+                            <ColumnDefinition Width="170" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Event" VerticalAlignment="Top" />
+                        <StackPanel Grid.Column="1">
+                            <TextBlock Text="Redeem (points)" Margin="0,0,0,4" />
+                            <StackPanel Orientation="Horizontal">
+                                <Button Content="All on" Command="{Binding AllOnCommand}" CommandParameter="redeem" Padding="8,2" Margin="0,0,6,0" />
+                                <Button Content="All off" Command="{Binding AllOffCommand}" CommandParameter="redeem" Padding="8,2" />
+                            </StackPanel>
+                        </StackPanel>
+                        <TextBlock Grid.Column="2" Text="Cooldown (seconds)" VerticalAlignment="Top" ToolTip="How long viewers wait before they can redeem it again. Bits, gift subs and Test ignore it." />
+                        <StackPanel Grid.Column="3">
+                            <TextBlock Text="Bits (exact amount)" Margin="0,0,0,4" />
+                            <StackPanel Orientation="Horizontal">
+                                <Button Content="All on" Command="{Binding AllOnCommand}" CommandParameter="bits" Padding="8,2" Margin="0,0,6,0" />
+                                <Button Content="All off" Command="{Binding AllOffCommand}" CommandParameter="bits" Padding="8,2" />
+                            </StackPanel>
+                        </StackPanel>
+                        <StackPanel Grid.Column="4">
+                            <TextBlock Text="Gift subs (exact count)" Margin="0,0,0,4" />
+                            <StackPanel Orientation="Horizontal">
+                                <Button Content="All on" Command="{Binding AllOnCommand}" CommandParameter="gift" Padding="8,2" Margin="0,0,6,0" />
+                                <Button Content="All off" Command="{Binding AllOffCommand}" CommandParameter="gift" Padding="8,2" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Grid>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <ItemsControl ItemsSource="{Binding Events}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="260" />
+                                            <ColumnDefinition Width="170" />
+                                            <ColumnDefinition Width="130" />
+                                            <ColumnDefinition Width="170" />
+                                            <ColumnDefinition Width="170" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="{Binding Name}" VerticalAlignment="Center" Foreground="#F3F3F3" />
+                                        <StackPanel Grid.Column="1" Orientation="Horizontal">
+                                            <CheckBox IsChecked="{Binding Redeem}" VerticalAlignment="Center" Margin="0,0,10,0" />
+                                            <TextBox Text="{Binding Cost, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding Redeem}" Width="90" />
+                                        </StackPanel>
+                                        <TextBox Grid.Column="2" Text="{Binding Cooldown, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding Redeem}" Width="90" HorizontalAlignment="Left" />
+                                        <StackPanel Grid.Column="3" Orientation="Horizontal">
+                                            <CheckBox IsChecked="{Binding Bits}" VerticalAlignment="Center" Margin="0,0,10,0" />
+                                            <TextBox Text="{Binding BitsAmount, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding Bits}" Width="90" />
+                                        </StackPanel>
+                                        <StackPanel Grid.Column="4" Orientation="Horizontal">
+                                            <CheckBox IsChecked="{Binding Gift}" VerticalAlignment="Center" Margin="0,0,10,0" />
+                                            <TextBox Text="{Binding GiftAmount, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding Gift}" Width="90" />
+                                        </StackPanel>
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </DockPanel>
+            </TabItem>
+
+            <TabItem Header="Discord">
+                <DockPanel>
+                    <StackPanel DockPanel.Dock="Top" Margin="0,0,0,12" MaxWidth="640" HorizontalAlignment="Left" Width="640">
+                        <TextBlock Text="{Binding DiscordStatus}" Margin="0,0,0,8" Foreground="#F3F3F3" />
+                        <TextBlock Text="Bot token" Foreground="#F3F3F3" />
+                        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+                            <PasswordBox x:Name="DiscordTokenBox" Width="320" Margin="0,0,8,0" />
+                            <Button x:Name="SaveDiscordTokenButton" Content="Save token" Padding="10,3" Margin="0,0,8,0" />
+                            <Button Content="Remove token" Command="{Binding ForgetDiscordTokenCommand}" Padding="10,3" />
+                        </StackPanel>
+                        <TextBlock Text="{Binding DiscordTokenState}" Opacity="0.75" Margin="0,4,0,0" Foreground="#F3F3F3" />
+                        <TextBlock Text="From your own bot in the Discord Developer Portal (Bot, Reset Token). It is stored encrypted for your Windows user and never goes into the support logs. The README explains how to make the bot and invite it to your server." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,12" Foreground="#F3F3F3" />
+                        <Button Content="{Binding DiscordButtonText}" Command="{Binding ToggleDiscordCommand}" Padding="12,6" HorizontalAlignment="Left" Margin="0,0,0,12" />
+                        <TextBlock Text="Panel channel id" Foreground="#F3F3F3" />
+                        <TextBox Text="{Binding DiscordChannelId, UpdateSourceTrigger=PropertyChanged}" Width="220" HorizontalAlignment="Left" Margin="0,4,0,0" />
+                        <TextBlock Text="In Discord, turn on Developer Mode (Settings, Advanced), then right-click the channel and choose Copy Channel ID." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,12" Foreground="#F3F3F3" />
+                        <TextBlock Text="Cooldown per viewer (seconds)" Foreground="#F3F3F3" />
+                        <TextBox Text="{Binding DiscordViewerCooldown, UpdateSourceTrigger=PropertyChanged}" Width="100" HorizontalAlignment="Left" Margin="0,4,0,0" />
+                        <TextBlock Text="After pressing any button, a viewer waits this long before they can press another. Each event also has its own cooldown below, shared by everyone. A press that fails gives both back." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,12" Foreground="#F3F3F3" />
+                        <Button Content="Post or update panel" Command="{Binding PostDiscordPanelCommand}" Padding="12,6" HorizontalAlignment="Left" />
+                        <TextBlock Text="Writes the buttons into the channel. After that, the panel follows changes in the table below by itself, and its buttons turn grey while the manager is closed." TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,0" Foreground="#F3F3F3" />
+                    </StackPanel>
+                    <Grid DockPanel.Dock="Top" Margin="0,0,0,8" TextElement.Foreground="#F3F3F3">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="260" />
+                            <ColumnDefinition Width="170" />
+                            <ColumnDefinition Width="170" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Text="Event" VerticalAlignment="Top" />
+                        <StackPanel Grid.Column="1">
+                            <TextBlock Text="On the panel" Margin="0,0,0,4" />
+                            <StackPanel Orientation="Horizontal">
+                                <Button Content="All on" Command="{Binding DiscordAllOnCommand}" Padding="8,2" Margin="0,0,6,0" />
+                                <Button Content="All off" Command="{Binding DiscordAllOffCommand}" Padding="8,2" />
+                            </StackPanel>
+                        </StackPanel>
+                        <TextBlock Grid.Column="2" Text="Cooldown (seconds)" VerticalAlignment="Top" ToolTip="How long everyone waits after someone presses it on Discord. Separate from the Twitch cooldown." />
+                    </Grid>
+                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                        <ItemsControl ItemsSource="{Binding DiscordEvents}">
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <Grid Margin="0,0,0,6">
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="260" />
+                                            <ColumnDefinition Width="170" />
+                                            <ColumnDefinition Width="170" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="{Binding Name}" VerticalAlignment="Center" Foreground="#F3F3F3" />
+                                        <CheckBox Grid.Column="1" IsChecked="{Binding OnPanel}" VerticalAlignment="Center" />
+                                        <TextBox Grid.Column="2" Text="{Binding Cooldown, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding OnPanel}" Width="90" HorizontalAlignment="Left" />
+                                    </Grid>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+                </DockPanel>
+            </TabItem>
+
+            <TabItem Header="Presets">
+                <Grid TextElement.Foreground="#F3F3F3">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="280" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <ListBox ItemsSource="{Binding Presets}" SelectedItem="{Binding SelectedPreset}" DisplayMemberPath="Name" Background="#252526" Foreground="#F3F3F3" BorderBrush="#3F3F46" />
+                    <DockPanel Grid.Column="1" Margin="12,0,0,0">
+                        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+                            <Button Content="Save" Command="{Binding SaveCommand}" Padding="16,6" Margin="0,0,8,0" />
+                            <Button Content="Test" Command="{Binding TestCommand}" Padding="16,6" />
+                        </StackPanel>
+                        <ScrollViewer VerticalScrollBarVisibility="Auto">
+                            <StackPanel>
+                                <TextBlock Text="Preset" FontSize="18" Margin="0,0,0,8" />
+                                <TextBlock Text="Name" />
+                                <TextBox Text="{Binding EditName, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,8" />
+                                <ItemsControl ItemsSource="{Binding Arguments}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <StackPanel Margin="0,0,0,8">
+                                                <TextBlock Text="{Binding Label}" Visibility="{Binding ShowsLabel, Converter={StaticResource BoolToVisibility}}" />
+                                                <ComboBox ItemsSource="{Binding Options}" SelectedIndex="{Binding SelectedIndex}" Margin="0,4,0,0" Visibility="{Binding IsChoice, Converter={StaticResource BoolToVisibility}}" />
+                                                <TextBox Text="{Binding Value, UpdateSourceTrigger=PropertyChanged}" Margin="0,4,0,0" Visibility="{Binding IsTextBox, Converter={StaticResource BoolToVisibility}}" />
+                                                <CheckBox Content="{Binding Label}" IsChecked="{Binding IsChecked}" Visibility="{Binding IsCheckBox, Converter={StaticResource BoolToVisibility}}" />
+                                                <TextBlock Text="{Binding Hint}" TextWrapping="Wrap" Opacity="0.75" Margin="0,4,0,0" Visibility="{Binding HasHint, Converter={StaticResource BoolToVisibility}}" />
+                                            </StackPanel>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                                <TextBlock Text="Play offline. Test stays off until the mod reports an offline session." TextWrapping="Wrap" Opacity="0.75" Margin="0,8,0,0" />
+                            </StackPanel>
+                        </ScrollViewer>
+                    </DockPanel>
+                </Grid>
+            </TabItem>
+        </TabControl>
+
+        <ListBox Grid.Row="2" Margin="0,12,0,0" ItemsSource="{Binding LogLines}" Background="#252526" Foreground="#D4D4D4" BorderBrush="#3F3F46" />
+
+        <DockPanel Grid.Row="2" Grid.Column="1" Margin="12,12,0,0">
+            <DockPanel DockPanel.Dock="Top" Margin="0,0,0,6">
+                <Button DockPanel.Dock="Right" Content="Clear queue" Command="{Binding ClearQueueCommand}" Padding="10,3" />
+                <CheckBox DockPanel.Dock="Right" Content="Show queue" IsChecked="{Binding ShowQueue}" VerticalAlignment="Center" Margin="0,0,10,0"
+                          ToolTip="Turn off if the player does not want to see what is coming." />
+                <TextBlock Text="{Binding QueueHeader}" FontSize="14" VerticalAlignment="Center" />
+            </DockPanel>
+            <Grid>
+                <TextBlock Text="Hidden" Opacity="0.75" Margin="4" Visibility="{Binding QueueHidden, Converter={StaticResource BoolToVisibility}}" />
+                <ListBox ItemsSource="{Binding QueueRows}" Background="#252526" Foreground="#D4D4D4" BorderBrush="#3F3F46"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         Visibility="{Binding ShowQueue, Converter={StaticResource BoolToVisibility}}">
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <StackPanel>
+                                <TextBlock Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Opacity="0.7" FontSize="11" TextTrimming="CharacterEllipsis">
+                                    <Run Text="{Binding Who, Mode=OneWay}" /><Run Text=" · " /><Run Text="{Binding State, Mode=OneWay}" />
+                                </TextBlock>
+                            </StackPanel>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+            </Grid>
+        </DockPanel>
+    </Grid>
+</Window>

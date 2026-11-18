@@ -4,7 +4,7 @@ param([Parameter(Mandatory = $true)][string]$Version)
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$name = "ds3-crowd-control-v$Version"
+$name = "ds3-viewer-control-v$Version"
 $out = Join-Path $root "dist\$name"
 $zip = Join-Path $root "dist\$name.zip"
 
@@ -26,7 +26,7 @@ $flags = @('-C', 'target-feature=+crt-static') + ($remaps | ForEach-Object { "--
 $previousFlags = $env:CARGO_ENCODED_RUSTFLAGS
 $env:CARGO_ENCODED_RUSTFLAGS = $flags -join [char]0x1f
 try {
-    dotnet publish (Join-Path $root 'src\Ds3CrowdControl.Manager') `
+    dotnet publish (Join-Path $root 'src\Ds3ViewerControl.Manager') `
         -c Release -r win-x64 --self-contained true `
         -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
         -p:DebugType=none -p:DebugSymbols=false `

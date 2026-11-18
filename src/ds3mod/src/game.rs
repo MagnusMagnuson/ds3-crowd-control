@@ -4618,6 +4618,104 @@ pub fn poll_shuffled_stats() {
     }));
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hand {
+    Right,
+    Left,
+    Either,
+}
+
+impl Hand {
+    pub fn from_index(index: i64) -> Self {
+        match index {
+            1 => Self::Left,
+            2 => Self::Either,
+            _ => Self::Right,
+        }
+    }
+}
+
+/// EquipGameData: which of a hand's three weapons is in use, 0 to 2, for the left and
+/// right hand. The weapon slots go left 1, right 1, left 2, right 2, left 3, right 3.
+const ACTIVE_LEFT_WEAPON_OFFSET: usize = 0x14;
+const ACTIVE_RIGHT_WEAPON_OFFSET: usize = 0x18;
+
+/// The slot of the weapon a hand holds right now. If the game's choice cannot be read,
+/// the first slot of that hand with a real weapon.
+fn held_weapon_slot(player: &PlayerIns, right: bool) -> Option<(u32, i32, u32)> {
+    let equipment = unsafe { &player.player_game_data.as_ref().equipment } as *const _ as usize;
+    let offset = if right { ACTIVE_RIGHT_WEAPON_OFFSET } else { ACTIVE_LEFT_WEAPON_OFFSET };
+    let first = u32::from(right);
+    let active = read_u32_checked(equipment + offset).ok().filter(|active| *active <= 2);
+    let slot = match active {
+        Some(active) => first + active * 2,
+        None => (0..3)
+            .map(|step| first + step * 2)
+            .find(|slot| equipped_weapon(player, *slot).is_some_and(|(_, weapon)| is_removable_weapon(weapon)))?,
+    };
+    equipped_weapon(player, slot)
+        .filter(|(_, weapon)| is_removable_weapon(*weapon))
+        .map(|(index, weapon)| (slot, index, weapon))
+}
+
+/// The held weapon of the chosen hand, or of a random hand that holds one.
+fn pick_held_weapon(player: &PlayerIns, hand: Hand) -> Result<(u32, i32, u32), String> {
+    let candidates: Vec<(u32, i32, u32)> = match hand {
+        Hand::Right => held_weapon_slot(player, true).into_iter().collect(),
+        Hand::Left => held_weapon_slot(player, false).into_iter().collect(),
+        Hand::Either => [true, false].into_iter().filter_map(|right| held_weapon_slot(player, right)).collect(),
+    };
+    if candidates.is_empty() {
+        return Err(match hand {
+            Hand::Right => "the right hand holds no weapon",
+            Hand::Left => "the left hand holds no weapon",
+            Hand::Either => "neither hand holds a weapon",
+        }
+        .to_string());
+    }
+    Ok(candidates[random_index(candidates.len())])
+}
+
+fn weapon_event_player() -> Result<&'static mut PlayerIns, String> {
+    let player = unsafe { &mut *local_player()? };
+    if player.super_chr_ins.modules.data.hp <= 0 {
+        return Err("the local player is dead".to_string());
+    }
+    // The swaps take care of the weapons themselves and put them back later.
+    if let Some(active) = pending().gear_event() {
+        return Err(active.to_string());
+    }
+    Ok(player)
+}
+
+fn hand_name(slot: u32) -> &'static str {
+    if slot % 2 == 1 {
+        "right"
+    } else {
+        "left"
+    }
+}
+
+/// Takes the held weapon out of the hand. It stays in the inventory.
+pub fn unequip_weapon(hand: Hand) -> Result<String, String> {
+    let player = weapon_event_player()?;
+    let (slot, _, weapon) = pick_held_weapon(player, hand)?;
+    call_equip(player, slot, -1)?;
+    Ok(format!("unequipped weapon {weapon} from the {} hand", hand_name(slot)))
+}
+
+/// Takes the held weapon out of the hand and deletes it from the inventory for good.
+/// A gear snapshot on the General page can bring it back.
+pub fn delete_weapon(hand: Hand) -> Result<String, String> {
+    let player = weapon_event_player()?;
+    let (slot, index, weapon) = pick_held_weapon(player, hand)?;
+    call_equip(player, slot, -1)?;
+    if !remove_inventory_entry(player, index)? {
+        return Err(format!("weapon {weapon} was unequipped, but the game kept it in the inventory"));
+    }
+    Ok(format!("deleted weapon {weapon} from the {} hand", hand_name(slot)))
+}
+
 pub fn random_weapon(options: WeaponOptions) -> Result<String, String> {
     let player = unsafe { &mut *local_player()? };
     if player.super_chr_ins.modules.data.hp <= 0 {
@@ -7931,6 +8029,22 @@ pub fn schemas_json() -> Value {
             "name": "Invincible",
             "description": "The player takes no hit damage for the chosen number of seconds. A second use keeps the longer remaining time.",
             "arguments": [{ "name": "seconds", "type": "int", "default": 30, "min": 1, "max": 300 }]
+        },
+        {
+            "id": "unequip_weapon",
+            "name": "Unequip Weapon",
+            "description": "Takes the weapon you are holding out of your hand. It stays in your inventory, so you can equip it again from the menu.",
+            "arguments": [
+                { "name": "hand", "type": "choice", "label": "Hand", "options": ["Right hand", "Left hand", "Either"], "default": 0, "min": 0, "max": 2 }
+            ]
+        },
+        {
+            "id": "delete_weapon",
+            "name": "Delete Weapon",
+            "description": "Deletes the weapon you are holding from your inventory for good. A gear snapshot on the General page can bring it back.",
+            "arguments": [
+                { "name": "hand", "type": "choice", "label": "Hand", "options": ["Right hand", "Left hand", "Either"], "default": 0, "min": 0, "max": 2 }
+            ]
         },
         {
             "id": "random_weapon",

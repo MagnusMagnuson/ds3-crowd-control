@@ -67,6 +67,12 @@ fn execute(handler: &str, args: &Value) -> Outcome {
             let seconds = args.get("seconds").and_then(Value::as_i64).unwrap_or(30);
             game::invincible(seconds.clamp(1, 300) as i32)
         }
+        "unequip_weapon" => game::unequip_weapon(game::Hand::from_index(
+            args.get("hand").and_then(Value::as_i64).unwrap_or(0),
+        )),
+        "delete_weapon" => game::delete_weapon(game::Hand::from_index(
+            args.get("hand").and_then(Value::as_i64).unwrap_or(0),
+        )),
         "random_weapon" => {
             let number = |name: &str, default: i64| {
                 args.get(name).and_then(Value::as_i64).unwrap_or(default)
